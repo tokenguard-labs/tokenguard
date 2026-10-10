@@ -101,12 +101,14 @@
             "deepseek",
             "anthropic",
             "openai",
+            "custom",
             "mock"
           ],
           "enumDescriptions": [
             "DeepSeek (OpenAI-compatible)",
             "Anthropic Claude",
-            "Any OpenAI-compatible API (OpenAI, Groq, OpenRouter, …)",
+            "OpenAI (uses the default OpenAI endpoint)",
+            "Custom OpenAI-compatible endpoint (Groq, OpenRouter, self-hosted) — set tokenguard.customBaseUrl",
             "Mock provider: no real cloud call (for demos only)"
           ],
           "default": "deepseek",
@@ -116,6 +118,16 @@
           "type": "string",
           "default": "",
           "description": "Model name for the selected provider (e.g. deepseek-chat, gpt-4o-mini, claude-sonnet-5-5). Empty: the provider/model default in backend/.env."
+        },
+        "tokenguard.customBaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL for the `custom` OpenAI-compatible provider (e.g. https://api.groq.com/openai/v1). Sent to the backend as X-LLM-Base-Url."
+        },
+        "tokenguard.cloudModelsAutoFetch": {
+          "type": "boolean",
+          "default": true,
+          "description": "Fetch the provider's model list for the sidebar picker (uses the API key). Disable to avoid the extra request."
         },
         "tokenguard.localModel": {
           "type": "string",

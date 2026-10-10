@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from . import llm, model_catalog, router, system
+from . import cloud_catalog, llm, model_catalog, router, system
 
 logging.basicConfig(level=logging.INFO)
 
@@ -35,10 +35,11 @@ async def llm_overrides_middleware(request, call_next):
     model = request.headers.get("x-llm-model")
     api_key = request.headers.get("x-llm-api-key")
     local_model = request.headers.get("x-local-model")
-    if not (provider or model or api_key or local_model):
+    base_url = request.headers.get("x-llm-base-url")
+    if not (provider or model or api_key or local_model or base_url):
         return await call_next(request)
     token = llm.set_overrides(llm.LLMOverrides(
-        provider=provider, model=model, api_key=api_key, local_model=local_model))
+        provider=provider, model=model, api_key=api_key, local_model=local_model, base_url=base_url))
     try:
         return await call_next(request)
     finally:
@@ -77,6 +78,9 @@ class ChatResponse(BaseModel):
     cloud_latency_ms: Optional[int]
     cloud_fallback_reason: Optional[str] = None
     is_mock: bool = False
+    cloud_input_tokens: int = 0
+    cloud_output_tokens: int = 0
+    cost_usd: Optional[float] = None
     trace: List[str]
 
 
@@ -127,6 +131,32 @@ async def models():
         "pulling": info["pulling"],
         "system": info["system"],
         "ollama": info["ollama"],
+    }
+
+
+@app.get("/cloud/models")
+async def cloud_models(force: bool = False):
+    """Cloud models for the active provider: live ids merged with curated metadata.
+
+    Without a usable key we fall back to the curated catalog so the picker still works.
+    """
+    provider = llm.effective_provider()
+    live = await llm.list_cloud_models(force=force)
+    ids = live["ids"]
+    models = cloud_catalog.merge(provider, ids)
+    if not models:  # no live list (no key / endpoint missing): show the curated catalog
+        models = cloud_catalog.all_models(provider)
+    current = llm.effective_model(provider) or cloud_catalog.default_model(provider)
+    return {
+        "provider": provider,
+        "base_url": live["base_url"],
+        "configured": live["configured"],
+        "valid": live["valid"],
+        "detail": live["detail"],
+        "current": current,
+        "default": cloud_catalog.default_model(provider),
+        "models": models,
+        "prices_updated": cloud_catalog.PRICES_UPDATED,
     }
 
 
@@ -191,6 +221,7 @@ async def stats():
     local = sum(1 for h in real if h["route"] == "local")
     original = sum(h["original_tokens"] for h in real)
     sent = sum(h["sent_tokens"] for h in real)
+    total_cost = sum(h.get("cost_usd") or 0.0 for h in real)
     return {
         "total_requests": n,
         "real_requests": len(real),
@@ -202,18 +233,19 @@ async def stats():
         "total_sent_tokens": sent,
         "total_tokens_saved": original - sent,
         "cloud_token_reduction_pct": round(100 * (original - sent) / original, 1) if original else 0.0,
+        "total_cost_usd": round(total_cost, 4),
         "avg_latency_ms": int(sum(h["latency_ms"] for h in real) / len(real)) if real else 0,
         "history": HISTORY[-50:],
     }
 
 
 @app.get("/health")
-async def health():
+async def health(force: bool = False):
     # Installed local models, host resources and pullable recommendations (one Ollama call).
     local = await _local_model_info()
     # Actually verify the configured provider instead of echoing its name: a placeholder or
-    # rejected key must not look "connected". Cached for CLOUD_HEALTHCHECK_TTL_S.
-    cloud = await llm.validate_cloud_provider()
+    # rejected key must not look "connected". Cached for CLOUD_HEALTHCHECK_TTL_S (force bypasses).
+    cloud = await llm.validate_cloud_provider(force=force)
     return {
         "status": "ok",
         "ollama": local["ollama"],
@@ -228,5 +260,6 @@ async def health():
         "cloud_configured": cloud["configured"],
         "cloud_valid": cloud["valid"],
         "cloud_detail": cloud["detail"],
+        "cloud_model_info": cloud_catalog.model_info(cloud["provider"], cloud["model"]),
         "cloud": cloud,
     }

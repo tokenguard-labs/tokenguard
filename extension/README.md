@@ -21,13 +21,32 @@ If you have any requirements or dependencies, add a section describing those and
 * `tokenguard.apiUrl`: URL of the LocalPilot backend (default `http://localhost:8000`).
 * `tokenguard.autoStartBackend`: Start the backend as a child process on activation.
 * `tokenguard.backendPath`, `tokenguard.pythonPath`: Override the backend folder / Python interpreter.
-* `tokenguard.cloudProvider`: Global LLM provider — `deepseek`, `anthropic`, `openai`, or `mock`.
+* `tokenguard.cloudProvider`: Global LLM provider — `deepseek`, `anthropic`, `openai`, `custom`, or `mock`.
 * `tokenguard.cloudModel`: Model name for the selected provider (empty = provider default).
+* `tokenguard.customBaseUrl`: Base URL for the `custom` OpenAI-compatible provider (e.g. `https://api.groq.com/openai/v1`).
+* `tokenguard.cloudModelsAutoFetch`: Fetch the provider's model list for the sidebar picker (default `true`).
 * `tokenguard.localModel`: Ollama model for local inference (empty = `LOCAL_MODEL` from `backend/.env`).
 * `tokenguard.ollamaUrl`: URL of the local Ollama server (default `http://localhost:11434`).
 * `tokenguard.autoStartOllama`: Start `ollama serve` with the extension if it isn't running (default `true`).
 * `tokenguard.preloadLocalModel`: Load the selected model when VS Code opens so it isn't shown idle (default `true`).
 * `tokenguard.stopOllamaOnExit`: On exit, stop the `ollama serve` started by TokenGuard/setup (default `true`). Models are always unloaded to free RAM; externally started Ollama is never killed.
+
+## Choosing a cloud model
+
+The sidebar's **Cloud** section picks the provider and model and manages the API key inline:
+
+- **Provider** — `deepseek`, `anthropic`, `openai`, `custom`, or `mock`. `custom` reveals a
+  **Base URL** field for any OpenAI-compatible endpoint (Groq, OpenRouter, self-hosted).
+- **Model** — populated from `GET /cloud/models`: the provider's live model list (using your key)
+  merged with curated context-window/price metadata; without a key it falls back to the curated
+  catalog. Models are grouped Recommended / All and show context and `$in/$out` per 1M tokens.
+- **API key** — a masked field with **Save** / **Clear**, stored in SecretStorage (per provider);
+  never written to disk. The existing command palette command still works.
+- **Test connection** — re-runs the credential check (bypassing the cache) and refreshes the list.
+
+`/analyze` shows an estimated cost per request, each cloud answer card shows its actual `cost_usd`,
+and the sidebar shows cumulative cloud spend from `/stats`. Prices come from a curated catalog and
+are estimates (custom endpoints show no price).
 
 ## Choosing a local model
 

@@ -33,6 +33,10 @@ CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "deepseek")
 CLOUD_FALLBACK_TO_MOCK = os.getenv("CLOUD_FALLBACK_TO_MOCK", "false").lower() in ("1", "true", "yes")
 # How long (seconds) a /health provider credential check is cached before re-pinging
 CLOUD_HEALTHCHECK_TTL_S = float(os.getenv("CLOUD_HEALTHCHECK_TTL_S", "60"))
+# How long (seconds) a provider /models listing is cached before re-fetching
+CLOUD_MODELS_TTL_S = float(os.getenv("CLOUD_MODELS_TTL_S", "300"))
+# Assumed output tokens used only for the pre-send cost estimate in /analyze
+DEFAULT_OUTPUT_TOKENS_ESTIMATE = int(os.getenv("DEFAULT_OUTPUT_TOKENS_ESTIMATE", "600"))
 
 DEEPSEEK_URL = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
@@ -47,6 +51,11 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Custom OpenAI-compatible endpoint (Groq/OpenRouter/self-hosted). The base URL can also be
+# supplied per request by the editor via the X-LLM-Base-Url header.
+CUSTOM_API_KEY = os.getenv("CUSTOM_API_KEY", "")
+CUSTOM_BASE_URL = os.getenv("CUSTOM_BASE_URL", "")
+CUSTOM_MODEL = os.getenv("CUSTOM_MODEL", "")
 CLOUD_TIMEOUT_S = float(os.getenv("CLOUD_TIMEOUT_S", "120"))
 CLOUD_MAX_TOKENS = int(os.getenv("CLOUD_MAX_TOKENS", "16000"))
 

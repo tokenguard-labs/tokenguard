@@ -41,7 +41,7 @@ const ollama_1 = require("./ollama");
 const ANALYZE_TIMEOUT_MS = 60_000;
 const CHAT_TIMEOUT_MS = 600_000; // local 7B models can be slow on a cold start
 // Providers that accept an API key (mock needs none). Keys live in VS Code SecretStorage.
-const KEY_PROVIDERS = ['deepseek', 'anthropic', 'openai'];
+const KEY_PROVIDERS = ['deepseek', 'anthropic', 'openai', 'custom'];
 const SECRET_PREFIX = 'tokenguard.apiKey.';
 let backend;
 let ollama;
@@ -113,6 +113,9 @@ function cloudProvider() {
 function cloudModel() {
     return (vscode.workspace.getConfiguration('tokenguard').get('cloudModel') || '').trim();
 }
+function customBaseUrl() {
+    return (vscode.workspace.getConfiguration('tokenguard').get('customBaseUrl') || '').trim();
+}
 function localModel() {
     return (vscode.workspace.getConfiguration('tokenguard').get('localModel') || '').trim();
 }
@@ -129,6 +132,12 @@ async function llmHeaders() {
     const model = cloudModel();
     if (model) {
         headers['X-LLM-Model'] = model;
+    }
+    if (provider === 'custom') {
+        const base = customBaseUrl();
+        if (base) {
+            headers['X-LLM-Base-Url'] = base;
+        }
     }
     const local = localModel();
     if (local) {
@@ -349,6 +358,7 @@ class LocalPilotViewProvider {
     _retryDelayMs = 1_000;
     _preloadedFor; // model we've already asked the backend to load
     _preloadSuppressed = false; // user explicitly unloaded: don't auto-reload until they pick again
+    _cloudSig = ''; // provider|baseUrl signature last fetched for /cloud/models
     resolveWebviewView(webviewView, _context, _token) {
         this._view = webviewView;
         webviewView.webview.options = { enableScripts: true };
@@ -361,6 +371,7 @@ class LocalPilotViewProvider {
             switch (data.type) {
                 case 'ready':
                     await this._postStatus();
+                    void this._postCloudModels();
                     break;
                 case 'refreshStatus':
                     await backend?.ensureRunning();
@@ -399,6 +410,63 @@ class LocalPilotViewProvider {
                     await this._postStatus();
                     break;
                 }
+                case 'selectCloudProvider': {
+                    const provider = (data.provider || 'deepseek');
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('cloudProvider', provider, vscode.ConfigurationTarget.Global);
+                    // A model belongs to one provider; clear it so the backend uses this provider's default.
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('cloudModel', '', vscode.ConfigurationTarget.Global);
+                    this._cloudSig = '';
+                    await this._postCloudModels(true);
+                    await this._postStatus();
+                    break;
+                }
+                case 'selectCloudModel': {
+                    const model = (data.model || '');
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('cloudModel', model, vscode.ConfigurationTarget.Global);
+                    await this._postStatus();
+                    void this._postCloudModels(); // refresh the price/current line from the cache
+                    break;
+                }
+                case 'saveCloudKey': {
+                    const provider = (data.provider || cloudProvider());
+                    const key = String(data.key || '').trim();
+                    if (key) {
+                        await extensionContext.secrets.store(secretKey(provider), key);
+                        void vscode.window.showInformationMessage(`TokenGuard: ${provider} API key saved to SecretStorage.`);
+                    }
+                    else {
+                        await extensionContext.secrets.delete(secretKey(provider));
+                    }
+                    this._cloudSig = '';
+                    await this._postCloudModels(true);
+                    await this._postStatus();
+                    break;
+                }
+                case 'clearCloudKey': {
+                    const provider = (data.provider || cloudProvider());
+                    await extensionContext.secrets.delete(secretKey(provider));
+                    void vscode.window.showInformationMessage(`TokenGuard: cleared the ${provider} API key.`);
+                    this._cloudSig = '';
+                    await this._postCloudModels(true);
+                    await this._postStatus();
+                    break;
+                }
+                case 'saveCloudBaseUrl': {
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('customBaseUrl', String(data.baseUrl || '').trim(), vscode.ConfigurationTarget.Global);
+                    this._cloudSig = '';
+                    await this._postCloudModels(true);
+                    await this._postStatus();
+                    break;
+                }
+                case 'testCloud':
+                    await api('GET', '/health?force=true', undefined, 15_000).catch(() => undefined);
+                    await this._postCloudModels(true);
+                    await this._postStatus();
+                    break;
             }
         });
     }
@@ -438,6 +506,11 @@ class LocalPilotViewProvider {
             this._clearRetry();
             this._post({ type: 'status', online: true, health, stats, apiUrl: apiUrl(), localModel: localModel() });
             void this._maybePreload(health);
+            const sig = `${cloudProvider()}|${customBaseUrl()}`;
+            if (sig !== this._cloudSig) {
+                this._cloudSig = sig;
+                void this._postCloudModels();
+            }
         }
         catch (err) {
             this._post({
@@ -468,6 +541,19 @@ class LocalPilotViewProvider {
             this._retryTimer = undefined;
         }
         this._retryDelayMs = 1_000;
+    }
+    /** Fetch the provider's model list (backend-cached) and hand it to the sidebar picker. */
+    async _postCloudModels(force = false) {
+        if (!force && !vscode.workspace.getConfiguration('tokenguard').get('cloudModelsAutoFetch', true)) {
+            return;
+        }
+        try {
+            const info = await api('GET', `/cloud/models${force ? '?force=true' : ''}`, undefined, 10_000);
+            this._post({ type: 'cloudModels', info });
+        }
+        catch {
+            // ignore: the status card already reports cloud problems
+        }
     }
     /** Load the selected local model once the backend + Ollama are up, so it isn't shown idle. */
     async _maybePreload(health) {
@@ -552,6 +638,37 @@ class LocalPilotViewProvider {
                     padding: 4px 6px;
                     font-family: inherit;
                 }
+                input[type="text"], input[type="password"] {
+                    flex: 1;
+                    min-width: 0;
+                    background: var(--vscode-input-background);
+                    color: var(--vscode-input-foreground);
+                    border: 1px solid var(--vscode-input-border);
+                    border-radius: 4px;
+                    padding: 4px 6px;
+                    font-family: inherit;
+                }
+                .section {
+                    border: 1px solid var(--vscode-widget-border);
+                    border-radius: 4px;
+                    padding: 6px 8px;
+                }
+                .section > summary {
+                    cursor: pointer;
+                    font-size: 11px;
+                    font-weight: 600;
+                    opacity: 0.9;
+                    list-style: none;
+                    user-select: none;
+                }
+                .section > summary::-webkit-details-marker { display: none; }
+                .section > summary::before { content: '▸ '; opacity: 0.6; }
+                .section[open] > summary::before { content: '▾ '; }
+                .section-body { display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
+                .section .model-row { gap: 6px; }
+                .section .model-row > label { flex: 0 0 52px; width: 52px; }
+                .section .choices { margin-top: 0; }
+                .section .choices button { width: auto; flex: 1 1 0; padding: 4px 6px; font-weight: normal; }
                 button {
                     width: 100%;
                     padding: 8px;
@@ -627,6 +744,33 @@ class LocalPilotViewProvider {
         <body>
             <div class="container">
                 <div id="status" class="status">Connecting to LocalPilot backend…</div>
+                <details id="cloudSection" class="section">
+                    <summary>Cloud model</summary>
+                    <div class="section-body">
+                        <div class="model-row">
+                            <label for="cloudProvider">Provider</label>
+                            <select id="cloudProvider"></select>
+                        </div>
+                        <div class="model-row" id="cloudBaseUrlRow" style="display:none">
+                            <label for="cloudBaseUrl">Base URL</label>
+                            <input id="cloudBaseUrl" type="text" placeholder="https://api.groq.com/openai/v1" />
+                        </div>
+                        <div class="model-row">
+                            <label for="cloudModel">Model</label>
+                            <select id="cloudModel"></select>
+                        </div>
+                        <div class="model-row">
+                            <label for="cloudKey">API key</label>
+                            <input id="cloudKey" type="password" placeholder="paste key" />
+                        </div>
+                        <div class="choices">
+                            <button id="saveCloudKey" class="secondary">Save key</button>
+                            <button id="clearCloudKey" class="secondary">Clear</button>
+                            <button id="testCloud" class="secondary">Test</button>
+                        </div>
+                        <div id="cloudState" class="muted"></div>
+                    </div>
+                </details>
                 <div class="model-row">
                     <label for="localModel">Local model</label>
                     <select id="localModel" title="Ollama model used for local inference"></select>
@@ -644,6 +788,13 @@ class LocalPilotViewProvider {
                 const input = document.getElementById('prompt');
                 const sendBtn = document.getElementById('send');
                 const modelSelect = document.getElementById('localModel');
+                const cloudProviderSel = document.getElementById('cloudProvider');
+                const cloudModelSel = document.getElementById('cloudModel');
+                const cloudBaseUrlRow = document.getElementById('cloudBaseUrlRow');
+                const cloudBaseUrlInput = document.getElementById('cloudBaseUrl');
+                const cloudKeyInput = document.getElementById('cloudKey');
+                const cloudState = document.getElementById('cloudState');
+                const CLOUD_PROVIDERS = ['deepseek', 'anthropic', 'openai', 'custom', 'mock'];
 
                 let nextId = 1;
                 let busy = false;               // one request at a time, like the Streamlit UI
@@ -723,6 +874,50 @@ class LocalPilotViewProvider {
                     }
                 }
 
+                // Cloud provider / model / key picker.
+                function cloudModelLabel(m) {
+                    let label = m.display || m.id;
+                    if (m.context) label += ' · ' + Math.round(m.context / 1000) + 'k';
+                    if (m.in != null && m.out != null) label += ' · $' + m.in + '/$' + m.out;
+                    if (m.note) label += ' — ' + m.note;
+                    return label;
+                }
+
+                function renderCloud(info) {
+                    if (!info) return;
+                    cloudProviderSel.innerHTML = CLOUD_PROVIDERS
+                        .map(p => '<option value="' + esc(p) + '">' + esc(p) + '</option>').join('');
+                    cloudProviderSel.value = info.provider;
+                    cloudBaseUrlRow.style.display = info.provider === 'custom' ? 'flex' : 'none';
+                    if (info.base_url) cloudBaseUrlInput.value = info.base_url;
+
+                    const models = info.models || [];
+                    const rec = models.filter(m => m.recommended);
+                    const rest = models.filter(m => !m.recommended);
+                    const opts = [];
+                    if (rec.length) {
+                        opts.push('<optgroup label="Recommended">');
+                        rec.forEach(m => opts.push('<option value="' + esc(m.id) + '">' + esc(cloudModelLabel(m)) + '</option>'));
+                        opts.push('</optgroup>');
+                    }
+                    if (rest.length) {
+                        opts.push('<optgroup label="All">');
+                        rest.forEach(m => opts.push('<option value="' + esc(m.id) + '">' + esc(cloudModelLabel(m)) + '</option>'));
+                        opts.push('</optgroup>');
+                    }
+                    if (!opts.length) opts.push('<option value="">(no models — check key/base URL)</option>');
+                    cloudModelSel.innerHTML = opts.join('');
+                    const current = info.current || info.default;
+                    const known = models.some(m => m.id === current);
+                    if (current && known) cloudModelSel.value = current;
+
+                    const cur = models.find(m => m.id === current);
+                    let state = info.valid ? 'key ✓' : (info.detail ? '⚠ ' + info.detail : 'key not set');
+                    state += ' · model: ' + esc(current || '—');
+                    if (cur && cur.in != null) state += ' · $' + cur.in + '/' + cur.out + ' per 1M';
+                    cloudState.innerHTML = state;
+                }
+
                 function setBusy(value) {
                     busy = value;
                     sendBtn.disabled = value;
@@ -799,9 +994,10 @@ class LocalPilotViewProvider {
                             ' · ' + fmt(r.latency_ms) + ' ms · <b>0</b> tokens sent to cloud';
                     } else {
                         const pct = r.original_tokens ? Math.round(100 * r.tokens_saved / r.original_tokens) : 0;
+                        const cost = (r.cost_usd != null) ? ' · <b>Cost:</b> $' + Number(r.cost_usd).toFixed(5) : '';
                         metrics = '<b>Model:</b> ' + esc(r.model) + ' · ' + fmt(r.latency_ms) + ' ms<br>' +
                             '<b>Token savings:</b> sent ' + fmt(r.sent_tokens) + ' of ' + fmt(r.original_tokens) +
-                            ' (saved ' + fmt(r.tokens_saved) + ', ' + pct + '%) · ' + r.secrets_redacted + ' secret(s) masked';
+                            ' (saved ' + fmt(r.tokens_saved) + ', ' + pct + '%) · ' + r.secrets_redacted + ' secret(s) masked' + cost;
                     }
                     const lowConf = isLocal && r.confidence != null && r.confidence < turn.analysis.min_local_confidence;
                     const files = (r.files_selected || []).map(f => '<code>' + esc(f) + '</code>').join(', ');
@@ -837,23 +1033,26 @@ class LocalPilotViewProvider {
                     }
                     const h = m.health, s = m.stats;
                     const provider = esc(h.cloud_provider);
+                    const model = h.cloud_model ? ' <code>' + esc(h.cloud_model) + '</code>' : '';
                     let cloudState;
                     if (h.cloud_valid) {
-                        cloudState = '<code>' + provider + '</code> ✓';
+                        cloudState = '<code>' + provider + '</code>' + model + ' ✓';
                     } else if (h.cloud_provider === 'mock') {
                         cloudState = '<code>mock</code>';
                     } else {
-                        cloudState = '<code>' + provider + '</code> <span class="warn">⚠ ' +
+                        cloudState = '<code>' + provider + '</code>' + model + ' <span class="warn">⚠ ' +
                             esc(h.cloud_detail || 'not configured') + '</span>';
                     }
                     const keyBtn = (!h.cloud_valid && h.cloud_provider !== 'mock')
                         ? '<div class="choices"><button id="setApiKey" class="secondary">🔑 Set API key</button></div>'
                         : '';
+                    const spend = (s.total_cost_usd != null && s.total_cost_usd > 0)
+                        ? '<span>Spend: <b>$' + s.total_cost_usd.toFixed(4) + '</b></span>' : '';
                     el.innerHTML = '● API online · cloud: ' + cloudState + ' · local: <code>' +
                         esc(h.local_model) + '</code> · Ollama ' + (h.ollama ? '✅' : '❌') + keyBtn +
                         '<div class="stats"><span>🖥️ Local: <b>' + s.local_requests + '</b></span><span>☁️ Cloud: <b>' +
                         s.cloud_requests + '</b></span><span>Tokens saved: <b>' + fmt(s.total_tokens_saved) + '</b> (' +
-                        s.cloud_token_reduction_pct + '%)</span></div>';
+                        s.cloud_token_reduction_pct + '%)</span>' + spend + '</div>';
                     const sys = document.getElementById('systemInfo');
                     if (sys && h.system) {
                         const g = h.system;
@@ -883,11 +1082,33 @@ class LocalPilotViewProvider {
                 input.addEventListener('keydown', e => {
                     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
                 });
+                cloudProviderSel.addEventListener('change', () => {
+                    vscode.postMessage({ type: 'selectCloudProvider', provider: cloudProviderSel.value });
+                });
+                cloudModelSel.addEventListener('change', () => {
+                    vscode.postMessage({ type: 'selectCloudModel', model: cloudModelSel.value });
+                });
+                cloudBaseUrlInput.addEventListener('change', () => {
+                    vscode.postMessage({ type: 'saveCloudBaseUrl', baseUrl: cloudBaseUrlInput.value });
+                });
+                cloudKeyInput.addEventListener('keydown', e => {
+                    if (e.key === 'Enter') { e.preventDefault(); document.getElementById('saveCloudKey').click(); }
+                });
                 document.addEventListener('click', e => {
                     const target = e.target.closest('button');
                     if (!target) return;
                     if (target.id === 'retryStatus') { vscode.postMessage({ type: 'refreshStatus' }); return; }
                     if (target.id === 'setApiKey') { vscode.postMessage({ type: 'setApiKey' }); return; }
+                    if (target.id === 'saveCloudKey') {
+                        vscode.postMessage({ type: 'saveCloudKey', provider: cloudProviderSel.value, key: cloudKeyInput.value });
+                        cloudKeyInput.value = '';
+                        return;
+                    }
+                    if (target.id === 'clearCloudKey') {
+                        vscode.postMessage({ type: 'clearCloudKey', provider: cloudProviderSel.value });
+                        return;
+                    }
+                    if (target.id === 'testCloud') { vscode.postMessage({ type: 'testCloud' }); return; }
                     if (target.dataset.route && !busy) {
                         target.dataset.used = '1';
                         run(Number(target.dataset.id), target.dataset.route);
@@ -898,6 +1119,9 @@ class LocalPilotViewProvider {
                     const m = event.data;
                     const turn = turns.get(m.id);
                     switch (m.type) {
+                        case 'cloudModels':
+                            renderCloud(m.info);
+                            break;
                         case 'modelLoading': {
                             loadingModel = m.model || null;
                             const state = document.getElementById('modelState');

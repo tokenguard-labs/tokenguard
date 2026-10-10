@@ -3,11 +3,11 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from . import config
+from . import cloud_catalog, config
 from .analyzer import analyze
 from .contracts import ContextResult
 from .context import ResolvedRequest, optimize_context, redact_text, repo_stats, resolve_request
-from .llm import LLMResult, call_cloud, call_local, effective_provider
+from .llm import LLMResult, call_cloud, call_local, effective_model, effective_provider
 from .tokens import count_tokens
 
 log = logging.getLogger("localpilot.router")
@@ -41,6 +41,10 @@ def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dic
     analysis = analyze(req.prompt, code=req.code, repo_context_tokens=repo_tokens, num_repo_files=num_files)
     ctx = compress(req)
     prompt_tokens = count_tokens(req.prompt)
+    provider = effective_provider()
+    model = effective_model(provider)
+    estimated_input = prompt_tokens + ctx.optimized_tokens
+    in_price, out_price = cloud_catalog.price(provider, model)
     return {
         "decision": decide(analysis.score),
         "complexity_score": analysis.score,
@@ -48,14 +52,19 @@ def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dic
         "factors": analysis.factors,
         "reasons": analysis.reasons,
         "original_tokens": prompt_tokens + ctx.original_tokens,
-        "estimated_cloud_tokens": prompt_tokens + ctx.optimized_tokens,
+        "estimated_cloud_tokens": estimated_input,
         "files_selected": ctx.files_selected,
         "secrets_redacted": ctx.secrets_redacted,
         "context_optimizer": ctx.optimizer,
         "repo_path": req.repo_path,
         "context_sources": req.sources,
         "min_local_confidence": config.MIN_LOCAL_CONFIDENCE,
-        "cloud_provider": effective_provider(),
+        "cloud_provider": provider,
+        "cloud_model": model,
+        "estimated_cost_usd": cloud_catalog.estimate_cost(
+            provider, model, estimated_input, config.DEFAULT_OUTPUT_TOKENS_ESTIMATE),
+        "pricing": {"input": in_price, "output": out_price},
+        "prices_updated": cloud_catalog.PRICES_UPDATED,
     }
 
 
@@ -114,6 +123,11 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
     # Cloud-only baseline: what a normal assistant would send (prompt + all code/repo)
     baseline_tokens = count_tokens(prompt) + ctx.original_tokens
     sent_tokens = cloud.input_tokens if cloud else 0
+    # Cost of a real cloud call only (mock answers are not billed); None when prices are unknown.
+    cost_usd = None
+    if cloud and not cloud.is_mock:
+        cost_usd = cloud_catalog.estimate_cost(
+            effective_provider(), cloud.model, cloud.input_tokens, cloud.output_tokens)
     return {
         "answer": final.answer,
         "route": "cloud" if cloud else "local",
@@ -139,5 +153,8 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
         "cloud_latency_ms": cloud.latency_ms if cloud else None,
         "cloud_fallback_reason": cloud.fallback_reason if cloud else None,
         "is_mock": bool(final.is_mock),
+        "cloud_input_tokens": cloud.input_tokens if cloud else 0,
+        "cloud_output_tokens": cloud.output_tokens if cloud else 0,
+        "cost_usd": cost_usd,
         "trace": trace,
     }
