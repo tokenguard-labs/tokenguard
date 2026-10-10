@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Images are limited to the extension itself: a model answer must not load remote URLs. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src {{cspSource}}; font-src {{cspSource}}; img-src {{cspSource}} data:; script-src 'nonce-{{nonce}}';">
+    <link rel="stylesheet" id="hljsLight" href="{{mediaUri}}/vendor/hljs-light.min.css">
+    <link rel="stylesheet" id="hljsDark" href="{{mediaUri}}/vendor/hljs-dark.min.css">
+    <link rel="stylesheet" href="{{mediaUri}}/chat/main.css">
+    <title>LocalPilot</title>
+</head>
+<body>
+    <div class="container">
+        <header class="top">
+            <div id="status" class="status">Connecting to LocalPilot backend…</div>
+            <div class="model-row">
+                <label for="localModel">Local model</label>
+                <select id="localModel" title="Ollama model used for local inference"></select>
+            </div>
+            <div id="modelState" class="muted"></div>
+            <div id="systemInfo" class="muted"></div>
+        </header>
+
+        <main id="scroller" class="middle">
+            <section id="empty" class="empty">
+                <h2>Ask about your code</h2>
+                <p>Simple questions run on your local model and never leave your machine. Complex ones can go to a
+                    cloud LLM with only the relevant files, compressed and with secrets masked.</p>
+                <div class="examples" id="examples"></div>
+                <p id="contextHint" class="muted"></p>
+                <p class="muted">Enter to send · Shift+Enter for a new line · Esc to stop</p>
+            </section>
+
+            <div id="history" class="chat-history"></div>
+        </main>
+
+        <footer class="bottom">
+            <textarea id="prompt" placeholder="Ask LocalPilot about your repository… (Enter to send, Shift+Enter for newline)"></textarea>
+            <button id="send" title="Send (Enter)">Send Request</button>
+        </footer>
+    </div>
+
+    <script nonce="{{nonce}}" src="{{mediaUri}}/vendor/marked.umd.js"></script>
+    <script nonce="{{nonce}}" src="{{mediaUri}}/vendor/purify.min.js"></script>
+    <script nonce="{{nonce}}" src="{{mediaUri}}/vendor/highlight.min.js"></script>
+    <script nonce="{{nonce}}" src="{{mediaUri}}/chat/main.js"></script>
+</body>
+</html>

@@ -1,10 +1,11 @@
 """LocalPilot API. Run with:  make backend  (or, from the repo root: uvicorn backend.main:app --port 8000)"""
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -169,14 +170,37 @@ async def select_local_model(req: LocalModelRequest):
 HISTORY: List[Dict[str, Any]] = []
 
 
+async def _wait_for_disconnect(request: Request) -> None:
+    """Return once the client hangs up. The body is already read, so the next ASGI message is
+    the disconnect. (request.is_disconnected() can't see it through the HTTP middleware.)"""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
+    # Run the pipeline as a task so a client disconnect (the sidebar's Stop button) cancels it.
+    # Cancelling closes the connection to Ollama / the cloud API (so generation stops) and
+    # releases the local-model lock, so the next prompt doesn't queue behind a dropped answer.
+    work = asyncio.create_task(router.handle(req.prompt, req.repo_path, req.code, req.force_route))
+    hangup = asyncio.create_task(_wait_for_disconnect(request))
     try:
-        result = await router.handle(req.prompt, req.repo_path, req.code, req.force_route)
+        await asyncio.wait({work, hangup}, return_when=asyncio.FIRST_COMPLETED)
+        if not work.done():
+            work.cancel()
+            logging.info("/chat cancelled by client")
+            raise HTTPException(499, "cancelled by client")
+        result = work.result()
+    except HTTPException:
+        raise
     except httpx.HTTPStatusError as e:
         raise HTTPException(502, f"upstream LLM error: {e.response.status_code} {e.response.text[:300]}")
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        hangup.cancel()
+        if not work.done():
+            work.cancel()  # the request itself was cancelled (e.g. server shutdown)
     HISTORY.append({"prompt": req.prompt, **{k: v for k, v in result.items() if k != "answer"}})
     return result
 
