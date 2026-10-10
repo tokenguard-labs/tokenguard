@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { BackendManager } from './backend';
+import { OllamaManager } from './ollama';
 
 // Talks to the LocalPilot backend (backend/main.py):
 //   POST /analyze  -> routing decision only, no model called
@@ -19,21 +20,49 @@ interface ChatRequest {
 const ANALYZE_TIMEOUT_MS = 60_000;
 const CHAT_TIMEOUT_MS = 600_000; // local 7B models can be slow on a cold start
 
+// Providers that accept an API key (mock needs none). Keys live in VS Code SecretStorage.
+const KEY_PROVIDERS = ['deepseek', 'anthropic', 'openai'] as const;
+type KeyProvider = typeof KEY_PROVIDERS[number];
+const SECRET_PREFIX = 'tokenguard.apiKey.';
+
 let backend: BackendManager | undefined;
+let ollama: OllamaManager | undefined;
+let viewProvider: LocalPilotViewProvider | undefined;
+let extensionContext: vscode.ExtensionContext;
 
 export function activate(context: vscode.ExtensionContext) {
     console.log('⚡ LocalPilot extension activated successfully!');
+    extensionContext = context;
 
     const output = vscode.window.createOutputChannel('LocalPilot Backend');
     backend = new BackendManager(context.extensionPath, output, apiUrl);
-    context.subscriptions.push(output, backend);
+    ollama = new OllamaManager(context.extensionPath, output, ollamaUrl);
+    context.subscriptions.push(output, backend, ollama);
 
-    const provider = new LocalPilotViewProvider();
-    context.subscriptions.push(backend.onDidChangeState(() => provider.refreshStatus()));
+    viewProvider = new LocalPilotViewProvider();
+    context.subscriptions.push(
+        backend.onDidChangeState(() => viewProvider?.refreshStatus()),
+        // When Ollama comes up (we may have just started it), refresh so the selected model loads.
+        ollama.onDidChangeState(() => viewProvider?.refreshStatus())
+    );
+
+    // Last-resort cleanup if VS Code exits without calling deactivate().
+    process.on('exit', () => {
+        backend?.killSync();
+        ollama?.killSync();
+    });
+
+    // Re-check provider/model when the user edits the VS Code settings.
+    context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('tokenguard.cloudProvider') || e.affectsConfiguration('tokenguard.cloudModel')
+            || e.affectsConfiguration('tokenguard.localModel')) {
+            viewProvider?.refreshStatus();
+        }
+    }));
 
     // Register Webview Provider
     context.subscriptions.push(
-        vscode.window.registerWebviewViewProvider('localpilot.chatView', provider, {
+        vscode.window.registerWebviewViewProvider('localpilot.chatView', viewProvider, {
             webviewOptions: { retainContextWhenHidden: true }
         })
     );
@@ -50,23 +79,253 @@ export function activate(context: vscode.ExtensionContext) {
                     `LocalPilot backend at ${apiUrl()} was started outside VS Code; restart it there.`);
             }
         }),
-        vscode.commands.registerCommand('tokenguard.showBackendLog', () => output.show())
+        vscode.commands.registerCommand('tokenguard.showBackendLog', () => output.show()),
+        vscode.commands.registerCommand('tokenguard.setApiKey', () => setApiKey()),
+        vscode.commands.registerCommand('tokenguard.clearApiKey', () => clearApiKey()),
+        vscode.commands.registerCommand('tokenguard.pullLocalModel', () => pullLocalModelCommand()),
+        vscode.commands.registerCommand('tokenguard.stopLocalModels', async () => {
+            const freed = await ollama?.unloadModels();
+            viewProvider?.suppressPreload();
+            void vscode.window.showInformationMessage(
+                freed && freed.length ? `TokenGuard: unloaded ${freed.join(', ')}.` : 'TokenGuard: no local models were loaded.');
+            await viewProvider?.refreshStatus();
+        })
     );
 
     // Spawn the backend now so it is warm by the time the sidebar asks for status.
     void backend.ensureRunning();
+    // Start Ollama if needed (it is stopped again on exit when we started it).
+    void ollama.ensureRunning();
 
     // Open the container so the activity bar entry is selected on launch.
     void vscode.commands.executeCommand('workbench.view.extension.localpilot-sidebar');
 }
 
 export function deactivate(): Promise<void> | undefined {
-    return backend?.stop();
+    // Stop everything this extension started: backend, local model memory, and our Ollama.
+    return Promise.all([backend?.stop(), ollama?.stop()]).then(() => undefined);
 }
 
 function apiUrl(): string {
     const url = vscode.workspace.getConfiguration('tokenguard').get<string>('apiUrl') || 'http://localhost:8000';
     return url.replace(/\/+$/, '');
+}
+
+function ollamaUrl(): string {
+    const url = vscode.workspace.getConfiguration('tokenguard').get<string>('ollamaUrl') || 'http://localhost:11434';
+    return url.replace(/\/+$/, '');
+}
+
+function cloudProvider(): string {
+    return vscode.workspace.getConfiguration('tokenguard').get<string>('cloudProvider') || 'deepseek';
+}
+
+function cloudModel(): string {
+    return (vscode.workspace.getConfiguration('tokenguard').get<string>('cloudModel') || '').trim();
+}
+
+function localModel(): string {
+    return (vscode.workspace.getConfiguration('tokenguard').get<string>('localModel') || '').trim();
+}
+
+function secretKey(provider: string): string {
+    return `${SECRET_PREFIX}${provider}`;
+}
+
+async function getApiKey(provider: string): Promise<string | undefined> {
+    return extensionContext.secrets.get(secretKey(provider));
+}
+
+/** LLM settings forwarded to the backend on every request. The key never touches disk. */
+async function llmHeaders(): Promise<Record<string, string>> {
+    const provider = cloudProvider();
+    const headers: Record<string, string> = { 'X-LLM-Provider': provider };
+    const model = cloudModel();
+    if (model) {
+        headers['X-LLM-Model'] = model;
+    }
+    const local = localModel();
+    if (local) {
+        headers['X-Local-Model'] = local;
+    }
+    const key = await getApiKey(provider);
+    if (key) {
+        headers['X-LLM-Api-Key'] = key;
+    }
+    return headers;
+}
+
+/** Ask the backend to unload the previous local model and load the selected one (one at a time). */
+async function switchLocalModel(model: string): Promise<void> {
+    try {
+        await fetch(`${apiUrl()}/local-model`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: model || null, preload: true }),
+            signal: AbortSignal.timeout(60_000)
+        });
+    } catch {
+        // Best effort: the backend re-enforces one-model-at-a-time on the next local prompt.
+    }
+}
+
+interface RecommendedModel {
+    name: string;
+    params: string;
+    size_gb: number;
+    min_ram_gb: number;
+    comfortable: boolean;
+    note: string;
+    tags: string[];
+    description: string;
+}
+
+interface ModelsInfo {
+    local_model: string;
+    local_loaded: string | null;
+    available: string[];
+    recommended: RecommendedModel[];
+    pulling: string[];
+    system: Record<string, number | boolean>;
+    ollama: boolean;
+}
+
+async function fetchModels(): Promise<ModelsInfo> {
+    return api<ModelsInfo>('GET', '/models', undefined, 10_000);
+}
+
+/** Download a model with `ollama pull` (via the backend), polling until it is installed. */
+async function downloadLocalModel(model: string): Promise<boolean> {
+    let info: ModelsInfo;
+    try {
+        info = await fetchModels();
+    } catch (err) {
+        void vscode.window.showErrorMessage(`TokenGuard: backend unreachable. ${(err as Error).message}`);
+        return false;
+    }
+    if (info.available.includes(model)) {
+        return true;
+    }
+    const rec = info.recommended.find(m => m.name === model);
+    const size = rec && rec.size_gb ? ` (~${rec.size_gb} GB)` : '';
+    return vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Notification, title: `TokenGuard: downloading ${model}${size}`, cancellable: true },
+        async (_progress, token) => {
+            try {
+                await api('POST', '/models/pull', { model }, 15_000);
+            } catch (err) {
+                void vscode.window.showErrorMessage(`TokenGuard: could not start download. ${(err as Error).message}`);
+                return false;
+            }
+            while (!token.isCancellationRequested) {
+                await new Promise(r => setTimeout(r, 2_000));
+                try {
+                    if ((await fetchModels()).available.includes(model)) {
+                        void vscode.window.showInformationMessage(`TokenGuard: ${model} is ready.`);
+                        return true;
+                    }
+                } catch {
+                    // keep polling; the pull continues on the backend
+                }
+            }
+            return false; // cancelled: the backend pull keeps running in the background
+        }
+    );
+}
+
+/** "TokenGuard: Download Local Model" — pick a recommended model and pull it. */
+async function pullLocalModelCommand(): Promise<void> {
+    let info: ModelsInfo;
+    try {
+        info = await fetchModels();
+    } catch (err) {
+        void vscode.window.showErrorMessage(`TokenGuard: backend unreachable. ${(err as Error).message}`);
+        return;
+    }
+    const items = [
+        ...info.recommended.map(m => ({
+            label: m.name,
+            description: `~${m.size_gb} GB · ${m.comfortable ? 'fits in RAM' : 'may use swap (slower)'}`,
+            detail: m.description
+        })),
+        ...info.available.map(name => ({ label: name, description: 'already installed' }))
+    ];
+    if (!items.length) {
+        void vscode.window.showInformationMessage('TokenGuard: no models available to download.');
+        return;
+    }
+    const picked = await vscode.window.showQuickPick(items, {
+        title: 'TokenGuard: Download Local Model',
+        placeHolder: 'Pick a model to pull with Ollama'
+    });
+    if (!picked) {
+        return;
+    }
+    if (info.available.includes(picked.label)) {
+        void vscode.window.showInformationMessage(`TokenGuard: ${picked.label} is already installed.`);
+        return;
+    }
+    await downloadLocalModel(picked.label);
+    await viewProvider?.refreshStatus();
+}
+
+/** "TokenGuard: Set Cloud API Key" — pick a provider and store its key in SecretStorage. */
+async function setApiKey(): Promise<void> {
+    const configured = cloudProvider();
+    const picks = KEY_PROVIDERS.map(p => ({
+        label: p,
+        description: p === configured ? 'current tokenguard.cloudProvider' : undefined
+    }));
+    const picked = await vscode.window.showQuickPick(picks, {
+        title: 'TokenGuard: Set Cloud API Key',
+        placeHolder: `Provider to store a key for (current: ${configured})`
+    });
+    if (!picked) {
+        return;
+    }
+    const provider = picked.label as KeyProvider;
+    const existing = await getApiKey(provider);
+    const value = await vscode.window.showInputBox({
+        title: `TokenGuard: ${provider} API key`,
+        prompt: existing
+            ? 'Enter a new key to replace the stored one, or leave empty to remove it.'
+            : 'Stored in VS Code SecretStorage — never written to backend files.',
+        placeHolder: existing ? '•••••••• (leave empty to clear)' : 'paste your API key',
+        password: true,
+        ignoreFocusOut: true
+    });
+    if (value === undefined) {
+        return; // cancelled
+    }
+    if (value.trim() === '') {
+        await extensionContext.secrets.delete(secretKey(provider));
+        void vscode.window.showInformationMessage(`TokenGuard: cleared the ${provider} API key.`);
+    } else {
+        await extensionContext.secrets.store(secretKey(provider), value.trim());
+        void vscode.window.showInformationMessage(`TokenGuard: ${provider} API key saved to SecretStorage.`);
+    }
+    if (provider !== configured) {
+        await vscode.workspace.getConfiguration('tokenguard')
+            .update('cloudProvider', provider, vscode.ConfigurationTarget.Global);
+    }
+    await viewProvider?.refreshStatus();
+}
+
+/** "TokenGuard: Clear Cloud API Key" — remove the key for the active provider. */
+async function clearApiKey(): Promise<void> {
+    const provider = cloudProvider();
+    if (!(await getApiKey(provider))) {
+        void vscode.window.showInformationMessage(`TokenGuard: no stored API key for ${provider}.`);
+        return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+        `Remove the stored ${provider} API key from SecretStorage?`, { modal: true }, 'Remove');
+    if (choice !== 'Remove') {
+        return;
+    }
+    await extensionContext.secrets.delete(secretKey(provider));
+    void vscode.window.showInformationMessage(`TokenGuard: cleared the ${provider} API key.`);
+    await viewProvider?.refreshStatus();
 }
 
 async function api<T>(method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number): Promise<T> {
@@ -77,7 +336,7 @@ async function api<T>(method: 'GET' | 'POST', path: string, body: unknown, timeo
     try {
         resp = await fetch(`${apiUrl()}${path}`, {
             method,
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', ...(await llmHeaders()) },
             body: body === undefined ? undefined : JSON.stringify(body),
             signal: AbortSignal.timeout(timeoutMs)
         });
@@ -126,6 +385,10 @@ function buildRequest(prompt: string): { req: ChatRequest; contextInfo: string }
 
 class LocalPilotViewProvider implements vscode.WebviewViewProvider {
     private _view?: vscode.WebviewView;
+    private _retryTimer?: NodeJS.Timeout;
+    private _retryDelayMs = 1_000;
+    private _preloadedFor?: string;      // model we've already asked the backend to load
+    private _preloadSuppressed = false;  // user explicitly unloaded: don't auto-reload until they pick again
 
     public resolveWebviewView(
         webviewView: vscode.WebviewView,
@@ -135,6 +398,10 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
         this._view = webviewView;
         webviewView.webview.options = { enableScripts: true };
         webviewView.webview.html = this._getHtmlForWebview();
+        webviewView.onDidDispose(() => {
+            this._clearRetry();
+            this._view = undefined;
+        });
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
@@ -151,6 +418,34 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                 case 'run':
                     await this._run(data.id, data.req, data.route);
                     break;
+                case 'setApiKey':
+                    await vscode.commands.executeCommand('tokenguard.setApiKey');
+                    break;
+                case 'selectLocalModel': {
+                    const model = (data.model || '') as string;
+                    if (model && data.installed === false) {
+                        const size = data.size_gb ? ` (~${data.size_gb} GB)` : '';
+                        const choice = await vscode.window.showInformationMessage(
+                            `"${model}" isn't downloaded yet${size}. Download it now?`, { modal: false }, 'Download');
+                        if (choice !== 'Download') {
+                            await this._postStatus(); // reset the dropdown to the saved value
+                            break;
+                        }
+                        if (!(await downloadLocalModel(model))) {
+                            await this._postStatus();
+                            break;
+                        }
+                    }
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('localModel', model, vscode.ConfigurationTarget.Global);
+                    this._preloadSuppressed = false;
+                    this._preloadedFor = model || undefined;
+                    // Unload the old local model and warm up the new one so only one is resident.
+                    await switchLocalModel(model);
+                    this._post({ type: 'modelLoading', model: null });
+                    await this._postStatus();
+                    break;
+                }
             }
         });
     }
@@ -163,20 +458,91 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
         void this._postStatus();
     }
 
+    /** After an explicit unload, don't auto-reload until the user picks a model again. */
+    public suppressPreload() {
+        this._preloadSuppressed = true;
+    }
+
     private async _postStatus() {
-        if (backend?.state === 'starting') {
-            this._post({ type: 'status', online: false, starting: true, apiUrl: apiUrl() });
-            return; // the state change to running/failed triggers another refresh
+        const state = backend?.state;
+        if (state === 'failed') {
+            this._post({
+                type: 'status', online: false, retrying: true,
+                error: backend?.lastError || 'backend failed to start', apiUrl: apiUrl(), localModel: localModel()
+            });
+            this._scheduleRetry(5_000); // keep retrying, but don't spin the "starting" spinner
+            return;
+        }
+        // Backend still booting (or not started yet): show the spinner and keep polling instead
+        // of flashing "offline" — the first /health can fail before uvicorn finishes importing.
+        if (state === 'starting' || state === 'stopped' || state === undefined) {
+            this._post({ type: 'status', online: false, starting: true, apiUrl: apiUrl(), localModel: localModel() });
+            void backend?.ensureRunning();
+            this._scheduleRetry();
+            return;
         }
         try {
             const [health, stats] = await Promise.all([
                 api('GET', '/health', undefined, 5_000),
                 api('GET', '/stats', undefined, 5_000)
             ]);
-            this._post({ type: 'status', online: true, health, stats, apiUrl: apiUrl() });
+            this._clearRetry();
+            this._post({ type: 'status', online: true, health, stats, apiUrl: apiUrl(), localModel: localModel() });
+            void this._maybePreload(health);
         } catch (err) {
-            this._post({ type: 'status', online: false, error: (err as Error).message, apiUrl: apiUrl() });
+            this._post({
+                type: 'status', online: false, retrying: true,
+                error: (err as Error).message, apiUrl: apiUrl(), localModel: localModel()
+            });
+            void backend?.ensureRunning(); // nudge a (re)start; harmless if it's already healthy
+            this._scheduleRetry();
         }
+    }
+
+    /** Poll again shortly (with a small backoff) until the backend answers. */
+    private _scheduleRetry(fixedDelayMs?: number) {
+        if (this._retryTimer || !this._view) {
+            return; // no view (sidebar closed) or a retry is already queued
+        }
+        const delay = fixedDelayMs ?? this._retryDelayMs;
+        this._retryTimer = setTimeout(() => {
+            this._retryTimer = undefined;
+            void this._postStatus();
+        }, delay);
+        if (fixedDelayMs === undefined) {
+            this._retryDelayMs = Math.min(this._retryDelayMs + 500, 4_000);
+        }
+    }
+
+    private _clearRetry() {
+        if (this._retryTimer) {
+            clearTimeout(this._retryTimer);
+            this._retryTimer = undefined;
+        }
+        this._retryDelayMs = 1_000;
+    }
+
+    /** Load the selected local model once the backend + Ollama are up, so it isn't shown idle. */
+    private async _maybePreload(health: any) {
+        if (this._preloadSuppressed || !vscode.workspace.getConfiguration('tokenguard').get<boolean>('preloadLocalModel', true)) {
+            return;
+        }
+        if (!health?.ollama) {
+            return; // wait until Ollama is reachable, then a later refresh will load it
+        }
+        const selected: string | undefined = health.local_model;
+        const installed: string[] = health.local_models || [];
+        if (!selected || !installed.includes(selected)) {
+            return; // nothing selected, or the model isn't pulled
+        }
+        if (health.local_loaded === selected || this._preloadedFor === selected) {
+            return;
+        }
+        this._preloadedFor = selected;
+        this._post({ type: 'modelLoading', model: selected }); // "loading…" while Ollama loads it
+        await switchLocalModel(selected);
+        this._post({ type: 'modelLoading', model: null });     // clear the spinner either way
+        void this._postStatus(); // reflect "loaded in memory" in the sidebar
     }
 
     /** Step 1: ask the backend where this prompt should go, without calling any model. */
@@ -226,6 +592,18 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                     padding: 8px;
                     box-sizing: border-box;
                     resize: vertical;
+                    font-family: inherit;
+                }
+                .model-row { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+                .model-row label { opacity: 0.85; white-space: nowrap; }
+                select {
+                    flex: 1;
+                    min-width: 0;
+                    background: var(--vscode-dropdown-background);
+                    color: var(--vscode-dropdown-foreground);
+                    border: 1px solid var(--vscode-dropdown-border);
+                    border-radius: 4px;
+                    padding: 4px 6px;
                     font-family: inherit;
                 }
                 button {
@@ -303,6 +681,12 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
         <body>
             <div class="container">
                 <div id="status" class="status">Connecting to LocalPilot backend…</div>
+                <div class="model-row">
+                    <label for="localModel">Local model</label>
+                    <select id="localModel" title="Ollama model used for local inference"></select>
+                </div>
+                <div id="modelState" class="muted"></div>
+                <div id="systemInfo" class="muted"></div>
                 <textarea id="prompt" placeholder="Ask LocalPilot about your repository… (Enter to send, Shift+Enter for newline)"></textarea>
                 <button id="send">Send Request</button>
                 <div id="history" class="chat-history"></div>
@@ -313,6 +697,7 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                 const history = document.getElementById('history');
                 const input = document.getElementById('prompt');
                 const sendBtn = document.getElementById('send');
+                const modelSelect = document.getElementById('localModel');
 
                 let nextId = 1;
                 let busy = false;               // one request at a time, like the Streamlit UI
@@ -337,6 +722,60 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                 }
 
                 function fmt(n) { return Number(n ?? 0).toLocaleString(); }
+
+                // Populate the local-model picker: installed models plus recommendations that fit
+                // this machine (pulled on demand). The empty value means "use LOCAL_MODEL from .env".
+                let installedModels = [];
+                let recommendedModels = [];
+                let loadingModel = null;   // model currently being loaded into memory
+
+                function renderModelSelect(available, recommended, pulling, current, saved, loaded) {
+                    const installed = available || [];
+                    const recs = recommended || [];
+                    const inFlight = pulling || [];
+                    installedModels = installed;
+                    recommendedModels = recs;
+                    const state = document.getElementById('modelState');
+                    if (!installed.length && !recs.length) {
+                        modelSelect.innerHTML = '<option value="">(no Ollama models found)</option>';
+                        modelSelect.disabled = true;
+                        if (state) state.textContent = '';
+                        return;
+                    }
+                    modelSelect.disabled = false;
+                    const opts = ['<option value="">Default (' + esc(current || 'backend') + ')</option>'];
+                    if (installed.length) {
+                        opts.push('<optgroup label="Installed">');
+                        installed.forEach(m => opts.push('<option value="' + esc(m) + '">' + esc(m) + '</option>'));
+                        opts.push('</optgroup>');
+                    }
+                    if (recs.length) {
+                        opts.push('<optgroup label="Recommended — needs download">');
+                        recs.forEach(m => {
+                            const size = m.size_gb ? ' — ' + m.size_gb + ' GB' : '';
+                            const warn = m.comfortable === false ? ' (may use swap)' : '';
+                            const busy = inFlight.includes(m.name) ? ' — downloading…' : '';
+                            opts.push('<option value="' + esc(m.name) + '">' + esc(m.name) + size + warn + busy + '</option>');
+                        });
+                        opts.push('</optgroup>');
+                    }
+                    modelSelect.innerHTML = opts.join('');
+                    const known = installed.concat(recs.map(m => m.name));
+                    modelSelect.value = known.includes(saved) ? saved : '';
+                    if (state) {
+                        if (loadingModel && loaded === loadingModel) {
+                            loadingModel = null; // finished loading
+                        }
+                        let text;
+                        if (loadingModel) {
+                            text = '<span class="spinner">loading ' + esc(loadingModel) + '…</span>';
+                        } else {
+                            text = loaded ? 'loaded in memory: ' + esc(loaded) : 'no model loaded';
+                        }
+                        if (inFlight.length) text += ' · downloading: ' + esc(inFlight.join(', '));
+                        state.innerHTML = text;
+                    }
+                }
 
                 function setBusy(value) {
                     busy = value;
@@ -426,7 +865,7 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                             (isLocal ? '🟢 Local inference' : '🔵 Global (cloud) LLM') + '</span>' +
                         '<div class="metrics">' + metrics + '</div>' +
                         (r.escalated ? '<div class="warn">Escalated: ' + esc(r.escalation_reason) + '</div>' : '') +
-                        (r.cloud_fallback_reason ? '<div class="warn">⚠️ Global LLM unavailable, showing the mock answer. ' + esc(r.cloud_fallback_reason) + '</div>' : '') +
+                        (r.is_mock ? '<div class="warn">⚠️ Mock answer — not a real cloud call. ' + esc(r.cloud_fallback_reason || 'CLOUD_PROVIDER=mock') + '</div>' : '') +
                         (lowConf ? '<div class="warn">The local model wasn\\'t confident about this answer.</div>' : '') +
                         '<div class="answer">' + renderMarkdown(r.answer) + '</div>' +
                         (!isLocal ? '<details' + (files ? ' open' : '') + '><summary>Context sent after compression (' + (r.files_selected || []).length + ' files)</summary>' +
@@ -444,19 +883,57 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                         return;
                     }
                     if (!m.online) {
-                        el.innerHTML = '<span class="offline">● Backend offline</span> (' + esc(m.apiUrl) + ')<div class="muted">' +
-                            esc(m.error) + '</div><div class="choices"><button id="retryStatus" class="secondary">Retry connection</button></div>';
+                        const retrying = m.retrying ? ' <span class="spinner">retrying…</span>' : '';
+                        el.innerHTML = '<span class="offline">● Backend offline</span> (' + esc(m.apiUrl) + ')' + retrying +
+                            '<div class="muted">' + esc(m.error || '') + '</div>' +
+                            '<div class="choices"><button id="retryStatus" class="secondary">Retry now</button></div>';
                         return;
                     }
                     const h = m.health, s = m.stats;
-                    el.innerHTML = '● API online · cloud: <code>' + esc(h.cloud_provider) + '</code> · local: <code>' +
-                        esc(h.local_model) + '</code> · Ollama ' + (h.ollama ? '✅' : '❌') +
+                    const provider = esc(h.cloud_provider);
+                    let cloudState;
+                    if (h.cloud_valid) {
+                        cloudState = '<code>' + provider + '</code> ✓';
+                    } else if (h.cloud_provider === 'mock') {
+                        cloudState = '<code>mock</code>';
+                    } else {
+                        cloudState = '<code>' + provider + '</code> <span class="warn">⚠ ' +
+                            esc(h.cloud_detail || 'not configured') + '</span>';
+                    }
+                    const keyBtn = (!h.cloud_valid && h.cloud_provider !== 'mock')
+                        ? '<div class="choices"><button id="setApiKey" class="secondary">🔑 Set API key</button></div>'
+                        : '';
+                    el.innerHTML = '● API online · cloud: ' + cloudState + ' · local: <code>' +
+                        esc(h.local_model) + '</code> · Ollama ' + (h.ollama ? '✅' : '❌') + keyBtn +
                         '<div class="stats"><span>🖥️ Local: <b>' + s.local_requests + '</b></span><span>☁️ Cloud: <b>' +
                         s.cloud_requests + '</b></span><span>Tokens saved: <b>' + fmt(s.total_tokens_saved) + '</b> (' +
                         s.cloud_token_reduction_pct + '%)</span></div>';
+                    const sys = document.getElementById('systemInfo');
+                    if (sys && h.system) {
+                        const g = h.system;
+                        sys.textContent = 'Host: ' + g.total_ram_gb + ' GB RAM' +
+                            (g.swap_total_gb ? ' + ' + g.swap_total_gb + ' GB swap' : '') +
+                            (g.has_gpu ? ' · ' + g.gpu_vram_gb + ' GB VRAM' : '') +
+                            ' · ' + g.cpu_count + ' CPU' + (g.cpu_count === 1 ? '' : 's');
+                    }
                 }
 
                 sendBtn.addEventListener('click', send);
+                modelSelect.addEventListener('change', () => {
+                    const value = modelSelect.value;
+                    const rec = recommendedModels.find(m => m.name === value);
+                    const installed = installedModels.includes(value);
+                    const state = document.getElementById('modelState');
+                    loadingModel = installed && value ? value : null;
+                    if (state) state.textContent = installed || !value ? 'switching…' : 'checking download…';
+                    modelSelect.disabled = true;
+                    vscode.postMessage({
+                        type: 'selectLocalModel',
+                        model: value,
+                        installed,
+                        size_gb: rec ? rec.size_gb : null
+                    });
+                });
                 input.addEventListener('keydown', e => {
                     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
                 });
@@ -464,6 +941,7 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                     const target = e.target.closest('button');
                     if (!target) return;
                     if (target.id === 'retryStatus') { vscode.postMessage({ type: 'refreshStatus' }); return; }
+                    if (target.id === 'setApiKey') { vscode.postMessage({ type: 'setApiKey' }); return; }
                     if (target.dataset.route && !busy) {
                         target.dataset.used = '1';
                         run(Number(target.dataset.id), target.dataset.route);
@@ -474,7 +952,25 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
                     const m = event.data;
                     const turn = turns.get(m.id);
                     switch (m.type) {
+                        case 'modelLoading': {
+                            loadingModel = m.model || null;
+                            const state = document.getElementById('modelState');
+                            if (state && m.model) {
+                                state.innerHTML = '<span class="spinner">loading ' + esc(m.model) + '…</span>';
+                            }
+                            break;
+                        }
                         case 'status':
+                            if (m.health) {
+                                renderModelSelect(
+                                    m.health.local_models,
+                                    m.health.local_recommended,
+                                    m.health.local_pulling,
+                                    m.health.local_model,
+                                    m.localModel,
+                                    m.health.local_loaded
+                                );
+                            }
                             renderStatus(m);
                             break;
                         case 'analysis':

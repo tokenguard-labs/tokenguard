@@ -90,6 +90,29 @@ class BackendManager {
         clearTimeout(timer);
         this._stopping = false;
     }
+    /** Synchronous best-effort kill for the process 'exit' event. */
+    killSync() {
+        const pid = this._proc?.pid;
+        if (!pid || this._proc?.exitCode !== null) {
+            return;
+        }
+        if (process.platform === 'win32') {
+            try {
+                (0, child_process_1.spawn)('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+            }
+            catch {
+                // ignore
+            }
+        }
+        else {
+            try {
+                process.kill(pid, 'SIGKILL');
+            }
+            catch {
+                // already gone
+            }
+        }
+    }
     dispose() {
         void this.stop();
         this._onDidChangeState.dispose();

@@ -64,17 +64,28 @@ LOCAL_MODEL="${LOCAL_MODEL:-$(env_get LOCAL_MODEL)}"; LOCAL_MODEL="${LOCAL_MODEL
 
 ollama_up() { curl -sf --max-time 3 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; }
 
+# Drop a marker left by a previous run whose process is gone.
+if [ -f "$ROOT/.ollama.pid" ] && ! kill -0 "$(cat "$ROOT/.ollama.pid" 2>/dev/null)" 2>/dev/null; then
+    rm -f "$ROOT/.ollama.pid"
+fi
+
 if [ "${SKIP_OLLAMA:-0}" = "1" ]; then
     warn "skipped (SKIP_OLLAMA=1)"
 elif ! command -v ollama >/dev/null; then
     warn "ollama not installed: local answers won't work. Install from https://ollama.com and re-run."
 else
     if ollama_up; then
-        ok "running at $OLLAMA_URL"
+        ok "running at $OLLAMA_URL (external; the extension won't stop it)"
     else
         nohup ollama serve > "$ROOT/.ollama.log" 2>&1 &
+        OLLAMA_PID=$!
+        echo "$OLLAMA_PID" > "$ROOT/.ollama.pid"
         for _ in $(seq 1 30); do ollama_up && break; sleep 0.5; done
-        if ollama_up; then ok "started ollama serve (log: .ollama.log)"; else warn "could not start ollama (see .ollama.log)"; fi
+        if ollama_up; then
+            ok "started ollama serve (pid $OLLAMA_PID; the extension stops it when VS Code closes)"
+        else
+            warn "could not start ollama (see .ollama.log)"
+        fi
     fi
 
     if ollama_up; then

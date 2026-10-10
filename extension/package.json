@@ -31,6 +31,26 @@
         "command": "tokenguard.showBackendLog",
         "title": "Show Backend Log",
         "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.setApiKey",
+        "title": "Set Cloud API Key",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.clearApiKey",
+        "title": "Clear Cloud API Key",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.pullLocalModel",
+        "title": "Download Local Model",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.stopLocalModels",
+        "title": "Unload Local Models",
+        "category": "TokenGuard"
       }
     ],
     "viewsContainers": {
@@ -74,6 +94,53 @@
           "type": "string",
           "default": "",
           "description": "Python interpreter for the backend. Empty: <repo>/.venv (created by `make setup`)."
+        },
+        "tokenguard.cloudProvider": {
+          "type": "string",
+          "enum": [
+            "deepseek",
+            "anthropic",
+            "openai",
+            "mock"
+          ],
+          "enumDescriptions": [
+            "DeepSeek (OpenAI-compatible)",
+            "Anthropic Claude",
+            "Any OpenAI-compatible API (OpenAI, Groq, OpenRouter, …)",
+            "Mock provider: no real cloud call (for demos only)"
+          ],
+          "default": "deepseek",
+          "description": "Global (cloud) LLM provider used for escalated/complex prompts. Sent to the backend with each request; overrides CLOUD_PROVIDER in backend/.env."
+        },
+        "tokenguard.cloudModel": {
+          "type": "string",
+          "default": "",
+          "description": "Model name for the selected provider (e.g. deepseek-chat, gpt-4o-mini, claude-sonnet-5-5). Empty: the provider/model default in backend/.env."
+        },
+        "tokenguard.localModel": {
+          "type": "string",
+          "default": "",
+          "description": "Ollama model used for local inference (e.g. qwen2.5-coder:1.5b). Empty: LOCAL_MODEL from backend/.env. Pick one from the LocalPilot sidebar dropdown."
+        },
+        "tokenguard.ollamaUrl": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "URL of the local Ollama server."
+        },
+        "tokenguard.preloadLocalModel": {
+          "type": "boolean",
+          "default": true,
+          "description": "Load the selected local model when VS Code opens so the first local prompt is warm (it stays loaded until exit)."
+        },
+        "tokenguard.autoStartOllama": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start `ollama serve` with the extension when it isn't already running. Ollama is stopped again when VS Code closes."
+        },
+        "tokenguard.stopOllamaOnExit": {
+          "type": "boolean",
+          "default": true,
+          "description": "On exit, stop the `ollama serve` process that TokenGuard/setup started. Local models are always unloaded to free RAM; an Ollama you started yourself (e.g. a systemd service) is never killed."
         }
       }
     }

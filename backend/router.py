@@ -7,7 +7,7 @@ from . import config
 from .analyzer import analyze
 from .contracts import ContextResult
 from .context import ResolvedRequest, optimize_context, redact_text, repo_stats, resolve_request
-from .llm import LLMResult, call_cloud, call_local
+from .llm import LLMResult, call_cloud, call_local, effective_provider
 from .tokens import count_tokens
 
 log = logging.getLogger("localpilot.router")
@@ -55,7 +55,7 @@ def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dic
         "repo_path": req.repo_path,
         "context_sources": req.sources,
         "min_local_confidence": config.MIN_LOCAL_CONFIDENCE,
-        "cloud_provider": config.CLOUD_PROVIDER,
+        "cloud_provider": effective_provider(),
     }
 
 
@@ -138,5 +138,6 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
         "local_latency_ms": local.latency_ms if local else None,
         "cloud_latency_ms": cloud.latency_ms if cloud else None,
         "cloud_fallback_reason": cloud.fallback_reason if cloud else None,
+        "is_mock": bool(final.is_mock),
         "trace": trace,
     }

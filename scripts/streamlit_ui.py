@@ -55,8 +55,14 @@ def run_and_record(req, route, analysis):
 with st.sidebar:
     st.header("🧭 LocalPilot")
     try:
-        health = requests.get(f"{API}/health", timeout=3).json()
-        st.success(f"API online · cloud: `{health['cloud_provider']}`")
+        health = requests.get(f"{API}/health", timeout=10).json()
+        provider = health["cloud_provider"]
+        if health.get("cloud_valid"):
+            st.success(f"API online · cloud: `{provider}` ✓")
+        elif provider == "mock":
+            st.info("API online · cloud: `mock` (no real model)")
+        else:
+            st.warning(f"API online · cloud `{provider}` unusable: {health.get('cloud_detail')}")
         st.caption(f"Local model: `{health['local_model']}` · Ollama {'✅' if health['ollama'] else '❌'}")
     except Exception:
         st.error("API offline. Start it with:\n\n`make backend`")
@@ -73,6 +79,8 @@ with st.sidebar:
         c1.metric("Local", s["local_requests"])
         c2.metric("Cloud", s["cloud_requests"])
         st.metric("Cloud tokens saved", f"{s['total_tokens_saved']:,}", f"{s['cloud_token_reduction_pct']}%")
+        if s.get("mock_requests"):
+            st.caption(f"{s['mock_requests']} mock response(s) excluded from cloud metrics")
     except Exception:
         pass
 
@@ -96,11 +104,13 @@ def render_meta(meta, idx):
             run_and_record(meta["request"], "cloud", meta["analysis"])
             st.rerun()
     else:
-        st.caption(f"☁️ **Global LLM** · `{meta['model']}` · {meta['latency_ms']} ms · "
-                   f"sent {meta['sent_tokens']:,} of {meta['original_tokens']:,} tokens "
+        mock = meta.get("is_mock")
+        st.caption(f"{'🧪' if mock else '☁️'} **{'Mock LLM' if mock else 'Global LLM'}** · `{meta['model']}` · "
+                   f"{meta['latency_ms']} ms · sent {meta['sent_tokens']:,} of {meta['original_tokens']:,} tokens "
                    f"(saved {meta['tokens_saved']:,}) · {meta['secrets_redacted']} secrets masked")
-        if meta.get("cloud_fallback_reason"):
-            st.warning(f"Global LLM unavailable, showing the mock answer. {meta['cloud_fallback_reason']}")
+        if mock:
+            detail = meta.get("cloud_fallback_reason") or "CLOUD_PROVIDER=mock"
+            st.warning(f"Mock answer — not a real cloud call. {detail}")
         if meta.get("files_selected"):
             st.caption("Context sent: " + ", ".join(f"`{f}`" for f in meta["files_selected"]))
     with st.expander("Why this route?"):

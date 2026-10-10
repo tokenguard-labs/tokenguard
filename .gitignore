@@ -10,3 +10,7 @@ examples/frozen_repo/
 
 # Local env
 .env
+
+# Ollama process started by setup.sh (killed by the extension on exit)
+.ollama.pid
+.ollama.log

@@ -18,14 +18,54 @@ If you have any requirements or dependencies, add a section describing those and
 
 ## Extension Settings
 
-Include if your extension adds any VS Code settings through the `contributes.configuration` extension point.
+* `tokenguard.apiUrl`: URL of the LocalPilot backend (default `http://localhost:8000`).
+* `tokenguard.autoStartBackend`: Start the backend as a child process on activation.
+* `tokenguard.backendPath`, `tokenguard.pythonPath`: Override the backend folder / Python interpreter.
+* `tokenguard.cloudProvider`: Global LLM provider — `deepseek`, `anthropic`, `openai`, or `mock`.
+* `tokenguard.cloudModel`: Model name for the selected provider (empty = provider default).
+* `tokenguard.localModel`: Ollama model for local inference (empty = `LOCAL_MODEL` from `backend/.env`).
+* `tokenguard.ollamaUrl`: URL of the local Ollama server (default `http://localhost:11434`).
+* `tokenguard.autoStartOllama`: Start `ollama serve` with the extension if it isn't running (default `true`).
+* `tokenguard.preloadLocalModel`: Load the selected model when VS Code opens so it isn't shown idle (default `true`).
+* `tokenguard.stopOllamaOnExit`: On exit, stop the `ollama serve` started by TokenGuard/setup (default `true`). Models are always unloaded to free RAM; externally started Ollama is never killed.
 
-For example:
+## Choosing a local model
 
-This extension contributes the following settings:
+The LocalPilot sidebar has a **Local model** dropdown with two groups (from `GET /models`,
+backed by `/health`):
 
-* `myExtension.enable`: Enable/disable this extension.
-* `myExtension.thing`: Set to `blah` to do something.
+- **Installed** — every model Ollama has already pulled.
+- **Recommended — needs download** — models that fit this machine, chosen from the host's
+  detected RAM/swap/VRAM (models that only fit by using swap are marked "may use swap").
+  Selecting one asks whether to download it (`ollama pull`) and shows progress.
+
+Pick one before sending a prompt; the choice is saved to `tokenguard.localModel` and sent to the
+backend as the `X-Local-Model` header. "Default" uses `LOCAL_MODEL` from `backend/.env`. You can
+also run **TokenGuard: Download Local Model** from the command palette to pull a model directly.
+
+Changing the selection calls `PUT /local-model`, which **unloads the previously loaded model
+first** and then preloads the new one, so only one local model is resident in RAM/VRAM at a time.
+The sidebar shows which model is currently `loaded in memory`. A `preload` flag lets the backend
+load the model immediately; if it's disabled, the model loads on the next prompt.
+
+## Process cleanup on exit
+
+When VS Code closes, the extension stops everything **it** started: the backend process, the
+loaded local model(s) (freeing RAM/VRAM), and the `ollama serve` it launched. An Ollama that was
+already running (systemd, or started outside the extension) is **not** killed — only its models
+are unloaded. `setup.sh` writes the PID to `.ollama.pid` when it starts Ollama so the extension
+can stop that process. Use **TokenGuard: Unload Local Models** to free memory without exiting, or
+set `tokenguard.stopOllamaOnExit=false` to leave the managed Ollama running.
+
+## API keys
+
+Cloud API keys are stored with VS Code's **SecretStorage** and sent to the backend as
+`X-LLM-Provider` / `X-LLM-Model` / `X-LLM-Api-Key` headers on each request, so they are never
+written to `backend/.env` or any other file.
+
+* Run **TokenGuard: Set Cloud API Key** to choose a provider and enter (or clear) a key.
+* Run **TokenGuard: Clear Cloud API Key** to remove the key for the active provider.
+* The sidebar shows whether the active key validated; `/health` exposes `cloud_valid` / `cloud_detail`.
 
 ## Known Issues
 

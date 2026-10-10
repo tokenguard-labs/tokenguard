@@ -62,6 +62,27 @@ export class BackendManager implements vscode.Disposable {
         this._stopping = false;
     }
 
+    /** Synchronous best-effort kill for the process 'exit' event. */
+    killSync(): void {
+        const pid = this._proc?.pid;
+        if (!pid || this._proc?.exitCode !== null) {
+            return;
+        }
+        if (process.platform === 'win32') {
+            try {
+                spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
+            } catch {
+                // ignore
+            }
+        } else {
+            try {
+                process.kill(pid, 'SIGKILL');
+            } catch {
+                // already gone
+            }
+        }
+    }
+
     dispose(): void {
         void this.stop();
         this._onDidChangeState.dispose();

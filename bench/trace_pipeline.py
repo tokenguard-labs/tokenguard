@@ -9,6 +9,9 @@ import time
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
+# This transcript is written against the mock provider; force it before config loads .env
+os.environ["CLOUD_PROVIDER"] = "mock"
+
 from backend import config
 from backend.tokens import count_tokens
 from compression.adapter import optimize_context

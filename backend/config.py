@@ -22,11 +22,17 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen2.5-coder:1.5b")
 LOCAL_TIMEOUT_S = float(os.getenv("LOCAL_TIMEOUT_S", "120"))
 LOCAL_NUM_CTX = int(os.getenv("LOCAL_NUM_CTX", "8192"))  # Ollama's default window silently truncates
+# How long to keep the active local model resident between prompts. Only one is kept loaded at a
+# time regardless: switching models unloads the previous one first.
+LOCAL_KEEP_ALIVE = os.getenv("LOCAL_KEEP_ALIVE", "30m")
 
 # Cloud (global) LLM: "deepseek", "anthropic", "openai" (any OpenAI-compatible API), or "mock"
 CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "deepseek")
-# If the real cloud call fails (no key, network, API error), answer with the mock instead of erroring
-CLOUD_FALLBACK_TO_MOCK = os.getenv("CLOUD_FALLBACK_TO_MOCK", "true").lower() in ("1", "true", "yes")
+# If the real cloud call fails (no key, network, API error), surface the error instead of silently
+# answering with the mock. Opt in to mock fallback explicitly with CLOUD_FALLBACK_TO_MOCK=true.
+CLOUD_FALLBACK_TO_MOCK = os.getenv("CLOUD_FALLBACK_TO_MOCK", "false").lower() in ("1", "true", "yes")
+# How long (seconds) a /health provider credential check is cached before re-pinging
+CLOUD_HEALTHCHECK_TTL_S = float(os.getenv("CLOUD_HEALTHCHECK_TTL_S", "60"))
 
 DEEPSEEK_URL = os.getenv("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
 DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
