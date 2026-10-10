@@ -28,6 +28,7 @@ export function activate(context: vscode.ExtensionContext) {
     viewProvider = new LocalPilotViewProvider(context.extensionUri, {
         backend: () => backend,
         api,
+        apiStream,
         apiUrl,
         localModel,
         switchLocalModel,
@@ -326,9 +327,6 @@ async function clearApiKey(): Promise<void> {
 async function api<T>(
     method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number, signal?: AbortSignal
 ): Promise<T> {
-    if (backend?.state === 'starting') {
-        await backend.ensureRunning();
-    }
     // One controller for both the timeout and the caller's cancel (the sidebar's Stop button).
     const controller = new AbortController();
     let timedOut = false;
@@ -342,36 +340,134 @@ async function api<T>(
     }
     signal?.addEventListener('abort', onAbort, { once: true });
     try {
-        let resp: Response;
-        try {
-            resp = await fetch(`${apiUrl()}${path}`, {
-                method,
-                headers: { 'Content-Type': 'application/json', ...(await llmHeaders()) },
-                body: body === undefined ? undefined : JSON.stringify(body),
-                signal: controller.signal
-            });
-        } catch (err) {
-            if (signal?.aborted) {
-                throw err; // cancelled by the caller, who already knows why
-            }
-            const reason = timedOut ? 'timed out' : 'is not reachable';
-            const hint = backend?.lastError
-                ? `Auto-start failed: ${backend.lastError}`
-                : 'Run "TokenGuard: Restart Backend" or start it with `make backend` in the repo root.';
-            throw new Error(`LocalPilot backend at ${apiUrl()} ${reason}. ${hint}`);
-        }
-        if (!resp.ok) {
-            let detail = await resp.text();
-            try {
-                detail = JSON.parse(detail).detail ?? detail;
-            } catch {
-                // plain-text error body
-            }
-            throw new Error(`Backend error ${resp.status}: ${detail}`);
-        }
+        const resp = await backendFetch(method, path, body, controller.signal, signal, () => timedOut);
         return (await resp.json()) as T;
     } finally {
         clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
     }
+}
+
+/**
+ * POST to a Server-Sent Events endpoint (/chat/stream): `onEvent` gets each event as it arrives,
+ * and the promise resolves with the `done` event's data (or rejects with the `error` event's).
+ * The timeout is an idle timeout: the backend sends a heartbeat while it has nothing else to say,
+ * so it only fires when the connection really stalls, however long the answer takes.
+ */
+async function apiStream<T>(
+    path: string, body: unknown, onEvent: (event: string, data: any) => void, idleTimeoutMs: number, signal?: AbortSignal
+): Promise<T> {
+    const controller = new AbortController();
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+    const resetIdle = () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => {
+            timedOut = true;
+            controller.abort();
+        }, idleTimeoutMs);
+    };
+    const onAbort = () => controller.abort();
+    if (signal?.aborted) {
+        controller.abort();
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+    resetIdle();
+    try {
+        const resp = await backendFetch('POST', path, body, controller.signal, signal, () => timedOut, 'text/event-stream');
+        if (!resp.body) {
+            throw new Error('Backend returned an empty stream');
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+            let chunk: Awaited<ReturnType<typeof reader.read>>;
+            try {
+                chunk = await reader.read();
+            } catch (err) {
+                if (timedOut && !signal?.aborted) {
+                    throw new Error(`LocalPilot backend stopped responding (no data for ${Math.round(idleTimeoutMs / 1000)}s).`);
+                }
+                throw err;
+            }
+            if (chunk.done) {
+                break;
+            }
+            resetIdle();
+            buffer = (buffer + decoder.decode(chunk.value, { stream: true })).replace(/\r\n/g, '\n');
+            let end: number;
+            while ((end = buffer.indexOf('\n\n')) >= 0) {
+                const block = buffer.slice(0, end);
+                buffer = buffer.slice(end + 2);
+                let event = 'message';
+                const data: string[] = [];
+                for (const line of block.split('\n')) {
+                    if (line.startsWith('event:')) {
+                        event = line.slice(6).trim();
+                    } else if (line.startsWith('data:')) {
+                        data.push(line.slice(5).replace(/^ /, ''));
+                    } // ":" lines are heartbeats
+                }
+                if (!data.length) {
+                    continue;
+                }
+                const payload = JSON.parse(data.join('\n'));
+                if (event === 'done') {
+                    return payload as T;
+                }
+                if (event === 'error') {
+                    throw new Error(`Backend error ${payload.status}: ${payload.message}`);
+                }
+                onEvent(event, payload);
+            }
+        }
+        throw new Error('LocalPilot backend closed the stream before the answer finished.');
+    } finally {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        controller.abort(); // release the connection if we stopped reading early
+    }
+}
+
+/** fetch() against the backend with LLM headers; turns network and HTTP failures into readable errors. */
+async function backendFetch(
+    method: 'GET' | 'POST', path: string, body: unknown, signal: AbortSignal,
+    callerSignal: AbortSignal | undefined, timedOut: () => boolean, accept?: string
+): Promise<Response> {
+    if (backend?.state === 'starting') {
+        await backend.ensureRunning();
+    }
+    let resp: Response;
+    try {
+        resp = await fetch(`${apiUrl()}${path}`, {
+            method,
+            headers: {
+                'Content-Type': 'application/json',
+                ...(accept ? { Accept: accept } : {}),
+                ...(await llmHeaders())
+            },
+            body: body === undefined ? undefined : JSON.stringify(body),
+            signal
+        });
+    } catch (err) {
+        if (callerSignal?.aborted) {
+            throw err; // cancelled by the caller, who already knows why
+        }
+        const reason = timedOut() ? 'timed out' : 'is not reachable';
+        const hint = backend?.lastError
+            ? `Auto-start failed: ${backend.lastError}`
+            : 'Run "TokenGuard: Restart Backend" or start it with `make backend` in the repo root.';
+        throw new Error(`LocalPilot backend at ${apiUrl()} ${reason}. ${hint}`);
+    }
+    if (!resp.ok) {
+        let detail = await resp.text();
+        try {
+            detail = JSON.parse(detail).detail ?? detail;
+        } catch {
+            // plain-text error body
+        }
+        throw new Error(`Backend error ${resp.status}: ${detail}`);
+    }
+    return resp;
 }

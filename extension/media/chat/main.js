@@ -13,7 +13,7 @@
     let nextId = 1;
     let busy = false;               // one request at a time, like the Streamlit UI
     let activeId = null;            // turn whose request is in flight (what Stop cancels)
-    const turns = new Map();        // id -> { prompt, req, analysis, el, pendingEl }
+    const turns = new Map();        // id -> { prompt, req, analysis, el, pendingEl, stream }
 
     const EXAMPLES = [
         'Explain what the selected code does',
@@ -245,6 +245,7 @@
         turn.pendingEl = el || addCard('');
         turn.pendingEl.innerHTML = '<span class="spinner">Asking the ' + label + '…</span>';
         turn.route = route;
+        endStream(turn);
         setBusy(true, id);
         vscode.postMessage({ type: 'run', id, req: turn.req, route });
     }
@@ -310,8 +311,70 @@
             '</div>';
     }
 
+    function routeBadge(isLocal) {
+        return '<span class="badge ' + (isLocal ? 'local' : 'cloud') + '">' +
+            (isLocal ? '🟢 Local inference' : '🔵 Global (cloud) LLM') + '</span>';
+    }
+
+    // ---- Streaming ------------------------------------------------------------------------
+    // While /chat/stream runs, the card shows the answer as it is generated; the final 'result'
+    // re-renders it with the metrics. Markdown is re-rendered at most every STREAM_RENDER_MS.
+
+    const STREAM_RENDER_MS = 60;
+
+    function onStream(id, event, data) {
+        const turn = turns.get(id);
+        const el = turn.pendingEl;
+        if (!el) return;
+        if (event === 'start') {
+            // A second start (escalation from local to cloud) replaces the first answer.
+            endStream(turn);
+            turn.stream = { text: '' };
+            el.innerHTML = routeBadge(data.route === 'local') +
+                '<div class="metrics"><b>Model:</b> ' + esc(data.model) + ' · <span class="spinner">generating…</span></div>' +
+                (data.escalation_reason ? '<div class="warn">Escalated: ' + esc(data.escalation_reason) + '</div>' : '') +
+                '<div class="stream-note"></div><div class="answer"></div>';
+            return;
+        }
+        if (!turn.stream) return;
+        if (event === 'delta') {
+            turn.stream.text += data.text;
+        } else if (event === 'reset') {
+            turn.stream.text = '';
+            const note = el.querySelector('.stream-note');
+            if (note) note.innerHTML = '<div class="warn">' + esc(data.reason) + '</div>';
+        }
+        if (!turn.stream.timer) {
+            turn.stream.timer = setTimeout(() => {
+                if (!turn.stream) return;
+                turn.stream.timer = null;
+                const answer = el.querySelector('.answer');
+                if (answer) fillMarkdown(answer, turn.stream.text);
+            }, STREAM_RENDER_MS);
+        }
+    }
+
+    /** Stop streaming into the turn's card; returns the text received so far. */
+    function endStream(turn) {
+        const stream = turn.stream;
+        turn.stream = null;
+        if (!stream) return '';
+        clearTimeout(stream.timer);
+        return stream.text;
+    }
+
+    /** A partial streamed answer, kept on the card when the run is stopped or fails. */
+    function partialAnswer(el, text) {
+        if (!text) return;
+        const answer = document.createElement('div');
+        answer.className = 'answer partial';
+        el.prepend(answer);
+        fillMarkdown(answer, text);
+    }
+
     function renderResult(id, r) {
         const turn = turns.get(id);
+        endStream(turn);
         const isLocal = r.route === 'local';
         const minConf = turn.analysis ? turn.analysis.min_local_confidence : null;
         const conf = r.confidence == null ? 'n/a' : Math.round(r.confidence * 100) + '%';
@@ -341,8 +404,7 @@
 
         const el = turn.pendingEl;
         el.innerHTML =
-            '<span class="badge ' + (isLocal ? 'local' : 'cloud') + '">' +
-                (isLocal ? '🟢 Local inference' : '🔵 Global (cloud) LLM') + '</span>' +
+            routeBadge(isLocal) +
             '<div class="metrics">' + metrics + '</div>' +
             (r.escalated ? '<div class="warn">Escalated: ' + esc(r.escalation_reason) + '</div>' : '') +
             (r.is_mock ? '<div class="warn">⚠️ Mock answer — not a real cloud call. ' + esc(r.cloud_fallback_reason || 'CLOUD_PROVIDER=mock') + '</div>' : '') +
@@ -364,6 +426,7 @@
             ? '<button class="secondary" data-retry="run" data-id="' + id + '" data-retry-route="' + esc(turn.route) + '">↻ Retry</button>'
             : '<button class="secondary" data-retry="analyze" data-id="' + id + '">↻ Retry</button>';
         el.innerHTML = '<div class="cancelled">⏹ Stopped.</div><div class="choices">' + retry + '</div>';
+        partialAnswer(el, endStream(turn));
         turn.pendingEl = null;
     }
 
@@ -485,8 +548,8 @@
         const m = event.data;
         const turn = turns.get(m.id);
         // A late reply for a turn that was cleared from the view: drop it.
-        if (['analysis', 'result', 'error', 'cancelled'].includes(m.type) && m.id !== undefined && !turn) {
-            if (m.id === activeId) setBusy(false);
+        if (['analysis', 'stream', 'result', 'error', 'cancelled'].includes(m.type) && m.id !== undefined && !turn) {
+            if (m.id === activeId && m.type !== 'stream') setBusy(false);
             return;
         }
         switch (m.type) {
@@ -528,6 +591,9 @@
                     run(m.id, 'local');
                 }
                 break;
+            case 'stream':
+                onStream(m.id, m.event, m.data);
+                break;
             case 'result':
                 renderResult(m.id, m.result);
                 setBusy(false);
@@ -539,7 +605,10 @@
             case 'error': {
                 const el = turn ? (turn.pendingEl || turn.el) : addCard('');
                 el.innerHTML = '<div class="error">⚠️ ' + esc(m.message) + '</div>';
-                if (turn) turn.pendingEl = null;
+                if (turn) {
+                    partialAnswer(el, endStream(turn));
+                    turn.pendingEl = null;
+                }
                 setBusy(false);
                 break;
             }

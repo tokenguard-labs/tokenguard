@@ -37,7 +37,8 @@ exports.LocalPilotViewProvider = void 0;
 const fs = __importStar(require("fs"));
 const vscode = __importStar(require("vscode"));
 const ANALYZE_TIMEOUT_MS = 60_000;
-const CHAT_TIMEOUT_MS = 600_000; // local 7B models can be slow on a cold start
+// Idle, not total: the backend streams tokens and sends a heartbeat every 15s while a model loads.
+const STREAM_IDLE_TIMEOUT_MS = 60_000;
 // Code-fence names (as highlight.js reports them) that differ from VS Code language ids.
 const LANGUAGE_ALIASES = {
     js: 'javascript', jsx: 'javascriptreact', ts: 'typescript', tsx: 'typescriptreact',
@@ -279,7 +280,8 @@ class LocalPilotViewProvider {
         // Aborting closes the connection; the backend notices and cancels the model call.
         const controller = this._track(id);
         try {
-            const result = await this._host.api('POST', '/chat', { ...req, force_route: route }, CHAT_TIMEOUT_MS, controller.signal);
+            // start / delta / reset events render the answer while it's generated; 'result' finalizes it.
+            const result = await this._host.apiStream('/chat/stream', { ...req, force_route: route }, (event, data) => this._post({ type: 'stream', id, event, data }), STREAM_IDLE_TIMEOUT_MS, controller.signal);
             this._post({ type: 'result', id, route, result });
         }
         catch (err) {

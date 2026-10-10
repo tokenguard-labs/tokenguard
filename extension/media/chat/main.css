@@ -134,6 +134,7 @@ details.acc > .acc-body { padding: 4px 8px 8px; }
 
 /* Model answers (markdown) */
 .answer { margin: 0; line-height: 1.45; overflow-wrap: anywhere; }
+.answer.partial { margin-bottom: 8px; opacity: 0.85; }
 .answer > :first-child { margin-top: 0; }
 .answer > :last-child { margin-bottom: 0; }
 .answer p { margin: 0 0 8px 0; }

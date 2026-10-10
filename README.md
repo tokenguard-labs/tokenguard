@@ -99,6 +99,7 @@ All Python runs from the repo root: `backend` and `compression` are sibling pack
 |---|---|
 | `POST /analyze` | `{prompt, code, repo_path}` → decision, score, reasons, repo searched, files selected, token estimate. No model called. |
 | `POST /chat` | Same body + `force_route: auto \| local \| cloud` → answer, route, model, confidence, tokens sent/saved, files, secrets masked, trace |
+| `POST /chat/stream` | Same as `/chat`, streamed as Server-Sent Events: `start` {route, model} when a model begins answering, `delta` {text} per token chunk, `reset` {reason} if the text so far is discarded, then `done` {the `/chat` response} or `error` {status, message}. Sends a `: ping` comment every `SSE_HEARTBEAT_S` (15s) while idle. Used by the VS Code sidebar. |
 | `GET /stats` | Session totals: local/cloud requests, escalations, tokens saved |
 | `GET /health` | Backend status, Ollama reachability, active local model + available local models, active cloud provider/model, and whether its API key validated |
 | `GET /models` | Installed local models + active/loaded one, host resources (RAM/swap/VRAM), and recommended models that fit and can be pulled |

@@ -7,7 +7,7 @@ from . import config
 from .analyzer import analyze
 from .contracts import ContextResult
 from .context import ResolvedRequest, optimize_context, redact_text, repo_stats, resolve_request
-from .llm import LLMResult, call_cloud, call_local, effective_provider
+from .llm import Emit, LLMResult, call_cloud, call_local, effective_local_model, effective_model, effective_provider
 from .tokens import count_tokens
 
 log = logging.getLogger("localpilot.router")
@@ -59,7 +59,13 @@ def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dic
     }
 
 
-async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", force_route: str = "auto") -> Dict[str, Any]:
+async def handle(
+    prompt: str, repo_path: Optional[str] = None, code: str = "", force_route: str = "auto",
+    emit: Optional[Emit] = None,
+) -> Dict[str, Any]:
+    """Run the pipeline. With `emit`, also stream progress: "start" {route, model} when a model
+    begins answering (a second "start" means the earlier text was superseded by an escalation),
+    then that model's "delta"/"reset" events."""
     start = time.perf_counter()
     trace: List[str] = []
 
@@ -81,7 +87,9 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
         try:
             # Local model is private, so it can see the same optimized context
             ctx = compress(req, trace)
-            local = await call_local(prompt, ctx.context)
+            if emit:
+                emit("start", {"route": "local", "model": effective_local_model()})
+            local = await call_local(prompt, ctx.context, emit)
             trace.append(f"local confidence={local.confidence} needs_cloud={local.needs_cloud}")
             if local.confidence < config.MIN_LOCAL_CONFIDENCE:
                 escalation_reason = f"local confidence {local.confidence} < {config.MIN_LOCAL_CONFIDENCE}"
@@ -102,7 +110,11 @@ async def handle(prompt: str, repo_path: Optional[str] = None, code: str = "", f
         # context leaves the machine (reused if the local attempt already built it for this request)
         if ctx is None:
             ctx = compress(req, trace)
-        cloud = await call_cloud(cloud_prompt, ctx.context)
+        if emit:
+            provider = effective_provider()
+            emit("start", {"route": "cloud", "model": effective_model(provider) or provider,
+                           "escalation_reason": escalation_reason if escalated else None})
+        cloud = await call_cloud(cloud_prompt, ctx.context, emit)
         if cloud.fallback_reason:
             trace.append(f"cloud fallback: {cloud.fallback_reason}")
 
