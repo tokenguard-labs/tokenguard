@@ -30,7 +30,7 @@ Request (prompt + optional code + optional repo_path)
    ▼
 3. Context optimizer: pick the relevant files, keep them under a 3,000-token budget
    │
-   ├─ LOCAL / LOCAL FIRST ─► Ollama (qwen2.5-coder:7b)
+   ├─ LOCAL / LOCAL FIRST ─► Ollama (qwen2.5-coder:1.5b)
    │                          returns {answer, confidence, needs_cloud}
    │                          │
    │                          ├─ confidence ≥ 0.7 and needs_cloud = false → return local answer ✅

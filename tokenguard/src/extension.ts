@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { BackendManager } from './backend';
 
 // Talks to the LocalPilot backend (localpilot/app/main.py):
 //   POST /analyze  -> routing decision only, no model called
@@ -18,10 +19,17 @@ interface ChatRequest {
 const ANALYZE_TIMEOUT_MS = 60_000;
 const CHAT_TIMEOUT_MS = 600_000; // local 7B models can be slow on a cold start
 
+let backend: BackendManager | undefined;
+
 export function activate(context: vscode.ExtensionContext) {
     console.log('⚡ LocalPilot extension activated successfully!');
 
+    const output = vscode.window.createOutputChannel('LocalPilot Backend');
+    backend = new BackendManager(context.extensionPath, output, apiUrl);
+    context.subscriptions.push(output, backend);
+
     const provider = new LocalPilotViewProvider();
+    context.subscriptions.push(backend.onDidChangeState(() => provider.refreshStatus()));
 
     // Register Webview Provider
     context.subscriptions.push(
@@ -34,14 +42,27 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         vscode.commands.registerCommand('tokenguard.openChat', () => {
             vscode.commands.executeCommand('localpilot.chatView.focus');
-        })
+        }),
+        vscode.commands.registerCommand('tokenguard.restartBackend', async () => {
+            await backend?.restart();
+            if (backend?.state === 'external') {
+                void vscode.window.showInformationMessage(
+                    `LocalPilot backend at ${apiUrl()} was started outside VS Code; restart it there.`);
+            }
+        }),
+        vscode.commands.registerCommand('tokenguard.showBackendLog', () => output.show())
     );
+
+    // Spawn the backend now so it is warm by the time the sidebar asks for status.
+    void backend.ensureRunning();
 
     // Open the container so the activity bar entry is selected on launch.
     void vscode.commands.executeCommand('workbench.view.extension.localpilot-sidebar');
 }
 
-export function deactivate() {}
+export function deactivate(): Promise<void> | undefined {
+    return backend?.stop();
+}
 
 function apiUrl(): string {
     const url = vscode.workspace.getConfiguration('tokenguard').get<string>('apiUrl') || 'http://localhost:8000';
@@ -49,6 +70,9 @@ function apiUrl(): string {
 }
 
 async function api<T>(method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number): Promise<T> {
+    if (backend?.state === 'starting') {
+        await backend.ensureRunning();
+    }
     let resp: Response;
     try {
         resp = await fetch(`${apiUrl()}${path}`, {
@@ -59,10 +83,10 @@ async function api<T>(method: 'GET' | 'POST', path: string, body: unknown, timeo
         });
     } catch (err) {
         const reason = err instanceof Error && err.name === 'TimeoutError' ? 'timed out' : 'is not reachable';
-        throw new Error(
-            `LocalPilot backend at ${apiUrl()} ${reason}. Start it with: ` +
-            'cd localpilot && uvicorn app.main:app --reload --port 8000'
-        );
+        const hint = backend?.lastError
+            ? `Auto-start failed: ${backend.lastError}`
+            : 'Run "TokenGuard: Restart Backend" or start it with `make backend` in the repo root.';
+        throw new Error(`LocalPilot backend at ${apiUrl()} ${reason}. ${hint}`);
     }
     if (!resp.ok) {
         let detail = await resp.text();
@@ -115,7 +139,10 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case 'ready':
+                    await this._postStatus();
+                    break;
                 case 'refreshStatus':
+                    await backend?.ensureRunning();
                     await this._postStatus();
                     break;
                 case 'sendPrompt':
@@ -132,7 +159,15 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
         void this._view?.webview.postMessage(message);
     }
 
+    public refreshStatus() {
+        void this._postStatus();
+    }
+
     private async _postStatus() {
+        if (backend?.state === 'starting') {
+            this._post({ type: 'status', online: false, starting: true, apiUrl: apiUrl() });
+            return; // the state change to running/failed triggers another refresh
+        }
         try {
             const [health, stats] = await Promise.all([
                 api('GET', '/health', undefined, 5_000),
@@ -404,6 +439,10 @@ class LocalPilotViewProvider implements vscode.WebviewViewProvider {
 
                 function renderStatus(m) {
                     const el = document.getElementById('status');
+                    if (m.starting) {
+                        el.innerHTML = '<span class="spinner">Starting LocalPilot backend…</span> (' + esc(m.apiUrl) + ')';
+                        return;
+                    }
                     if (!m.online) {
                         el.innerHTML = '<span class="offline">● Backend offline</span> (' + esc(m.apiUrl) + ')<div class="muted">' +
                             esc(m.error) + '</div><div class="choices"><button id="retryStatus" class="secondary">Retry connection</button></div>';

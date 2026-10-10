@@ -21,6 +21,16 @@
         "title": "Open LocalPilot",
         "category": "TokenGuard",
         "icon": "$(circuit-board)"
+      },
+      {
+        "command": "tokenguard.restartBackend",
+        "title": "Restart Backend",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.showBackendLog",
+        "title": "Show Backend Log",
+        "category": "TokenGuard"
       }
     ],
     "viewsContainers": {
@@ -49,6 +59,21 @@
           "type": "string",
           "default": "http://localhost:8000",
           "description": "URL of the LocalPilot backend (localpilot/app/main.py)."
+        },
+        "tokenguard.autoStartBackend": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the LocalPilot backend as a child process when VS Code opens (and stop it on exit). Ignored if a backend already answers on tokenguard.apiUrl."
+        },
+        "tokenguard.backendPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the localpilot/ folder. Empty: the folder next to this extension in the TokenGuard repo."
+        },
+        "tokenguard.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter for the backend. Empty: <repo>/.venv (created by `make setup`)."
         }
       }
     }

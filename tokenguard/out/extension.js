@@ -36,11 +36,17 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
+const backend_1 = require("./backend");
 const ANALYZE_TIMEOUT_MS = 60_000;
 const CHAT_TIMEOUT_MS = 600_000; // local 7B models can be slow on a cold start
+let backend;
 function activate(context) {
     console.log('⚡ LocalPilot extension activated successfully!');
+    const output = vscode.window.createOutputChannel('LocalPilot Backend');
+    backend = new backend_1.BackendManager(context.extensionPath, output, apiUrl);
+    context.subscriptions.push(output, backend);
     const provider = new LocalPilotViewProvider();
+    context.subscriptions.push(backend.onDidChangeState(() => provider.refreshStatus()));
     // Register Webview Provider
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('localpilot.chatView', provider, {
         webviewOptions: { retainContextWhenHidden: true }
@@ -48,16 +54,28 @@ function activate(context) {
     // Register a Command to force-open the view via Command Palette (Ctrl+Shift+P)
     context.subscriptions.push(vscode.commands.registerCommand('tokenguard.openChat', () => {
         vscode.commands.executeCommand('localpilot.chatView.focus');
-    }));
+    }), vscode.commands.registerCommand('tokenguard.restartBackend', async () => {
+        await backend?.restart();
+        if (backend?.state === 'external') {
+            void vscode.window.showInformationMessage(`LocalPilot backend at ${apiUrl()} was started outside VS Code; restart it there.`);
+        }
+    }), vscode.commands.registerCommand('tokenguard.showBackendLog', () => output.show()));
+    // Spawn the backend now so it is warm by the time the sidebar asks for status.
+    void backend.ensureRunning();
     // Open the container so the activity bar entry is selected on launch.
     void vscode.commands.executeCommand('workbench.view.extension.localpilot-sidebar');
 }
-function deactivate() { }
+function deactivate() {
+    return backend?.stop();
+}
 function apiUrl() {
     const url = vscode.workspace.getConfiguration('tokenguard').get('apiUrl') || 'http://localhost:8000';
     return url.replace(/\/+$/, '');
 }
 async function api(method, path, body, timeoutMs) {
+    if (backend?.state === 'starting') {
+        await backend.ensureRunning();
+    }
     let resp;
     try {
         resp = await fetch(`${apiUrl()}${path}`, {
@@ -69,8 +87,10 @@ async function api(method, path, body, timeoutMs) {
     }
     catch (err) {
         const reason = err instanceof Error && err.name === 'TimeoutError' ? 'timed out' : 'is not reachable';
-        throw new Error(`LocalPilot backend at ${apiUrl()} ${reason}. Start it with: ` +
-            'cd localpilot && uvicorn app.main:app --reload --port 8000');
+        const hint = backend?.lastError
+            ? `Auto-start failed: ${backend.lastError}`
+            : 'Run "TokenGuard: Restart Backend" or start it with `make backend` in the repo root.';
+        throw new Error(`LocalPilot backend at ${apiUrl()} ${reason}. ${hint}`);
     }
     if (!resp.ok) {
         let detail = await resp.text();
@@ -116,7 +136,10 @@ class LocalPilotViewProvider {
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case 'ready':
+                    await this._postStatus();
+                    break;
                 case 'refreshStatus':
+                    await backend?.ensureRunning();
                     await this._postStatus();
                     break;
                 case 'sendPrompt':
@@ -131,7 +154,14 @@ class LocalPilotViewProvider {
     _post(message) {
         void this._view?.webview.postMessage(message);
     }
+    refreshStatus() {
+        void this._postStatus();
+    }
     async _postStatus() {
+        if (backend?.state === 'starting') {
+            this._post({ type: 'status', online: false, starting: true, apiUrl: apiUrl() });
+            return; // the state change to running/failed triggers another refresh
+        }
         try {
             const [health, stats] = await Promise.all([
                 api('GET', '/health', undefined, 5_000),
@@ -403,6 +433,10 @@ class LocalPilotViewProvider {
 
                 function renderStatus(m) {
                     const el = document.getElementById('status');
+                    if (m.starting) {
+                        el.innerHTML = '<span class="spinner">Starting LocalPilot backend…</span> (' + esc(m.apiUrl) + ')';
+                        return;
+                    }
                     if (!m.online) {
                         el.innerHTML = '<span class="offline">● Backend offline</span> (' + esc(m.apiUrl) + ')<div class="muted">' +
                             esc(m.error) + '</div><div class="choices"><button id="retryStatus" class="secondary">Retry connection</button></div>';

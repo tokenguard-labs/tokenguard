@@ -106,41 +106,36 @@ If the engine fails, the router falls back to a simpler keyword-based optimizer 
 
 ### Prerequisites
 
-- [Ollama](https://ollama.com/) running locally with the local model pulled (default `qwen2.5-coder:7b`, set `LOCAL_MODEL` to change):
-
-  ```bash
-  ollama pull qwen2.5-coder:7b
-  ```
-
+- [Ollama](https://ollama.com/) installed. `make setup` starts it and pulls the local model (default `qwen2.5-coder:1.5b`, set `LOCAL_MODEL` to change).
 - Python 3.9+
 - VS Code 1.82+, and Node.js 18+ to rebuild the extension (`tokenguard/out/` is committed)
 - A DeepSeek API key for the global LLM (put it in `localpilot/.env`). Without one, or if the call fails, the gateway answers with a mock so the whole pipeline still runs, and the answer card says so.
 
-### 1. Backend (gateway)
+### One command
 
 ```bash
-python -m venv localpilot/.venv
-source localpilot/.venv/bin/activate
-pip install -r requirements.txt
-
-cd localpilot
-cp .env.example .env          # replace the DEEPSEEK_API_KEY placeholder with your key
-uvicorn app.main:app --reload --port 8000
+make dev                      # or: make dev WORKSPACE=/path/to/project-to-ask-about
 ```
 
-Check it: `curl localhost:8000/health`
+This runs `scripts/setup.sh` (idempotent: re-runs skip finished steps) and then opens VS Code with the extension loaded:
 
-### 2. VS Code extension (sidebar)
+1. Creates `.venv/` and installs `requirements.txt` (reinstalls only when a requirements file changes).
+2. Creates `localpilot/.env` from `.env.example` if missing. Put your `DEEPSEEK_API_KEY` there; until then global answers use the mock.
+3. Starts `ollama serve` if Ollama isn't reachable, and pulls `LOCAL_MODEL` if it isn't downloaded.
+4. Runs `npm install` (when needed) and compiles the extension.
 
-```bash
-cd tokenguard
-npm install
-npm run compile
-```
+The extension then **starts the backend itself** as a child process (`.venv/bin/python -m uvicorn app.main:app` in `localpilot/`) and stops it when VS Code closes. If something already answers on `tokenguard.apiUrl` (e.g. `make backend`), it reuses that and leaves it running. Backend logs: **Output → LocalPilot Backend**. Commands: **TokenGuard: Restart Backend**, **TokenGuard: Show Backend Log**.
 
-Open the `tokenguard/` folder in VS Code and press `F5`. In the Extension Development Host window, open the project you want to ask about (or paste a path to it in the prompt), then click the LocalPilot icon in the activity bar.
+| Command | What it does |
+|---|---|
+| `make dev` | setup + open VS Code with the extension (backend auto-starts) |
+| `make setup` | setup only (`SKIP_OLLAMA=1`, `SKIP_EXTENSION=1`, `PYTHON=python3.11` to tweak) |
+| `make backend` | setup + run the API in the foreground with `--reload` (`PORT=8000`) |
+| `make test` | run the Python tests |
 
-The backend URL is the `tokenguard.apiUrl` setting (default `http://localhost:8000`).
+Extension settings: `tokenguard.apiUrl` (default `http://localhost:8000`), `tokenguard.autoStartBackend` (default `true`), `tokenguard.backendPath` and `tokenguard.pythonPath` (empty = the repo's `localpilot/` and `.venv/`).
+
+To work on the extension itself, open `tokenguard/` in VS Code and press `F5` instead of `make dev`.
 
 ### Optional
 
@@ -161,7 +156,7 @@ python -m pytest tests                    # context engine tests
 | `DEEPSEEK_URL`, `DEEPSEEK_MODEL` | `https://api.deepseek.com/chat/completions`, `deepseek-chat` (DeepSeek-V3) | DeepSeek endpoint and model (output capped at 8,192 tokens) |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | – , `claude-sonnet-5-5` | Anthropic settings |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | – , OpenAI, `gpt-4o-mini` | OpenAI-compatible settings (OpenAI, Groq, OpenRouter, …) |
-| `OLLAMA_URL`, `LOCAL_MODEL` | `http://localhost:11434`, `qwen2.5-coder:7b` | Local model |
+| `OLLAMA_URL`, `LOCAL_MODEL` | `http://localhost:11434`, `qwen2.5-coder:1.5b` | Local model |
 | `LOCAL_THRESHOLD`, `CLOUD_THRESHOLD` | `0.35`, `0.65` | Routing thresholds |
 | `MIN_LOCAL_CONFIDENCE` | `0.7` | Below this, a local answer is flagged for the global LLM |
 | `CLOUD_CONTEXT_TOKEN_BUDGET` | `3000` | Max context tokens sent to the cloud |
