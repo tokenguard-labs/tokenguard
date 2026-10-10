@@ -10,7 +10,7 @@ import os
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "localpilot", "optimizer"))
+sys.path.insert(0, os.path.join(HERE, "compression"))
 
 from context_engine import ContextEngine, ContextRequest  # noqa: E402
 DEMO_REPO = os.path.join(HERE, "examples", "frozen_repo")

@@ -120,14 +120,14 @@ included chunks (in priority order):
   0.000  tests/utils.py::__module__ L1-5  [dependency header of tests/utils.py]
 
 ==============================================================================
-STAGE 6  REDACTION + OUTPUT FORMAT  (optimizer.adapter)
+STAGE 6  REDACTION + OUTPUT FORMAT  (compression.adapter)
 ==============================================================================
 secret rules hit     : 0
 header format        : '// file:' -> '# File:'
 final context tokens : 2985
 
 ==============================================================================
-STAGE 7  CONTRACT RESULT  (optmizer.optimize_context -> app.contracts.ContextResult)
+STAGE 7  CONTRACT RESULT  (compression.optimize_context -> backend.contracts.ContextResult)
 ==============================================================================
 optimizer            : person2-v1
 original_tokens      : 94777

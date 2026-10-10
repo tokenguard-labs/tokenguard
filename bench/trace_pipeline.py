@@ -6,18 +6,19 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "/home/akash/TokenGuard/localpilot")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)
 
-from app import config
-from app.tokens import count_tokens
-from optimizer.adapter import optimize_context
-from optimizer.context_engine.engine import ContextEngine
-from optimizer.context_engine.chunker import chunk_repo
-from optimizer.context_engine.config import ContextConfig
-from optimizer.context_engine.imports import build_import_graph, neighbors
-from optimizer.context_engine.redact import redact
-from optimizer.context_engine.selector import extract_terms, rank_chunks
-from optimizer.context_engine.walker import walk_repo
+from backend import config
+from backend.tokens import count_tokens
+from compression.adapter import optimize_context
+from compression.context_engine.engine import ContextEngine
+from compression.context_engine.chunker import chunk_repo
+from compression.context_engine.config import ContextConfig
+from compression.context_engine.imports import build_import_graph, neighbors
+from compression.context_engine.redact import redact
+from compression.context_engine.selector import extract_terms, rank_chunks
+from compression.context_engine.walker import walk_repo
 
 REPO = "/tmp/opencode/repos/requests"
 QUERY = (
@@ -125,7 +126,7 @@ for c in included:
 # STAGE 6 -- redaction + format
 redacted, reds = redact(repo_context)
 context = redacted.replace("// file: ", "# File: ")
-hr("STAGE 6  REDACTION + OUTPUT FORMAT  (optimizer.adapter)")
+hr("STAGE 6  REDACTION + OUTPUT FORMAT  (compression.adapter)")
 p(f"secret rules hit     : {len(reds)}")
 for r in reds:
     p(f"  - {r.rule} in {r.file}:{r.line}")
@@ -135,7 +136,7 @@ p(f"final context tokens : {count_tokens(context)}")
 # STAGE 7 -- contract result (what Person 1 receives)
 t_opt = time.perf_counter() - t0
 result = optimize_context(QUERY, REPO, code="", token_budget=BUDGET)
-hr("STAGE 7  CONTRACT RESULT  (optmizer.optimize_context -> app.contracts.ContextResult)")
+hr("STAGE 7  CONTRACT RESULT  (compression.optimize_context -> backend.contracts.ContextResult)")
 p(f"optimizer            : {result.optimizer}")
 p(f"original_tokens      : {result.original_tokens}")
 p(f"optimized_tokens     : {result.optimized_tokens}")
@@ -148,7 +149,7 @@ p(f"optimize_context time: {t_opt*1000:.0f} ms")
 
 # STAGE 8..10 -- end to end through Person 1's API
 from fastapi.testclient import TestClient
-from app.main import app
+from backend.main import app
 
 client = TestClient(app)
 hr("STAGE 8  ROUTING  (POST /analyze  -- no model called)")
@@ -183,7 +184,7 @@ hr("STAGE 10  DASHBOARD  (GET /stats)")
 st = client.get("/stats").json()
 p(str({k: v for k, v in st.items() if k != "history"}))
 
-out_path = "/home/akash/TokenGuard/docs/pipeline-trace.md"
+out_path = os.path.join(_ROOT, "docs", "pipeline-trace.md")
 with open(out_path, "w", encoding="utf-8") as fh:
     fh.write("# Pipeline Trace: one complex query, end to end\n\n")
     fh.write("```text\n" + "\n".join(OUT) + "\n```\n")

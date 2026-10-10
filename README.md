@@ -62,11 +62,11 @@ flowchart TD
 | Context size | 20% | Tokens of selected code + repo (8k+ tokens = 1.0) |
 | Files | 20% | Files mentioned in the prompt and the size of the attached repo |
 
-A clearly complex task keeps a floor of `0.8 × task_type`, so a hard prompt with no code attached still reaches the strong model. Rules were chosen over a trained classifier so every decision comes with readable reasons. See [`localpilot/ROUTING.md`](localpilot/ROUTING.md) for worked examples.
+A clearly complex task keeps a floor of `0.8 × task_type`, so a hard prompt with no code attached still reaches the strong model. Rules were chosen over a trained classifier so every decision comes with readable reasons. See [`backend/ROUTING.md`](backend/ROUTING.md) for worked examples.
 
 ### Context engine
 
-Deterministic and LLM-free (`localpilot/optimizer/`):
+Deterministic and LLM-free (`compression/`):
 
 1. **Walk** the repo, respecting `.gitignore` and skipping `node_modules`, build output, minified and binary files.
 2. **Chunk** code into functions and classes (80-line windows where there are no symbols).
@@ -83,12 +83,14 @@ If the engine fails, the router falls back to a simpler keyword-based optimizer 
 
 | Path | What |
 |---|---|
-| `localpilot/app/` | Gateway (FastAPI): `analyzer.py`, `router.py`, `context.py` (path resolution + optimizer adapter), `llm.py` (Ollama + cloud clients), `main.py` (API) |
-| `localpilot/optimizer/` | Context engine: walker, chunker, selector, import graph, budget allocator, redaction |
-| `localpilot/ui.py` | Optional Streamlit UI with the same flow as the sidebar |
-| `tokenguard/` | VS Code extension: the LocalPilot sidebar (`src/extension.ts`) |
+| `backend/` | LLM gateway service (FastAPI): `analyzer.py`, `router.py`, `context.py` (path resolution + optimizer adapter), `llm.py` (Ollama + cloud clients), `main.py` (API). Also holds `.env`, `requirements.txt`, `ROUTING.md` |
+| `compression/` | Context compression engine: `adapter.py` (contract the gateway calls), `context_engine/` (walker, chunker, selector, import graph, budget allocator, redaction) |
+| `extension/` | VS Code extension (frontend): the LocalPilot sidebar (`src/extension.ts`) and the backend launcher (`src/backend.ts`) |
+| `scripts/` | `setup.sh` (used by `make setup`), `streamlit_ui.py` (optional browser UI with the same flow as the sidebar), `smoke_test.py` (calls a running API) |
 | `tests/` | Context engine tests |
 | `bench/`, `run_demo.py`, `examples/` | Benchmarks, a CLI demo and a generator for the demo repo |
+
+All Python runs from the repo root: `backend` and `compression` are sibling packages (`uvicorn backend.main:app`, `python -m compression.check_contract`).
 | `docs/` | Context engine spec, benchmark notes, pipeline trace |
 
 ### API
@@ -108,8 +110,8 @@ If the engine fails, the router falls back to a simpler keyword-based optimizer 
 
 - [Ollama](https://ollama.com/) installed. `make setup` starts it and pulls the local model (default `qwen2.5-coder:1.5b`, set `LOCAL_MODEL` to change).
 - Python 3.9+
-- VS Code 1.82+, and Node.js 18+ to rebuild the extension (`tokenguard/out/` is committed)
-- A DeepSeek API key for the global LLM (put it in `localpilot/.env`). Without one, or if the call fails, the gateway answers with a mock so the whole pipeline still runs, and the answer card says so.
+- VS Code 1.82+, and Node.js 18+ to rebuild the extension (`extension/out/` is committed)
+- A DeepSeek API key for the global LLM (put it in `backend/.env`). Without one, or if the call fails, the gateway answers with a mock so the whole pipeline still runs, and the answer card says so.
 
 ### One command
 
@@ -120,11 +122,11 @@ make dev                      # or: make dev WORKSPACE=/path/to/project-to-ask-a
 This runs `scripts/setup.sh` (idempotent: re-runs skip finished steps) and then opens VS Code with the extension loaded:
 
 1. Creates `.venv/` and installs `requirements.txt` (reinstalls only when a requirements file changes).
-2. Creates `localpilot/.env` from `.env.example` if missing. Put your `DEEPSEEK_API_KEY` there; until then global answers use the mock.
+2. Creates `backend/.env` from `.env.example` if missing. Put your `DEEPSEEK_API_KEY` there; until then global answers use the mock.
 3. Starts `ollama serve` if Ollama isn't reachable, and pulls `LOCAL_MODEL` if it isn't downloaded.
 4. Runs `npm install` (when needed) and compiles the extension.
 
-The extension then **starts the backend itself** as a child process (`.venv/bin/python -m uvicorn app.main:app` in `localpilot/`) and stops it when VS Code closes. If something already answers on `tokenguard.apiUrl` (e.g. `make backend`), it reuses that and leaves it running. Backend logs: **Output → LocalPilot Backend**. Commands: **TokenGuard: Restart Backend**, **TokenGuard: Show Backend Log**.
+The extension then **starts the backend itself** as a child process (`.venv/bin/python -m uvicorn backend.main:app` from the repo root) and stops it when VS Code closes. If something already answers on `tokenguard.apiUrl` (e.g. `make backend`), it reuses that and leaves it running. Backend logs: **Output → LocalPilot Backend**. Commands: **TokenGuard: Restart Backend**, **TokenGuard: Show Backend Log**.
 
 | Command | What it does |
 |---|---|
@@ -133,20 +135,20 @@ The extension then **starts the backend itself** as a child process (`.venv/bin/
 | `make backend` | setup + run the API in the foreground with `--reload` (`PORT=8000`) |
 | `make test` | run the Python tests |
 
-Extension settings: `tokenguard.apiUrl` (default `http://localhost:8000`), `tokenguard.autoStartBackend` (default `true`), `tokenguard.backendPath` and `tokenguard.pythonPath` (empty = the repo's `localpilot/` and `.venv/`).
+Extension settings: `tokenguard.apiUrl` (default `http://localhost:8000`), `tokenguard.autoStartBackend` (default `true`), `tokenguard.backendPath` and `tokenguard.pythonPath` (empty = the repo's `backend/` and `.venv/`).
 
-To work on the extension itself, open `tokenguard/` in VS Code and press `F5` instead of `make dev`.
+To work on the extension itself, open `extension/` in VS Code and press `F5` instead of `make dev`.
 
 ### Optional
 
 ```bash
-streamlit run localpilot/ui.py            # browser UI with the same flow
+streamlit run scripts/streamlit_ui.py     # browser UI with the same flow
 python examples/seed_demo_repo.py         # creates examples/frozen_repo, a small TS repo with an auth module
 python run_demo.py                        # context engine CLI demo on that repo
 python -m pytest tests                    # context engine tests
 ```
 
-### Configuration (`localpilot/.env`)
+### Configuration (`backend/.env`)
 
 | Variable | Default | Meaning |
 |---|---|---|

@@ -2,7 +2,7 @@
 # One-shot, idempotent setup for TokenGuard. Safe to re-run: every step is skipped when already done.
 #
 #   1. Python venv at .venv/ with the gateway + test dependencies (reinstalled only when requirements change)
-#   2. localpilot/.env from .env.example (never overwrites an existing file)
+#   2. backend/.env from .env.example (never overwrites an existing file)
 #   3. Ollama: start `ollama serve` if it isn't reachable, pull LOCAL_MODEL if it's missing
 #   4. VS Code extension: npm install (when needed) + compile
 #
@@ -11,8 +11,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="$ROOT/.venv"
-BACKEND="$ROOT/localpilot"
-EXTENSION="$ROOT/tokenguard"
+BACKEND="$ROOT/backend"
+EXTENSION="$ROOT/extension"
 PYTHON="${PYTHON:-python3}"
 
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
@@ -46,7 +46,7 @@ else
 fi
 
 # --- 2. .env ----------------------------------------------------------------------------------
-step "Backend config (localpilot/.env)"
+step "Backend config (backend/.env)"
 if [ ! -f "$BACKEND/.env" ]; then
     cp "$BACKEND/.env.example" "$BACKEND/.env"
     ok "created from .env.example (cloud calls fall back to the mock until you set DEEPSEEK_API_KEY)"
@@ -89,12 +89,12 @@ else
 fi
 
 # --- 4. VS Code extension ----------------------------------------------------------------------
-step "VS Code extension (tokenguard/)"
+step "VS Code extension (extension/)"
 if [ "${SKIP_EXTENSION:-0}" = "1" ]; then
     warn "skipped (SKIP_EXTENSION=1)"
 elif ! command -v npm >/dev/null; then
-    [ -f "$EXTENSION/out/extension.js" ] || die "npm not found and tokenguard/out/ is missing. Install Node.js 18+."
-    warn "npm not found: using the prebuilt tokenguard/out/"
+    [ -f "$EXTENSION/out/extension.js" ] || die "npm not found and extension/out/ is missing. Install Node.js 18+."
+    warn "npm not found: using the prebuilt extension/out/"
 else
     NPM_HASH="$(hash_files "$EXTENSION/package.json" "$EXTENSION/package-lock.json")"
     NPM_STAMP="$EXTENSION/node_modules/.install.sha256"

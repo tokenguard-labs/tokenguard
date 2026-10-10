@@ -21,7 +21,7 @@ import sys
 from datetime import date
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ROOT, "localpilot", "optimizer"))
+sys.path.insert(0, os.path.join(_ROOT, "compression"))
 
 from context_engine import ContextEngine, ContextRequest  # noqa: E402
 

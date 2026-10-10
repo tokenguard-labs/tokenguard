@@ -21,14 +21,15 @@ setup:
 
 dev: setup
 	@command -v code >/dev/null || { echo "VS Code 'code' CLI not found on PATH"; exit 1; }
-	code --new-window --extensionDevelopmentPath="$(CURDIR)/tokenguard" "$(WORKSPACE)"
+	code --new-window --extensionDevelopmentPath="$(CURDIR)/extension" "$(WORKSPACE)"
 	@echo "VS Code is opening. The LocalPilot backend starts with the extension (Output > LocalPilot Backend)."
 
 backend: setup
-	cd localpilot && ../$(PY) -m uvicorn app.main:app --reload --host 127.0.0.1 --port $(PORT)
+	$(PY) -m uvicorn backend.main:app --reload --reload-dir backend --reload-dir compression --host 127.0.0.1 --port $(PORT)
 
 test: setup
 	$(PY) -m pytest tests
+	$(PY) -m compression.check_contract
 
 clean:
 	rm -rf $(VENV)

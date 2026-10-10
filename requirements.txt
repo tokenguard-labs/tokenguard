@@ -1,6 +1,6 @@
 # Everything needed to run TokenGuard from the repo root: pip install -r requirements.txt
-# The gateway's dependencies live in localpilot/requirements.txt.
--r localpilot/requirements.txt
+# The gateway's dependencies live in backend/requirements.txt.
+-r backend/requirements.txt
 
 # Tests (python -m pytest tests)
 pytest>=7.0             # tested 8.4.2

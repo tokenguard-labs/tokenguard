@@ -1,0 +1,103 @@
+{
+  "name": "tokenguard",
+  "displayName": "TokenGuard",
+  "description": "AI Router and token optimizer",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.82.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:localpilot.chatView"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "tokenguard.openChat",
+        "title": "Open LocalPilot",
+        "category": "TokenGuard",
+        "icon": "$(circuit-board)"
+      },
+      {
+        "command": "tokenguard.restartBackend",
+        "title": "Restart Backend",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.showBackendLog",
+        "title": "Show Backend Log",
+        "category": "TokenGuard"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "localpilot-sidebar",
+          "title": "LocalPilot",
+          "icon": "./media/circuit-board.svg"
+        }
+      ]
+    },
+    "views": {
+      "localpilot-sidebar": [
+        {
+          "type": "webview",
+          "id": "localpilot.chatView",
+          "name": "LocalPilot Assistant",
+          "icon": "./media/circuit-board.svg"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "TokenGuard",
+      "properties": {
+        "tokenguard.apiUrl": {
+          "type": "string",
+          "default": "http://localhost:8000",
+          "description": "URL of the LocalPilot backend (backend/main.py)."
+        },
+        "tokenguard.autoStartBackend": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the LocalPilot backend as a child process when VS Code opens (and stop it on exit). Ignored if a backend already answers on tokenguard.apiUrl."
+        },
+        "tokenguard.backendPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the backend/ folder. Empty: the backend/ folder next to this extension in the TokenGuard repo."
+        },
+        "tokenguard.pythonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Python interpreter for the backend. Empty: <repo>/.venv (created by `make setup`)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "24.x",
+    "typescript-eslint": "^8.61.1",
+    "eslint": "^10.5.0",
+    "typescript": "^6.0.3",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0"
+  },
+  "overrides": {
+    "diff": "^8.0.4",
+    "serialize-javascript": "^7.0.6"
+  }
+}
