@@ -67,9 +67,7 @@ CUSTOM_MODEL = os.getenv("CUSTOM_MODEL", "")
 CLOUD_TIMEOUT_S = float(os.getenv("CLOUD_TIMEOUT_S", "120"))
 CLOUD_MAX_TOKENS = int(os.getenv("CLOUD_MAX_TOKENS", "16000"))
 
-# Routing thresholds
-LOCAL_THRESHOLD = float(os.getenv("LOCAL_THRESHOLD", "0.35"))  # score below this -> local
-CLOUD_THRESHOLD = float(os.getenv("CLOUD_THRESHOLD", "0.65"))  # score above this -> cloud
+# Post-response escalation: a local answer below this confidence is escalated / flagged.
 MIN_LOCAL_CONFIDENCE = float(os.getenv("MIN_LOCAL_CONFIDENCE", "0.7"))  # below -> escalate
 
 # Context budget for cloud requests
@@ -163,8 +161,6 @@ def validate() -> None:
         raise ValueError(f"MISSING_CONFIDENCE_POLICY must be escalate|keep, got {MISSING_CONFIDENCE_POLICY!r}")
     if MAX_CLOUD_ESCALATIONS < 0:
         raise ValueError("MAX_CLOUD_ESCALATIONS must be >= 0")
-    if not (0.0 <= LOCAL_THRESHOLD <= CLOUD_THRESHOLD <= 1.0):
-        raise ValueError("require 0 <= LOCAL_THRESHOLD <= CLOUD_THRESHOLD <= 1")
     if not (0.0 <= MIN_LOCAL_CONFIDENCE <= 1.0):
         raise ValueError("MIN_LOCAL_CONFIDENCE must be in [0, 1]")
     weights = COMPLEXITY_WEIGHTS

@@ -1,11 +1,11 @@
 """Quick manual test of the LocalPilot API. Start the server first (`make backend`), then:
-    python scripts/smoke_test.py
+    python scripts/smoke_test.py          # TOKENGUARD_API_URL overrides http://localhost:8000
 """
 import os
 
 import requests
 
-API = "http://localhost:8000"
+API = os.getenv("TOKENGUARD_API_URL", "http://localhost:8000").rstrip("/")
 REPO = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "backend")
 
 CASES = [

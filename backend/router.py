@@ -43,15 +43,6 @@ def looks_like_refusal(answer: str) -> bool:
     return bool(_REFUSAL.search(answer or ""))
 
 
-def decide(score: float) -> str:
-    """Legacy single-score decision, kept for backward compatibility (see routing.plan_route)."""
-    if score < config.LOCAL_THRESHOLD:
-        return "local"
-    if score > config.CLOUD_THRESHOLD:
-        return "cloud"
-    return "local_first"
-
-
 def cloud_allowed() -> bool:
     """Whether anything may leave the machine: cloud on and not blocked by the privacy policy."""
     return config.CLOUD_ENABLED and not config.CLOUD_TRANSMISSION_PROHIBITED
@@ -292,6 +283,9 @@ async def handle(
         "escalation_kind": escalation_kind if escalated else None,
         "confidence": local.confidence if local else None,
         "confidence_threshold": config.MIN_LOCAL_CONFIDENCE,
+        # Computed here so every frontend shows the same "low confidence" state.
+        "low_confidence": bool(local and not cloud and local.confidence is not None
+                               and local.confidence < config.MIN_LOCAL_CONFIDENCE),
         "detail": detail,
         "more_available": bool(local and not cloud and local.more_available),
         "truncated": bool(local and not cloud and local.truncated),

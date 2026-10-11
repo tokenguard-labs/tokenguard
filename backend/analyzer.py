@@ -125,7 +125,7 @@ def _reasoning_score(prompt: str, prompt_l: str, reasons: List[str]) -> float:
 
 
 def _context_size_score(context_tokens: int, reasons: List[str]) -> float:
-    # ~0 tokens -> 0, 8k+ tokens -> 1 (a 7B local model struggles with big contexts)
+    # ~0 tokens -> 0, 8k+ tokens -> 1 (small local models degrade, and slow down on CPU, with big contexts)
     score = min(context_tokens / 8000, 1.0)
     if context_tokens:
         reasons.append(f"context size ~{context_tokens} tokens")

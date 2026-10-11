@@ -1,10 +1,16 @@
 """LocalPilot demo UI. Start the API first, then:
     streamlit run scripts/streamlit_ui.py
+
+The backend URL comes from TOKENGUARD_API_URL (default http://localhost:8000, the same default as
+the VS Code extension's `tokenguard.apiUrl`). Routing, escalation and the low-confidence flag are
+all decided by the backend; this UI only renders them.
 """
+import os
+
 import requests
 import streamlit as st
 
-API = "http://localhost:8000"
+API = os.getenv("TOKENGUARD_API_URL", "http://localhost:8000").rstrip("/")
 
 st.set_page_config(page_title="LocalPilot", page_icon="🧭", layout="wide")
 
@@ -112,7 +118,7 @@ def render_meta(meta, idx):
                    f"{meta['latency_ms']} ms · 0 tokens sent to cloud")
         st.caption(f"Routing: {summary}")
         # Local answer looks shaky -> nudge harder; either way the user can opt in to the cloud
-        low_conf = meta["confidence"] is not None and meta["confidence"] < meta["analysis"]["min_local_confidence"]
+        low_conf = bool(meta.get("low_confidence"))
         if low_conf:
             st.warning("The local model wasn't confident about this answer.")
         label = "☁️ Retry with global LLM" if low_conf else "Not satisfied with this answer? ☁️ Use global LLM"
@@ -185,7 +191,7 @@ pending = st.session_state.pending
 if pending:
     a = pending["analysis"]
     with st.chat_message("assistant"):
-        st.warning(f"**This looks like a complex task** (score {a['complexity_score']}). "
+        st.warning(f"**This looks like a complex task** ({a.get('complexity', 'complex')}, {a.get('complexity_score_100', '?')}/100). "
                    "LocalPilot recommends the **global (cloud) LLM**.")
         for reason in a["reasons"]:
             st.write(f"- {reason}")

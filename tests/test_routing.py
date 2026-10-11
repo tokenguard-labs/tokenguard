@@ -217,7 +217,19 @@ class TestRouterIntegration(unittest.TestCase):
                                                force_route="local", confidence=0.1)
         self.assertEqual(result["route"], "local")
         self.assertFalse(result["escalated"])
+        self.assertTrue(result["low_confidence"])  # frontends highlight "Retry with global LLM" from this
         cloud_mock.assert_not_awaited()
+
+    def test_confident_local_answer_is_not_low_confidence(self):
+        result, _local, _cloud = self._run("Debug this small module and explain the trade-offs",
+                                           force_route="local", confidence=0.9)
+        self.assertFalse(result["low_confidence"])
+
+    def test_escalated_answer_is_not_low_confidence(self):
+        # The flag describes the answer shown; after escalation that is the cloud answer.
+        result, _local, _cloud = self._run("Debug this small module and explain the trade-offs")
+        self.assertTrue(result["escalated"])
+        self.assertFalse(result["low_confidence"])
 
     def test_cloud_disabled_keeps_request_local(self):
         result, _local, cloud_mock = self._run(

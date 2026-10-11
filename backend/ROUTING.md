@@ -90,11 +90,12 @@ We look for keywords in the prompt. Each keyword has a difficulty value:
 | refactor, security, codebase, end-to-end | 0.8 | rename, docstring, one-liner | 0.1 |
 | rewrite, performance, optimize, across, entire, authentication | 0.7 | explain, comment, format, syntax | 0.15–0.2 |
 | debug, bug, crash, implement, feature | 0.6 | regex, convert | 0.3 |
-| fix | 0.5 | unit test | 0.35 |
+| fix | 0.5 | | |
 
 The rules:
 - **Any complex keyword found:** take the highest value, then **add 0.05 for each extra complex keyword** (capped at 1.0). Several hard signals together make the task harder.
 - **Exactly one complex keyword plus a simple keyword** (e.g. "*explain* this *race condition*"): blend 75% complex and 25% simple. The task is still hard, just slightly less so.
+- **No complex keyword, but a localized one** (`unit test`, `modify`, `add error handling`, `add validation`, `refactor this function`, …): take the highest, 0.45–0.55. These keep a floor of `MEDIUM_TASK_FLOOR` (0.75) × task_type so they stay out of the simple band.
 - **Only simple keywords:** take the lowest (easiest) value.
 - **No keywords at all:** 0.45, a neutral "medium" guess.
 
@@ -116,7 +117,7 @@ How much *relevant* code comes with the request — the optimized context, not t
 context_size = optimized_context_tokens / 8000      (capped at 1)
 ```
 
-A 7B local model gets noticeably worse with large contexts, so at 8k+ tokens this factor is maxed out.
+Small local models (the default is `qwen2.5-coder:1.5b`) get noticeably worse, and on CPU much slower, with large contexts, so at 8k+ tokens this factor is maxed out.
 
 ### Factor 4: Files (20%)
 
@@ -165,9 +166,10 @@ The UI first calls `POST /analyze`. This is a dry run: it returns the decision, 
 
 | Decision | What the UI does |
 |---|---|
-| `local` (score < 0.35) | Shows a "Simple task: using the local LLM" notification and answers locally. |
-| `local_first` (0.35–0.65) | Answers locally too. If the local model's confidence is below 0.7, it shows a **"Retry with global LLM"** button. |
-| `cloud` (score > 0.65) | **Asks the user.** It shows the reasons and how many tokens would be sent, with two buttons: **Use local** and **Use global (recommended)**. |
+| `local` / `local_first` (simple or medium, local model capable) | Answers locally. If the backend flags the answer `low_confidence` (below `MIN_LOCAL_CONFIDENCE`, 0.7), it highlights a **"Retry with global LLM"** button. |
+| `cloud` (complex, or local model not capable) | **Asks the user.** It shows the reasons and how many tokens would be sent, with two buttons: **Use local** and **Use global (recommended)**. |
+
+The decision comes from `routing.plan_route` (see `docs/routing-policy.md`); the UIs only render it.
 
 Nothing is sent to the cloud unless the user clicks a "global" button. In the UI, every `/chat` call uses `force_route`, so the API never escalates on its own. The automatic escalation in Stage 2 only applies to API clients that use `force_route: "auto"`.
 
@@ -178,8 +180,10 @@ Nothing is sent to the cloud unless the user clicks a "global" button. In the UI
 For requests routed **LOCAL** or **LOCAL FIRST**, we ask the local model to answer in this JSON shape:
 
 ```json
-{"answer": "...", "confidence": 0.0-1.0, "needs_cloud": true/false}
+{"answer": "...", "confidence": 0.0-1.0, "needs_cloud": true/false, "more_available": true/false}
 ```
+
+The answer is length-limited (`detail: "brief"`, about `LOCAL_BRIEF_WORDS` words, hard cap `LOCAL_BRIEF_MAX_TOKENS`); when a fuller answer would help, `more_available` makes the sidebar offer **More detailed explanation**, which re-asks with `detail: "detailed"`.
 
 Small models tend to overrate their confidence, so we adjust the number they give:
 - **−0.4** if the answer is under 20 characters (empty or near-empty)
@@ -201,7 +205,7 @@ response shows `escalated: true`, `escalation_kind` and the reason.
 
 ## Stage 3: Only relevant context goes to the cloud
 
-Before anything goes to the cloud, the context optimizer (Person 2's module) picks only the files relevant to the prompt and keeps them within a **3,000-token budget**. The current fallback ranks files by keyword matches. Person 2's version will add smarter selection, compression and secret redaction.
+Before anything goes to the cloud, the context optimizer picks only the code relevant to the prompt (persistent codebase index, `compression/codeindex`; in-memory engine as fallback) and masks secrets. The budget depends on the task: local-bound requests get the local window, complex cloud-bound ones get the cloud model's window minus room for the answer, capped at `CLOUD_MAX_CONTEXT_TOKENS` (16,000).
 
 How we measure the savings:
 
@@ -221,7 +225,7 @@ Real example: the refactor request above would have sent **6,454** tokens. Local
 
 | Pro | Why it matters |
 |---|---|
-| **Most coding requests are simple** | Explaining code, writing docstrings, renames, small snippets and regexes are a large share of everyday requests. A 7B coding model handles these well, so they never reach the cloud. |
+| **Most coding requests are simple** | Explaining code, writing docstrings, renames, small snippets and regexes are a large share of everyday requests. A small local coding model handles these well, so they never reach the cloud. |
 | **Two safety nets** | The upfront score catches obviously hard tasks. The confidence check catches tasks that *looked* easy but weren't. Each one covers mistakes the other misses. |
 | **Explainable** | Every decision lists its reasons, e.g. "complex task keywords: refactor, architecture" or "context size ~6,400 tokens". No black box. Good for the demo and easy to debug. |
 | **Fast and free to decide** | Scoring takes under a millisecond and costs nothing. Using an LLM to make the routing decision would itself cost tokens and time. |
@@ -233,10 +237,10 @@ Real example: the refactor request above would have sent **6,454** tokens. Local
 
 | Con | Impact | Mitigation |
 |---|---|---|
-| **Keyword matching is shallow** | "Fix this typo in the auth module" contains "auth" and "fix", so it scores higher than it should. Phrasing we haven't listed falls back to the neutral 0.45. | Tune the keyword list on real prompts. Later: a small embedding classifier trained on logged requests. |
-| **Small models are overconfident** | In testing, qwen2.5-coder:7b almost always reports 0.9–1.0, so the confidence check rarely triggers. | Blend in the complexity score, e.g. `0.7 × self_confidence + 0.3 × (1 − score)`. Or run a quick self-check: ask the local model to verify its own answer. |
-| **Hand-picked weights and thresholds** | The 0.35 / 0.65 thresholds and the 40/20/20/20 weights are educated guesses, not learned from data. | Run a set of labelled demo prompts and adjust. Log every decision so we could fit the weights later. |
-| **"Local first" can be slow** | A big local answer takes 60s or more on a laptop. If it then escalates, the user waits for both models. | Limit local answer length. Or run local and cloud in parallel for the middle band and cancel whichever isn't needed. |
+| **Keyword matching is shallow** | "Fix this typo in the auth module" contains "auth" and "fix", so it scores higher than it should. Phrasing we haven't listed falls back to the neutral 0.45. | Medium-band requests are re-checked by the local-LLM tie-breaker (`classifier.py`). Later: a classifier trained on logged requests. |
+| **Small models are overconfident** | In testing, the qwen2.5-coder models almost always report 0.9–1.0, so the confidence check rarely triggers (refusals are caught separately as validation failures). | Blend in the complexity score, e.g. `0.7 × self_confidence + 0.3 × (1 − score)`. Or run a quick self-check: ask the local model to verify its own answer. |
+| **Hand-picked weights and thresholds** | The 34 / 64 category boundaries and the 25/20/20/20/15 weights are educated guesses, not learned from data. | `bench/routing_eval.py` runs a labelled prompt set; all values are configurable in `.env`. Log every decision so we could fit the weights later. |
+| **"Local first" can be slow** | A big local answer takes 60s or more on a laptop (more with a large repo context on CPU). If it then escalates, the user waits for both models. | Local answers are now length-limited (brief by default, **More detail** on request). Next: run local and cloud in parallel for the middle band and cancel whichever isn't needed. |
 | **No check that the answer is correct** | High confidence doesn't mean the answer is correct. | Future: run generated code or tests, check syntax, or have the cloud model review local answers on a sample. |
 
 **One-line summary for the pitch:** cheap rules filter out the easy requests, the local model's own uncertainty catches the borderline ones, and the cloud only sees the hard ones, with trimmed context.

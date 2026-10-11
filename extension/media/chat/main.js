@@ -461,9 +461,8 @@
         const turn = turns.get(id);
         endStream(turn);
         const isLocal = r.route === 'local';
-        const minConf = turn.analysis ? turn.analysis.min_local_confidence : null;
         const conf = r.confidence == null ? 'n/a' : Math.round(r.confidence * 100) + '%';
-        const lowConf = isLocal && r.confidence != null && minConf != null && r.confidence < minConf;
+        const lowConf = isLocal && !!r.low_confidence;  // decided by the backend (confidence_threshold)
         const pct = r.original_tokens ? Math.round(100 * r.tokens_saved / r.original_tokens) : 0;
         const files = r.files_selected || [];
         const trace = (r.trace || []).map(t => '<li>' + esc(t) + '</li>').join('');

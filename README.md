@@ -13,7 +13,7 @@ TokenGuard is not another coding LLM. It is the layer in front of the models tha
 Cloud-only coding assistants send every request, often with a large slice of the repository, to a remote model:
 
 - A one-line regex question is billed like a multi-file refactor.
-- A laptop that can run a 7B coding model sits idle while every question goes to the cloud.
+- A laptop that can run a small coding model sits idle while every question goes to the cloud.
 - Source code, and the secrets in it, leave the machine by default.
 
 TokenGuard sends each request to the cheapest, most private model that can answer it, and compresses the context before anything leaves the machine.
@@ -26,17 +26,19 @@ TokenGuard sends each request to the cheapest, most private model that can answe
 flowchart TD
     A["VS Code sidebar<br/>prompt + selected code + workspace folder"] --> B["POST /analyze"]
     B --> R["Resolve context sources<br/>(a path in the prompt overrides the workspace)"]
-    R --> S["Complexity score 0–1<br/>task type · reasoning · context size · files"]
-    S --> D{Decision}
-    D -- "score < 0.35: local<br/>0.35–0.65: local first" --> L["Run on local LLM automatically"]
-    D -- "score > 0.65: cloud" --> C["Sidebar shows score, reasons, token estimate<br/>User clicks Use local or Use global"]
+    R --> P["Hard policy + capability checks<br/>preference · cloud allowed · local model reachable/capable"]
+    P --> S["Complexity 0–100 → simple / medium / complex<br/>task type · context size · files · dependency · reasoning<br/>(medium band: local-LLM tie-breaker)"]
+    S --> D{Initial route}
+    D -- "simple / medium:<br/>local first" --> L["Run on local LLM automatically"]
+    D -- "complex, or local not capable:<br/>cloud first" --> C["Sidebar shows complexity, reasons, token estimate<br/>User clicks Use local or Use global"]
     C -- "Use local" --> L
     C -- "Use global" --> G
-    L --> LC["POST /chat force_route=local<br/>compress context · Ollama · confidence check"]
-    LC --> LA["Answer card: model, confidence, 0 cloud tokens<br/>button: Use global LLM (highlighted if confidence < 0.7)"]
+    L --> LC["POST /chat force_route=local<br/>context index · Ollama (brief, length-limited) · confidence + refusal check"]
+    LC --> LA["Answer card: model, confidence, 0 cloud tokens<br/>buttons: More detailed explanation · Use global LLM (highlighted if low_confidence)"]
+    LA -- "More detail" --> LC
     LA -- "Use global LLM" --> G["POST /chat force_route=cloud"]
-    G --> CE["Context engine: walk → chunk → rank → expand → budget → redact<br/>≤ 3,000 tokens"]
-    CE --> CL["Global LLM: DeepSeek deepseek-chat<br/>(falls back to the mock if the call fails)"]
+    G --> CE["Context: codebase index → retrieve → expand graph → budget → redact<br/>budget sized to the cloud model, ≤ 16,000 tokens"]
+    CE --> CL["Global LLM (DeepSeek, Anthropic, OpenAI or custom)"]
     CL --> GA["Answer card: tokens sent vs full context, files sent, secrets masked, trace"]
 ```
 
@@ -49,9 +51,9 @@ flowchart TD
    - `local` (simple) and `local_first` (medium, capable): the sidebar runs the local LLM automatically, then escalates only if the answer looks unreliable.
    - `cloud` (complex, or not locally capable): the sidebar waits for the user to click **Use local LLM** or **Use global LLM (recommended)**.
 5. **Run the chosen route (`POST /chat` with `force_route`).**
-   - **Local:** the context engine builds the context, Ollama answers as JSON `{answer, confidence, needs_cloud}`, and the confidence is adjusted (very short answers and hedges such as "I'm not sure" lower it). Nothing leaves the machine.
-   - **Global:** the context engine always runs right before the cloud call: it selects the relevant code, fits it into the token budget and masks secrets in both the code and the prompt. Only that slice is sent to DeepSeek (`deepseek-chat`). If that call fails, the mock answers instead and the card shows why.
-6. **Show the receipts.** The answer card shows the model, latency, confidence (local) or tokens sent / saved, files sent and secrets masked (global), plus a pipeline trace. A local answer always offers **Use global LLM**; it is highlighted when confidence is below 0.7. The header shows backend and Ollama status and the session's local/cloud counts and tokens saved (`GET /health`, `GET /stats`).
+   - **Local:** the context engine builds the context, Ollama answers as JSON `{answer, confidence, needs_cloud, more_available}`, and the confidence is adjusted (very short answers and hedges such as "I'm not sure" lower it). Answers are **brief by default** (about `LOCAL_BRIEF_WORDS` words, hard-capped at `LOCAL_BRIEF_MAX_TOKENS`); when more would help, the card offers **More detailed explanation**, which re-asks with `detail: "detailed"`. Nothing leaves the machine.
+   - **Global:** the context engine always runs right before the cloud call: it selects the relevant code, fits it into the token budget and masks secrets in both the code and the prompt. Only that slice is sent to the configured cloud provider. A failed call is shown as an error (or answered by the labelled mock when `CLOUD_FALLBACK_TO_MOCK=true`).
+6. **Show the receipts.** The answer card shows the model, latency, confidence (local) or tokens sent / saved, files sent and secrets masked (global), plus a pipeline trace. A local answer always offers **Use global LLM**; it is highlighted when the backend flags `low_confidence` (confidence below `MIN_LOCAL_CONFIDENCE`, 0.7). Both frontends render the backend's routing and escalation decisions; neither recomputes them. The header shows backend and Ollama status and the session's local/cloud counts and tokens saved (`GET /health`, `GET /stats`).
 
 ### Routing policy
 
@@ -86,7 +88,7 @@ Deterministic and LLM-free (`compression/`):
 2. **Chunk** code into functions and classes (80-line windows where there are no symbols).
 3. **Rank** chunks with IDF-weighted matches of the query terms in symbol names, paths and bodies. The query is the prompt plus the most frequent identifiers of the selected code, so vague prompts ("explain this") still find related files.
 4. **Expand** one hop through the import graph.
-5. **Budget:** a short summary of every relevant file first, then full bodies, then extra chunks, never repeating a line, within `CLOUD_CONTEXT_TOKEN_BUDGET` (3,000 tokens by default).
+5. **Budget:** a short summary of every relevant file first, then full bodies, then extra chunks, never repeating a line. The budget is chosen per request: the local window for local-bound requests, and for complex cloud-bound ones the cloud model's window minus room for the answer, capped at `CLOUD_MAX_CONTEXT_TOKENS` (16,000).
 6. **Redact** secrets (AWS keys, OpenAI keys, GitHub tokens, private keys, connection strings, `password = "…"` style assignments).
 
 If the engine fails, the router falls back to a simpler keyword-based optimizer so a request never breaks.
@@ -95,8 +97,11 @@ By default the repo context now comes from a **persistent, incremental codebase 
 (`compression/codeindex`, `CONTEXT_INDEX_ENABLED=true`): a SQLite symbol/edge index keyed by content
 hash *and* a derivation environment (so a parser/resolver/model upgrade re-derives only what it must),
 with uncertainty-aware edges (syntactic references are recorded but never asserted as dependencies)
-and per-item provenance plus an adequacy verdict. It degrades to the in-memory engine above on any
-error. Design: [`docs/codebase-intelligence.md`](docs/codebase-intelligence.md).
+and per-item provenance plus an adequacy verdict. Retrieval is hybrid (exact symbol, lexical, graph
+expansion over confident edges, and semantic when an embedding model is available); corpus-wide
+requests ("convert all the python code to typescript") get a signature map of every in-scope file.
+The local model may only rerank a shortlist and propose missing names, which the index resolves.
+It degrades to the in-memory engine above on any error. Design: [`docs/codebase-intelligence.md`](docs/codebase-intelligence.md).
 
 ---
 
@@ -105,21 +110,22 @@ error. Design: [`docs/codebase-intelligence.md`](docs/codebase-intelligence.md).
 | Path | What |
 |---|---|
 | `backend/` | LLM gateway service (FastAPI): `analyzer.py` (complexity scoring), `routing.py` (routing/escalation policy), `router.py` (pipeline), `context.py` (path resolution + optimizer adapter), `llm.py` (Ollama + cloud clients), `main.py` (API). Also holds `.env`, `requirements.txt`, `ROUTING.md` |
-| `compression/` | Context compression engine: `adapter.py` (contract the gateway calls), `context_engine/` (walker, chunker, selector, import graph, budget allocator, redaction) |
+| `backend/` (cont.) | `classifier.py` (local-LLM complexity tie-breaker), `config.py` (all settings, validated on startup), `cloud_catalog.py` / `model_catalog.py` (cloud and local model metadata) |
+| `compression/` | Context compression: `adapter.py` (contract the gateway calls), `codeindex/` (persistent SQLite index, hybrid retrieval, adequacy), `context_engine/` (in-memory fallback: walker, chunker, selector, import graph, budget allocator, redaction) |
 | `extension/` | VS Code extension (frontend): the LocalPilot sidebar (`src/extension.ts`) and the backend launcher (`src/backend.ts`) |
-| `scripts/` | `setup.sh` (used by `make setup`), `streamlit_ui.py` (optional browser UI with the same flow as the sidebar), `smoke_test.py` (calls a running API) |
-| `tests/` | Context engine tests |
-| `bench/`, `run_demo.py`, `examples/` | Benchmarks, a CLI demo and a generator for the demo repo |
+| `scripts/` | `setup.sh` (used by `make setup`), `stop.sh` (used by `make stop`), `streamlit_ui.py` (optional browser UI with the same flow as the sidebar), `smoke_test.py` (calls a running API) |
+| `tests/` | Python tests: routing policy and escalation, router integration, codebase index, context engine, context eval, lifecycle |
+| `bench/`, `run_demo.py`, `examples/` | Routing and context benchmarks with labelled query sets, a CLI demo and a generator for the demo repo |
+| `docs/` | Context engine spec, routing policy, [codebase-intelligence architecture](docs/codebase-intelligence.md), benchmark notes, pipeline trace |
 
 All Python runs from the repo root: `backend` and `compression` are sibling packages (`uvicorn backend.main:app`, `python -m compression.check_contract`).
-| `docs/` | Context engine spec, routing policy, [codebase-intelligence architecture](docs/codebase-intelligence.md), benchmark notes, pipeline trace |
 
 ### API
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /analyze` | `{prompt, code, repo_path}` → decision, score, reasons, repo searched, files selected, token estimate. No model called. |
-| `POST /chat` | Same body + `force_route: auto \| local \| cloud` → answer, route, model, confidence, tokens sent/saved, files, secrets masked, trace, plus routing metadata (`requested_route`, `initial_route`, `final_route`, `complexity`, `complexity_score_100`, `local_capable`, `capability_reasons`, `escalation_kind`) |
+| `POST /analyze` | `{prompt, code, repo_path, force_route?}` → decision, complexity, reasons, repo searched, files selected, token and cost estimate, plus the same routing metadata as `/chat`. No model called. |
+| `POST /chat` | Same body + `force_route: auto \| local \| cloud` and `detail: brief \| detailed` → answer, route, model, confidence, `low_confidence`, `more_available`, `truncated`, tokens sent/saved, files, secrets masked, trace, plus routing metadata (`requested_route`, `initial_route`, `final_route`, `complexity`, `complexity_score_100`, `local_capable`, `capability_reasons`, `escalation_kind`) and `context_metadata` (retrieval coverage, adequacy, evidence) |
 | `POST /chat/stream` | Same as `/chat`, streamed as Server-Sent Events: `start` {route, model} when a model begins answering, `delta` {text} per token chunk, `reset` {reason} if the text so far is discarded, then `done` {the `/chat` response} or `error` {status, message}. Sends a `: ping` comment every `SSE_HEARTBEAT_S` (15s) while idle. Used by the VS Code sidebar. |
 | `GET /stats` | Session totals: local/cloud requests, escalations, tokens saved |
 | `GET /health` | Backend status, Ollama reachability, active local model + available local models, active cloud provider/model, and whether its API key validated |
@@ -182,10 +188,10 @@ To work on the extension itself, open `extension/` in VS Code and press `F5` ins
 ### Optional
 
 ```bash
-streamlit run scripts/streamlit_ui.py     # browser UI with the same flow
+streamlit run scripts/streamlit_ui.py     # browser UI with the same flow (TOKENGUARD_API_URL overrides http://localhost:8000)
 python examples/seed_demo_repo.py         # creates examples/frozen_repo, a small TS repo with an auth module
 python run_demo.py                        # context engine CLI demo on that repo
-python -m pytest tests                    # context engine tests
+python -m pytest tests                    # all Python tests (same as make test)
 ```
 
 ### Configuration (`backend/.env`)
@@ -204,18 +210,47 @@ python -m pytest tests                    # context engine tests
 | `CUSTOM_API_KEY`, `CUSTOM_BASE_URL`, `CUSTOM_MODEL` | – | Custom OpenAI-compatible endpoint (Groq/OpenRouter/self-hosted); also settable per request via `X-LLM-Base-Url` |
 | `OLLAMA_URL`, `LOCAL_MODEL` | `http://localhost:11434`, `qwen2.5-coder:1.5b` | Local model |
 | `LOCAL_KEEP_ALIVE` | `30m` | How long the active local model stays resident. Only one is loaded at a time; switching unloads the previous model first |
-| `LOCAL_THRESHOLD`, `CLOUD_THRESHOLD` | `0.35`, `0.65` | Routing thresholds |
-| `MIN_LOCAL_CONFIDENCE` | `0.7` | Below this, a local answer is flagged for the global LLM |
-| `CLOUD_CONTEXT_TOKEN_BUDGET` | `3000` | Max context tokens sent to the cloud |
+| `LOCAL_TIMEOUT_S` | `120` | Max wait between streamed chunks from the local model |
+| `LOCAL_BRIEF_WORDS`, `LOCAL_BRIEF_MAX_TOKENS` | `200`, `1200` | Length budget and hard cap for a normal local answer |
+| `LOCAL_DETAILED_WORDS`, `LOCAL_DETAILED_MAX_TOKENS` | `800`, `4000` | The same for **More detailed explanation** |
+| `DEFAULT_ROUTE` | `auto` | Routing preference when a request doesn't set one: `auto`, `local` or `cloud` |
+| `CLOUD_ENABLED`, `CLOUD_TRANSMISSION_PROHIBITED` | `true`, `false` | Cloud master switch, and the hard privacy switch (nothing leaves the machine) |
+| `COMPLEXITY_WEIGHTS`, `COMPLEXITY_SIMPLE_MAX`, `COMPLEXITY_MEDIUM_MAX` | see `.env.example`, `34`, `64` | Complexity factor weights (JSON) and the 0–100 category boundaries |
+| `LOCAL_LLM_CLASSIFIER` | `true` | Use the local model as a tie-breaker for medium-band requests |
+| `MIN_LOCAL_CONFIDENCE` | `0.7` | Below this, a local answer is escalated (`auto`) or flagged `low_confidence` |
+| `ESCALATION_ENABLED`, `MAX_CLOUD_ESCALATIONS`, `MISSING_CONFIDENCE_POLICY` | `true`, `1`, `escalate` | Post-response escalation |
+| `CLOUD_MAX_CONTEXT_TOKENS` | `16000` | Cap on context sent to a cloud model |
+| `CLOUD_CONTEXT_TOKEN_BUDGET` | `3000` | Fallback context budget when none is computed for the request |
+| `CONTEXT_INDEX_ENABLED`, `CONTEXT_LLM_ASSIST`, `CONTEXT_SEMANTIC_ENABLED` | `true` | Codebase index, local-model rerank/propose, and semantic retrieval (each fails open) |
+
+Every setting, with comments, is in [`backend/.env.example`](backend/.env.example).
 
 ---
 
 ## Measured results
 
-Token counts from our runs (tiktoken `cl100k`). "Full context" is the prompt plus every source file in the repo, which is what a cloud-only assistant could send.
+Token counts from our runs on the `final_features` code (tiktoken `cl100k`, codebase index on,
+local model `qwen2.5-coder:1.5b` on an 8-core CPU without a GPU). "Full context" is the prompt plus
+every source file of the attached repo, which is what a cloud-only assistant could send.
 
-| Prompt | Route | Full context | Sent to cloud | Saved |
-|---|---|---:|---:|---:|
+| Prompt | Repo | Route | Full context | Sent to cloud | Saved |
+|---|---|---|---:|---:|---:|
+| Write a regex to match an email address | none | Local (`qwen2.5-coder:1.5b`, 22 s, confidence 0.9) | 8 | 0 | 100% |
+| Refactor the auth architecture across the whole codebase | this repo | Global (complex, 80/100) | 116,062 | 14,398 | 88% |
+| Explain the auth schema | `frozen_repo` | Global | 2,605 | 819 | 69% |
+| Find and fix a race condition in the user service | `frozen_repo` | Global (complex, 80/100) | 2,610 | 824 | 68% |
+
+The global answers in these runs came from the mock provider; the token savings do not depend on
+which cloud model answers. Cloud-bound requests now get a context budget sized to the cloud
+model (up to 16,000 tokens) instead of a fixed 3,000, so they carry more of the relevant code.
+On the small `frozen_repo` that means a lower percentage saved than earlier 3,000-token runs.
+
+**Known limitation:** with a large repo attached, a CPU-only machine can take longer than
+`LOCAL_TIMEOUT_S` (120 s) to read a ~7.7k-token local context with the 1.5B model. The local call
+then fails and an `auto` request escalates to the cloud. On such machines, raise `LOCAL_TIMEOUT_S`
+or lower `LOCAL_MAX_CONTEXT_TOKENS`.
+
+---|---|---:|---:|---:|
 | Write a regex to match an email address | Local (`qwen2.5-coder:7b`, 28 s) | 24,812 | 0 | 100% |
 | Refactor the auth architecture across the whole codebase | Global | 24,814 | 2,982 | 88% |
 | Explain the auth schema (`frozen_repo`) | Global | 2,604 | 502 | 81% |
@@ -227,7 +262,7 @@ The global answers in these runs came from the mock provider; the token savings 
 
 ## Roadmap
 
-Done: VS Code sidebar, local and cloud LLM clients, rule-based router with user consent, confidence-based escalation, token measurement, context selection and compression, secret redaction, session stats.
+Done: VS Code sidebar, local and cloud LLM clients (DeepSeek, Anthropic, OpenAI, custom), explainable routing policy (hard policy, capability checks, 0–100 complexity, local-LLM tie-breaker) with user consent, escalation on confidence, refusals and errors, length-limited local answers with **More detail**, persistent codebase index with hybrid retrieval and adequacy checks, token and cost measurement, secret redaction, session stats, clean process shutdown.
 
 Next:
 

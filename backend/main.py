@@ -80,6 +80,7 @@ class ChatResponse(BaseModel):
     escalation_kind: Optional[str] = None
     confidence: Optional[float]
     confidence_threshold: float = 0.7
+    low_confidence: bool = False  # local answer below confidence_threshold
     detail: str = "brief"
     more_available: bool = False  # local answer was kept short; a detailed one can be requested
     truncated: bool = False  # local answer hit the length cap
