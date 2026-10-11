@@ -244,8 +244,27 @@ LOCAL_JSON_INSTRUCTIONS = """You are a coding assistant running as a small local
 Answer the user's request, then honestly rate your confidence that the answer is fully correct and complete.
 If the task needs deep multi-file reasoning, architecture decisions, or knowledge you lack, set needs_cloud to true.
 
+LENGTH: {length}
+Plan the answer to fit this budget before writing; code blocks count toward it. Put the most
+important points first and always finish the answer: never stop mid-sentence or mid-list.
+In code examples prefer single quotes; any double quote inside the answer must be escaped as \\".
+
 Respond ONLY with a JSON object of this exact shape:
-{"answer": "<your full answer in markdown>", "confidence": <number 0.0-1.0>, "needs_cloud": <true|false>}"""
+{{"answer": "<your full answer in markdown>", "confidence": <number 0.0-1.0>, "needs_cloud": <true|false>, "more_available": <true|false>}}"""
+
+LOCAL_LENGTH_RULES = {
+    "brief": ("Keep the answer short: at most about {words} words and at most 7 bullet points or steps. "
+              "If a fuller explanation would genuinely help, summarize the key points and set "
+              "more_available to true; otherwise set it to false."),
+    "detailed": ("The user asked for a detailed explanation: be thorough, up to about {words} words, "
+                 "with examples where useful. Set more_available to false."),
+}
+
+
+def local_instructions(detail: str) -> str:
+    words = config.LOCAL_DETAILED_WORDS if detail == "detailed" else config.LOCAL_BRIEF_WORDS
+    rule = LOCAL_LENGTH_RULES.get(detail, LOCAL_LENGTH_RULES["brief"]).format(words=words)
+    return LOCAL_JSON_INSTRUCTIONS.format(length=rule)
 
 HEDGE_PATTERNS = re.compile(
     r"\b(i'?m not sure|i am not sure|not certain|i don'?t know|cannot determine|can'?t determine|"
@@ -263,6 +282,8 @@ class LLMResult:
     output_tokens: int = 0
     confidence: Optional[float] = None
     needs_cloud: bool = False
+    more_available: bool = False  # local model: a longer, more detailed answer is worth asking for
+    truncated: bool = False  # local model: generation hit the token cap before finishing
     fallback_reason: Optional[str] = None  # set when the real cloud call failed and the mock answered
     is_mock: bool = False  # true when no real cloud model answered (mock stand-in)
 
@@ -273,17 +294,18 @@ def _parse_local_json(raw: str):
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if not match:
-            return raw, 0.5, False
+            return raw, 0.5, False, False
         try:
             data = json.loads(match.group(0))
         except json.JSONDecodeError:
-            return raw, 0.5, False
+            return raw, 0.5, False, False
     answer = str(data.get("answer", "")).strip()
     try:
         confidence = float(data.get("confidence", 0.5))
     except (TypeError, ValueError):
         confidence = 0.5
-    return answer, max(0.0, min(confidence, 1.0)), bool(data.get("needs_cloud", False))
+    return (answer, max(0.0, min(confidence, 1.0)), bool(data.get("needs_cloud", False)),
+            bool(data.get("more_available", False)))
 
 
 class _JSONAnswerStream:
@@ -295,6 +317,7 @@ class _JSONAnswerStream:
 
     def __init__(self) -> None:
         self.raw = ""
+        self.answer = ""  # the answer decoded so far (all of it once the closing quote arrives)
         self._pos: Optional[int] = None  # index just past the decoded part of the answer
         self._done = False
 
@@ -348,7 +371,9 @@ class _JSONAnswerStream:
             out.append(chr(cp))
             i += 6
         self._pos = i
-        return "".join(out)
+        delta = "".join(out)
+        self.answer += delta
+        return delta
 
 
 async def _raise_for_status(resp: httpx.Response) -> None:
@@ -379,20 +404,25 @@ def _adjust_confidence(answer: str, confidence: float) -> float:
     return round(max(0.0, min(confidence, 1.0)), 2)
 
 
-async def call_local(prompt: str, context: str = "", emit: Optional[Emit] = None) -> LLMResult:
+async def call_local(
+    prompt: str, context: str = "", emit: Optional[Emit] = None, detail: str = "brief"
+) -> LLMResult:
+    """Ask the local model. `detail` ("brief" | "detailed") sets the length budget it is told about
+    and the hard token cap behind it."""
     user_content = f"{prompt}\n\n### Code context\n{context}" if context else prompt
     model = effective_local_model()
     global _loaded_local_model
+    max_tokens = config.LOCAL_DETAILED_MAX_TOKENS if detail == "detailed" else config.LOCAL_BRIEF_MAX_TOKENS
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": LOCAL_JSON_INSTRUCTIONS},
+            {"role": "system", "content": local_instructions(detail)},
             {"role": "user", "content": user_content},
         ],
         "format": "json",
         "stream": True,
         "keep_alive": config.LOCAL_KEEP_ALIVE,
-        "options": {"temperature": 0.2, "num_ctx": config.LOCAL_NUM_CTX},
+        "options": {"temperature": 0.2, "num_ctx": config.LOCAL_NUM_CTX, "num_predict": max_tokens},
     }
     # Enforce one local model at a time: unload any other model before this one is loaded.
     # The lock also keeps a model switch (PUT /local-model) from racing the generation.
@@ -412,6 +442,11 @@ async def call_local(prompt: str, context: str = "", emit: Optional[Emit] = None
                         continue
                     chunk = json.loads(line)
                     if chunk.get("error"):
+                        # Ollama aborts a run that loops on one token (typically after an unescaped
+                        # quote ended the JSON string). Keep what was answered so far, if anything.
+                        if "repeat limit" in str(chunk["error"]) and stream.answer.strip():
+                            data = {"done_reason": "length"}
+                            break
                         raise RuntimeError(chunk["error"])  # Ollama streams errors with HTTP 200
                     delta = stream.feed((chunk.get("message") or {}).get("content", ""))
                     if delta and emit:
@@ -420,7 +455,18 @@ async def call_local(prompt: str, context: str = "", emit: Optional[Emit] = None
                         data = chunk  # the final chunk carries the token counts
         latency = int((time.perf_counter() - start) * 1000)
 
-    answer, confidence, needs_cloud = _parse_local_json(stream.raw)
+    truncated = data.get("done_reason") == "length"
+    if truncated:
+        # Hit num_predict mid-JSON: keep the answer streamed so far rather than the broken raw JSON.
+        # The model never got to rate itself, so confidence stays neutral; offer the longer answer.
+        answer, confidence, needs_cloud, more_available = stream.answer.strip(), 0.5, False, True
+        log.info("local answer hit the %d-token cap (%s)", max_tokens, detail)
+    else:
+        answer, confidence, needs_cloud, more_available = _parse_local_json(stream.raw)
+        # Small models rarely flag more_available themselves; an answer that used most of its
+        # word budget was squeezed to fit, so a longer one is worth offering too.
+        if detail != "detailed" and len(answer.split()) >= 0.75 * config.LOCAL_BRIEF_WORDS:
+            more_available = True
     return LLMResult(
         answer=answer,
         model=model,
@@ -429,6 +475,8 @@ async def call_local(prompt: str, context: str = "", emit: Optional[Emit] = None
         output_tokens=data.get("eval_count", 0),
         confidence=_adjust_confidence(answer, confidence),
         needs_cloud=needs_cloud,
+        more_available=more_available and detail != "detailed",
+        truncated=truncated,
     )
 
 

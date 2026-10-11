@@ -348,7 +348,11 @@ class LocalPilotViewProvider {
         const controller = this._track(id);
         try {
             // start / delta / reset events render the answer while it's generated; 'result' finalizes it.
-            const result = await this._host.apiStream('/chat/stream', { ...req, force_route: route }, (event, data) => this._post({ type: 'stream', id, event, data }), STREAM_IDLE_TIMEOUT_MS, controller.signal);
+            const result = await this._host.apiStream('/chat/stream', { ...req, force_route: route }, (event, data) => {
+                if (!controller.signal.aborted) { // Stop pressed: forward nothing more
+                    this._post({ type: 'stream', id, event, data });
+                }
+            }, STREAM_IDLE_TIMEOUT_MS, controller.signal);
             this._post({ type: 'result', id, route, result });
         }
         catch (err) {

@@ -70,7 +70,7 @@ def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dic
 
 async def handle(
     prompt: str, repo_path: Optional[str] = None, code: str = "", force_route: str = "auto",
-    emit: Optional[Emit] = None,
+    emit: Optional[Emit] = None, detail: str = "brief",
 ) -> Dict[str, Any]:
     """Run the pipeline. With `emit`, also stream progress: "start" {route, model} when a model
     begins answering (a second "start" means the earlier text was superseded by an escalation),
@@ -98,8 +98,11 @@ async def handle(
             ctx = compress(req, trace)
             if emit:
                 emit("start", {"route": "local", "model": effective_local_model()})
-            local = await call_local(prompt, ctx.context, emit)
-            trace.append(f"local confidence={local.confidence} needs_cloud={local.needs_cloud}")
+            local = await call_local(prompt, ctx.context, emit, detail)
+            trace.append(f"local confidence={local.confidence} needs_cloud={local.needs_cloud} "
+                         f"detail={detail} more_available={local.more_available}")
+            if local.truncated:
+                trace.append("local answer hit the length cap")
             if local.confidence < config.MIN_LOCAL_CONFIDENCE:
                 escalation_reason = f"local confidence {local.confidence} < {config.MIN_LOCAL_CONFIDENCE}"
             elif local.needs_cloud:
@@ -147,6 +150,9 @@ async def handle(
         "escalated": escalated,
         "escalation_reason": escalation_reason if escalated else None,
         "confidence": local.confidence if local else None,
+        "detail": detail,
+        "more_available": bool(local and not cloud and local.more_available),
+        "truncated": bool(local and not cloud and local.truncated),
         "complexity_score": analysis.score,
         "task_type": analysis.task_type,
         "factors": analysis.factors,

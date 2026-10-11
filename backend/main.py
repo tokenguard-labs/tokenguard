@@ -67,6 +67,8 @@ class ChatRequest(BaseModel):
     repo_path: Optional[str] = None
     code: str = ""  # optional selected code / file contents from the editor
     force_route: Literal["auto", "local", "cloud"] = "auto"
+    # Local answer length: "brief" by default; "detailed" re-asks for the longer explanation.
+    detail: Literal["brief", "detailed"] = "brief"
 
 
 class ChatResponse(BaseModel):
@@ -76,6 +78,9 @@ class ChatResponse(BaseModel):
     escalated: bool
     escalation_reason: Optional[str]
     confidence: Optional[float]
+    detail: str = "brief"
+    more_available: bool = False  # local answer was kept short; a detailed one can be requested
+    truncated: bool = False  # local answer hit the length cap
     complexity_score: float
     task_type: str
     factors: Dict[str, float]
@@ -240,7 +245,7 @@ async def chat(req: ChatRequest, request: Request):
     # Run the pipeline as a task so a client disconnect (the sidebar's Stop button) cancels it.
     # Cancelling closes the connection to Ollama / the cloud API (so generation stops) and
     # releases the local-model lock, so the next prompt doesn't queue behind a dropped answer.
-    work = asyncio.create_task(router.handle(req.prompt, req.repo_path, req.code, req.force_route))
+    work = asyncio.create_task(router.handle(req.prompt, req.repo_path, req.code, req.force_route, detail=req.detail))
     hangup = asyncio.create_task(_wait_for_disconnect(request))
     try:
         await asyncio.wait({work, hangup}, return_when=asyncio.FIRST_COMPLETED)
@@ -279,7 +284,7 @@ async def chat_stream(req: ChatRequest, request: Request):
 
     async def run() -> None:
         try:
-            result = await router.handle(req.prompt, req.repo_path, req.code, req.force_route, emit=emit)
+            result = await router.handle(req.prompt, req.repo_path, req.code, req.force_route, emit=emit, detail=req.detail)
         except Exception as e:
             err = _http_error(e)
             emit("error", {"status": err.status_code, "message": err.detail})
