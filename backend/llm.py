@@ -6,13 +6,17 @@ import re
 import time
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, AsyncIterator, Callable, Dict, Optional
 
 import httpx
 
 from . import config
 
 log = logging.getLogger("localpilot.llm")
+
+# Streaming hook: emit(event, data). Model calls send "delta" {"text"} as tokens arrive and
+# "reset" {"reason"} when text already sent is being thrown away (e.g. mock fallback mid-answer).
+Emit = Callable[[str, Dict[str, Any]], None]
 
 
 @dataclass
@@ -282,6 +286,90 @@ def _parse_local_json(raw: str):
     return answer, max(0.0, min(confidence, 1.0)), bool(data.get("needs_cloud", False))
 
 
+class _JSONAnswerStream:
+    """Decode the "answer" string of the local model's JSON reply while it is still streaming,
+    so the answer can be shown token by token. The full raw text is kept for the final parse."""
+
+    _KEY = re.compile(r'"answer"\s*:\s*"')
+    _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+
+    def __init__(self) -> None:
+        self.raw = ""
+        self._pos: Optional[int] = None  # index just past the decoded part of the answer
+        self._done = False
+
+    def feed(self, chunk: str) -> str:
+        """Append raw model output; return the newly decoded part of the answer (may be "")."""
+        self.raw += chunk
+        if self._done:
+            return ""
+        if self._pos is None:
+            match = self._KEY.search(self.raw)
+            if not match:
+                return ""
+            self._pos = match.end()
+        buf, i, out = self.raw, self._pos, []
+        while i < len(buf):
+            c = buf[i]
+            if c == '"':
+                self._done = True
+                break
+            if c != "\\":
+                out.append(c)
+                i += 1
+                continue
+            if i + 1 >= len(buf):
+                break  # escape split across chunks: wait for the rest
+            esc = buf[i + 1]
+            if esc != "u":
+                out.append(self._ESCAPES.get(esc, esc))
+                i += 2
+                continue
+            if i + 6 > len(buf):
+                break
+            try:
+                cp = int(buf[i + 2:i + 6], 16)
+            except ValueError:
+                out.append(buf[i + 2:i + 6])
+                i += 6
+                continue
+            if 0xD800 <= cp < 0xDC00:  # high surrogate: decode it together with its low half
+                if i + 8 > len(buf):
+                    break  # can't tell yet whether "\u<low>" follows
+                if buf[i + 6:i + 8] == "\\u" and i + 12 > len(buf):
+                    break
+                try:
+                    low = int(buf[i + 8:i + 12], 16)
+                    out.append(chr(0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)))
+                    i += 12
+                    continue
+                except ValueError:
+                    pass
+            out.append(chr(cp))
+            i += 6
+        self._pos = i
+        return "".join(out)
+
+
+async def _raise_for_status(resp: httpx.Response) -> None:
+    """raise_for_status for a streamed response (reads the body first so errors can quote it)."""
+    if resp.is_error:
+        await resp.aread()
+        resp.raise_for_status()
+
+
+async def _sse_data(resp: httpx.Response) -> AsyncIterator[Dict[str, Any]]:
+    """The JSON `data:` payloads of a server-sent-events response (OpenAI / Anthropic streams)."""
+    async for line in resp.aiter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            return
+        if data:
+            yield json.loads(data)
+
+
 def _adjust_confidence(answer: str, confidence: float) -> float:
     """Small models over-report confidence; penalize obvious signs of uncertainty."""
     if len(answer) < 20:
@@ -291,7 +379,7 @@ def _adjust_confidence(answer: str, confidence: float) -> float:
     return round(max(0.0, min(confidence, 1.0)), 2)
 
 
-async def call_local(prompt: str, context: str = "") -> LLMResult:
+async def call_local(prompt: str, context: str = "", emit: Optional[Emit] = None) -> LLMResult:
     user_content = f"{prompt}\n\n### Code context\n{context}" if context else prompt
     model = effective_local_model()
     global _loaded_local_model
@@ -302,7 +390,7 @@ async def call_local(prompt: str, context: str = "") -> LLMResult:
             {"role": "user", "content": user_content},
         ],
         "format": "json",
-        "stream": False,
+        "stream": True,
         "keep_alive": config.LOCAL_KEEP_ALIVE,
         "options": {"temperature": 0.2, "num_ctx": config.LOCAL_NUM_CTX},
     }
@@ -313,13 +401,26 @@ async def call_local(prompt: str, context: str = "") -> LLMResult:
             await _ollama_unload(_loaded_local_model)
         _loaded_local_model = model
         start = time.perf_counter()
+        stream = _JSONAnswerStream()
+        data: Dict[str, Any] = {}
+        # Streamed: the timeout applies between chunks, not to the whole generation.
         async with httpx.AsyncClient(timeout=config.LOCAL_TIMEOUT_S) as client:
-            resp = await client.post(f"{config.OLLAMA_URL}/api/chat", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+            async with client.stream("POST", f"{config.OLLAMA_URL}/api/chat", json=payload) as resp:
+                await _raise_for_status(resp)
+                async for line in resp.aiter_lines():
+                    if not line.strip():
+                        continue
+                    chunk = json.loads(line)
+                    if chunk.get("error"):
+                        raise RuntimeError(chunk["error"])  # Ollama streams errors with HTTP 200
+                    delta = stream.feed((chunk.get("message") or {}).get("content", ""))
+                    if delta and emit:
+                        emit("delta", {"text": delta})
+                    if chunk.get("done"):
+                        data = chunk  # the final chunk carries the token counts
         latency = int((time.perf_counter() - start) * 1000)
 
-    answer, confidence, needs_cloud = _parse_local_json(data["message"]["content"])
+    answer, confidence, needs_cloud = _parse_local_json(stream.raw)
     return LLMResult(
         answer=answer,
         model=model,
@@ -331,14 +432,17 @@ async def call_local(prompt: str, context: str = "") -> LLMResult:
     )
 
 
-async def _call_anthropic(user_content: str) -> LLMResult:
+async def _call_anthropic(user_content: str, emit: Optional[Emit] = None) -> LLMResult:
     key = effective_key("anthropic")
     if not key:
         raise RuntimeError("ANTHROPIC_API_KEY is not set")
     model = effective_model("anthropic")
     start = time.perf_counter()
+    parts: list[str] = []
+    input_tokens = output_tokens = 0
     async with httpx.AsyncClient(timeout=config.CLOUD_TIMEOUT_S) as client:
-        resp = await client.post(
+        async with client.stream(
+            "POST",
             "https://api.anthropic.com/v1/messages",
             headers={
                 "x-api-key": key,
@@ -350,26 +454,46 @@ async def _call_anthropic(user_content: str) -> LLMResult:
                 "max_tokens": config.CLOUD_MAX_TOKENS,
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": user_content}],
+                "stream": True,
             },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    text = "".join(block.get("text", "") for block in data["content"] if block["type"] == "text")
+        ) as resp:
+            await _raise_for_status(resp)
+            async for event in _sse_data(resp):
+                kind = event.get("type")
+                if kind == "message_start":
+                    usage = event["message"].get("usage", {})
+                    input_tokens = usage.get("input_tokens", 0)
+                    output_tokens = usage.get("output_tokens", 0)
+                elif kind == "content_block_delta" and event["delta"].get("type") == "text_delta":
+                    text = event["delta"]["text"]
+                    parts.append(text)
+                    if emit:
+                        emit("delta", {"text": text})
+                elif kind == "message_delta":
+                    output_tokens = event.get("usage", {}).get("output_tokens", output_tokens)
+                elif kind == "error":
+                    raise RuntimeError(f"anthropic stream error: {event.get('error')}")
     return LLMResult(
-        answer=text,
+        answer="".join(parts),
         model=model,
         latency_ms=int((time.perf_counter() - start) * 1000),
-        input_tokens=data["usage"]["input_tokens"],
-        output_tokens=data["usage"]["output_tokens"],
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
 
 async def _call_openai_compatible(
-    user_content: str, url: str, api_key: str, model: str, max_tokens: int
+    user_content: str, url: str, api_key: str, model: str, max_tokens: int, emit: Optional[Emit] = None
 ) -> LLMResult:
+    from .tokens import count_tokens
+
     start = time.perf_counter()
+    parts: list[str] = []
+    usage: Dict[str, Any] = {}
+    answered_by = model
     async with httpx.AsyncClient(timeout=config.CLOUD_TIMEOUT_S) as client:
-        resp = await client.post(
+        async with client.stream(
+            "POST",
             url,
             headers={"Authorization": f"Bearer {api_key}"},
             json={
@@ -379,30 +503,44 @@ async def _call_openai_compatible(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_content},
                 ],
+                "stream": True,
+                "stream_options": {"include_usage": True},  # usage arrives in the last chunk
             },
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    usage = data.get("usage", {})
+        ) as resp:
+            await _raise_for_status(resp)
+            async for chunk in _sse_data(resp):
+                answered_by = chunk.get("model") or answered_by
+                usage = chunk.get("usage") or usage
+                for choice in chunk.get("choices") or []:
+                    text = (choice.get("delta") or {}).get("content")
+                    if text:
+                        parts.append(text)
+                        if emit:
+                            emit("delta", {"text": text})
+    answer = "".join(parts)
     return LLMResult(
-        answer=data["choices"][0]["message"]["content"],
-        model=data.get("model", model),
+        answer=answer,
+        model=answered_by,
         latency_ms=int((time.perf_counter() - start) * 1000),
-        input_tokens=usage.get("prompt_tokens", 0),
-        output_tokens=usage.get("completion_tokens", 0),
+        # Estimate if the server ignored include_usage
+        input_tokens=usage.get("prompt_tokens") or count_tokens(SYSTEM_PROMPT + user_content),
+        output_tokens=usage.get("completion_tokens") or count_tokens(answer),
     )
 
 
-async def _call_mock(user_content: str) -> LLMResult:
+async def _call_mock(user_content: str, emit: Optional[Emit] = None) -> LLMResult:
     """Stand-in cloud model so the pipeline works end-to-end before an API key is available."""
-    import asyncio
-
     from .tokens import count_tokens
 
-    await asyncio.sleep(1.2)
+    answer = (f"[MOCK CLOUD ANSWER] Received {count_tokens(user_content)} tokens of request + context. "
+              "Set DEEPSEEK_API_KEY in backend/.env (CLOUD_PROVIDER=deepseek) to get a real answer.")
+    words = re.findall(r"\S+\s*", answer)
+    for word in words:  # "stream" it over ~1.2s like a real model
+        await asyncio.sleep(1.2 / len(words))
+        if emit:
+            emit("delta", {"text": word})
     return LLMResult(
-        answer=f"[MOCK CLOUD ANSWER] Received {count_tokens(user_content)} tokens of request + context. "
-        "Set DEEPSEEK_API_KEY in backend/.env (CLOUD_PROVIDER=deepseek) to get a real answer.",
+        answer=answer,
         model="mock-cloud",
         latency_ms=1200,
         input_tokens=count_tokens(user_content),
@@ -411,27 +549,27 @@ async def _call_mock(user_content: str) -> LLMResult:
     )
 
 
-async def _call_deepseek(user_content: str) -> LLMResult:
+async def _call_deepseek(user_content: str, emit: Optional[Emit] = None) -> LLMResult:
     key = effective_key("deepseek")
     if not key or key == config.DEEPSEEK_API_KEY_PLACEHOLDER:
         raise RuntimeError(f"{config.DEEPSEEK_API_KEY_ENV} is not set (still the placeholder)")
     return await _call_openai_compatible(
         user_content, config.DEEPSEEK_URL, key, effective_model("deepseek"),
-        min(config.CLOUD_MAX_TOKENS, config.DEEPSEEK_MAX_TOKENS),
+        min(config.CLOUD_MAX_TOKENS, config.DEEPSEEK_MAX_TOKENS), emit,
     )
 
 
-async def _call_openai(user_content: str) -> LLMResult:
+async def _call_openai(user_content: str, emit: Optional[Emit] = None) -> LLMResult:
     key = effective_key("openai")
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set")
     return await _call_openai_compatible(
         user_content, f"{effective_base_url('openai')}/chat/completions", key,
-        effective_model("openai"), config.CLOUD_MAX_TOKENS,
+        effective_model("openai"), config.CLOUD_MAX_TOKENS, emit,
     )
 
 
-async def _call_custom(user_content: str) -> LLMResult:
+async def _call_custom(user_content: str, emit: Optional[Emit] = None) -> LLMResult:
     """Any OpenAI-compatible endpoint (Groq/OpenRouter/self-hosted) via the base-URL override."""
     base = effective_base_url("custom")
     if not base:
@@ -443,7 +581,7 @@ async def _call_custom(user_content: str) -> LLMResult:
     if not model:
         raise RuntimeError("custom model is not set")
     return await _call_openai_compatible(
-        user_content, f"{base}/chat/completions", key, model, config.CLOUD_MAX_TOKENS,
+        user_content, f"{base}/chat/completions", key, model, config.CLOUD_MAX_TOKENS, emit,
     )
 
 
@@ -461,28 +599,37 @@ def _describe_error(e: Exception) -> str:
     return f"{type(e).__name__}: {e}"[:300]
 
 
-async def call_cloud(prompt: str, context: str = "") -> LLMResult:
+async def call_cloud(prompt: str, context: str = "", emit: Optional[Emit] = None) -> LLMResult:
     user_content = f"{prompt}\n\n### Relevant code context\n{context}" if context else prompt
     provider = effective_provider()
     if provider == "mock":
-        return await _call_mock(user_content)
+        return await _call_mock(user_content, emit)
     call = _PROVIDERS.get(provider)
     if call is None:
         reason = f"unsupported cloud provider {provider!r}; answered with the mock"
         if not config.CLOUD_FALLBACK_TO_MOCK:
             raise RuntimeError(reason)
         log.warning(reason)
-        result = await _call_mock(user_content)
+        result = await _call_mock(user_content, emit)
         result.fallback_reason = reason
         return result
+    streamed = False
+
+    def track(event: str, data: Dict[str, Any]) -> None:
+        nonlocal streamed
+        streamed = True
+        emit(event, data)
+
     try:
-        return await call(user_content)
+        return await call(user_content, track if emit else None)
     except Exception as e:
         if not config.CLOUD_FALLBACK_TO_MOCK:
             raise
         reason = f"{provider} call failed ({_describe_error(e)}); answered with the mock"
         log.warning(reason)
-        result = await _call_mock(user_content)
+        if streamed and emit:
+            emit("reset", {"reason": reason})  # drop the partial real answer
+        result = await _call_mock(user_content, emit)
         result.fallback_reason = reason
         return result
 

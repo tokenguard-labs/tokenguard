@@ -66,3 +66,7 @@ MIN_LOCAL_CONFIDENCE = float(os.getenv("MIN_LOCAL_CONFIDENCE", "0.7"))  # below 
 
 # Context budget for cloud requests
 CLOUD_CONTEXT_TOKEN_BUDGET = int(os.getenv("CLOUD_CONTEXT_TOKEN_BUDGET", "3000"))
+
+# POST /chat/stream sends an SSE comment this often (seconds) while no tokens are flowing (e.g. a
+# cold local model loading), so clients can use a short idle timeout instead of a huge total one.
+SSE_HEARTBEAT_S = float(os.getenv("SSE_HEARTBEAT_S", "15"))

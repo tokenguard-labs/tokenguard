@@ -14,3 +14,14 @@ examples/frozen_repo/
 # Ollama process started by setup.sh (killed by the extension on exit)
 .ollama.pid
 .ollama.log
+
+# Node / VS Code extension (setup.sh runs `npm install`; out/ and media/vendor/ stay committed
+# so the extension works without npm)
+node_modules/
+.vscode-test/
+*.vsix
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db

@@ -1,14 +1,17 @@
 """LocalPilot API. Run with:  make backend  (or, from the repo root: uvicorn backend.main:app --port 8000)"""
+import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from . import cloud_catalog, llm, model_catalog, router, system
+from . import cloud_catalog, config, llm, model_catalog, router, system
 
 logging.basicConfig(level=logging.INFO)
 
@@ -20,30 +23,43 @@ async def lifespan(_: FastAPI):
     await llm.unload_local_model_on_exit()
 
 
-app = FastAPI(title="LocalPilot", version="0.1.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-
-@app.middleware("http")
-async def llm_overrides_middleware(request, call_next):
+class LLMOverridesMiddleware:
     """Bind editor-supplied LLM settings (provider/model/API key) to this request.
 
     The VS Code extension keeps API keys in SecretStorage and sends them as headers, so keys
     never live in .env or on disk. Missing headers fall back to the backend's env config.
+
+    Plain ASGI rather than @app.middleware("http"): that wrapper hides client disconnects from the
+    endpoint and ends before a streamed body does, both of which /chat/stream relies on.
     """
-    provider = request.headers.get("x-llm-provider")
-    model = request.headers.get("x-llm-model")
-    api_key = request.headers.get("x-llm-api-key")
-    local_model = request.headers.get("x-local-model")
-    base_url = request.headers.get("x-llm-base-url")
-    if not (provider or model or api_key or local_model or base_url):
-        return await call_next(request)
-    token = llm.set_overrides(llm.LLMOverrides(
-        provider=provider, model=model, api_key=api_key, local_model=local_model, base_url=base_url))
-    try:
-        return await call_next(request)
-    finally:
-        llm.reset_overrides(token)
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
+        overrides = llm.LLMOverrides(
+            provider=headers.get("x-llm-provider"),
+            model=headers.get("x-llm-model"),
+            api_key=headers.get("x-llm-api-key"),
+            local_model=headers.get("x-local-model"),
+            base_url=headers.get("x-llm-base-url"),
+        )
+        if not (overrides.provider or overrides.model or overrides.api_key or overrides.local_model
+                or overrides.base_url):
+            return await self.app(scope, receive, send)
+        token = llm.set_overrides(overrides)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            llm.reset_overrides(token)
+
+
+app = FastAPI(title="LocalPilot", version="0.1.0", lifespan=lifespan)
+app.add_middleware(LLMOverridesMiddleware)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
 class ChatRequest(BaseModel):
@@ -199,16 +215,114 @@ async def select_local_model(req: LocalModelRequest):
 HISTORY: List[Dict[str, Any]] = []
 
 
+async def _wait_for_disconnect(request: Request) -> None:
+    """Return once the client hangs up. The body is already read, so the next ASGI message is
+    the disconnect."""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+
+
+def _http_error(e: Exception) -> HTTPException:
+    """Map a pipeline failure to the HTTP error /chat reports (and /chat/stream's error event)."""
+    if isinstance(e, HTTPException):
+        return e
+    if isinstance(e, httpx.HTTPStatusError):
+        return HTTPException(502, f"upstream LLM error: {e.response.status_code} {e.response.text[:300]}")
+    return HTTPException(500, str(e))
+
+
+def _record(prompt: str, result: Dict[str, Any]) -> None:
+    HISTORY.append({"prompt": prompt, **{k: v for k, v in result.items() if k != "answer"}})
+
+
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
+    # Run the pipeline as a task so a client disconnect (the sidebar's Stop button) cancels it.
+    # Cancelling closes the connection to Ollama / the cloud API (so generation stops) and
+    # releases the local-model lock, so the next prompt doesn't queue behind a dropped answer.
+    work = asyncio.create_task(router.handle(req.prompt, req.repo_path, req.code, req.force_route))
+    hangup = asyncio.create_task(_wait_for_disconnect(request))
     try:
-        result = await router.handle(req.prompt, req.repo_path, req.code, req.force_route)
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(502, f"upstream LLM error: {e.response.status_code} {e.response.text[:300]}")
+        await asyncio.wait({work, hangup}, return_when=asyncio.FIRST_COMPLETED)
+        if not work.done():
+            work.cancel()
+            logging.info("/chat cancelled by client")
+            raise HTTPException(499, "cancelled by client")
+        result = work.result()
     except Exception as e:
-        raise HTTPException(500, str(e))
-    HISTORY.append({"prompt": req.prompt, **{k: v for k, v in result.items() if k != "answer"}})
+        raise _http_error(e)
+    finally:
+        hangup.cancel()
+        if not work.done():
+            work.cancel()  # the request itself was cancelled (e.g. server shutdown)
+    _record(req.prompt, result)
     return result
+
+
+def _sse(event: str, data: Any) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/chat/stream")
+async def chat_stream(req: ChatRequest, request: Request):
+    """/chat as Server-Sent Events, so answers render while they are generated.
+
+    Events: start {route, model, escalation_reason?} when a model begins answering (a later
+    start replaces the earlier text), delta {text}, reset {reason} (discard the text so far),
+    then exactly one of done {ChatResponse} or error {status, message}. A ": ping" comment is
+    sent every SSE_HEARTBEAT_S while nothing else is, so clients can detect a dead connection.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def emit(event: str, data: Dict[str, Any]) -> None:
+        queue.put_nowait((event, data))
+
+    async def run() -> None:
+        try:
+            result = await router.handle(req.prompt, req.repo_path, req.code, req.force_route, emit=emit)
+        except Exception as e:
+            err = _http_error(e)
+            emit("error", {"status": err.status_code, "message": err.detail})
+            return
+        _record(req.prompt, result)
+        emit("done", ChatResponse(**result).model_dump())
+
+    # Created here so the task inherits this request's LLM overrides. As with /chat, a client
+    # disconnect cancels it, which stops generation and frees the local-model lock.
+    work = asyncio.create_task(run())
+
+    async def watch_hangup() -> None:
+        await _wait_for_disconnect(request)
+        if not work.done():
+            work.cancel()
+            logging.info("/chat/stream cancelled by client")
+
+    hangup = asyncio.create_task(watch_hangup())
+
+    async def events():
+        try:
+            yield ": connected\n\n"
+            while True:
+                try:
+                    event, data = await asyncio.wait_for(queue.get(), config.SSE_HEARTBEAT_S)
+                except asyncio.TimeoutError:
+                    if work.done() and queue.empty():
+                        return  # cancelled before it could report anything
+                    yield ": ping\n\n"
+                    continue
+                yield _sse(event, data)
+                if event in ("done", "error"):
+                    return
+        finally:
+            hangup.cancel()
+            if not work.done():
+                work.cancel()
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.get("/stats")

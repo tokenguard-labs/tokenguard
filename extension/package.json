@@ -23,6 +23,12 @@
         "icon": "$(circuit-board)"
       },
       {
+        "command": "tokenguard.clearChat",
+        "title": "Clear Chat",
+        "category": "TokenGuard",
+        "icon": "$(clear-all)"
+      },
+      {
         "command": "tokenguard.restartBackend",
         "title": "Restart Backend",
         "category": "TokenGuard"
@@ -69,6 +75,15 @@
           "id": "localpilot.chatView",
           "name": "LocalPilot Assistant",
           "icon": "./media/circuit-board.svg"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "tokenguard.clearChat",
+          "when": "view == localpilot.chatView",
+          "group": "navigation"
         }
       ]
     },
@@ -159,24 +174,30 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "vendor": "node scripts/copy-vendor.mjs",
+    "compile": "npm run vendor && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test"
   },
   "devDependencies": {
-    "@types/vscode": "^1.80.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "24.x",
-    "typescript-eslint": "^8.61.1",
+    "@types/vscode": "^1.80.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.0.0",
     "eslint": "^10.5.0",
     "typescript": "^6.0.3",
-    "@vscode/test-cli": "^0.0.15",
-    "@vscode/test-electron": "^3.0.0"
+    "typescript-eslint": "^8.61.1"
   },
   "overrides": {
     "diff": "^8.0.4",
     "serialize-javascript": "^7.0.6"
+  },
+  "dependencies": {
+    "@highlightjs/cdn-assets": "11.12.0",
+    "dompurify": "3.4.16",
+    "marked": "18.0.13"
   }
 }
