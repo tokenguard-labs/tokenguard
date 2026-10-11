@@ -30,6 +30,7 @@ class LLMOverrides:
     model: Optional[str] = None
     api_key: Optional[str] = None
     local_model: Optional[str] = None
+    base_url: Optional[str] = None  # custom OpenAI-compatible endpoint
 
 
 _overrides: ContextVar[Optional[LLMOverrides]] = ContextVar("llm_overrides", default=None)
@@ -61,6 +62,7 @@ def effective_model(provider: str) -> str:
         "deepseek": config.DEEPSEEK_MODEL,
         "openai": config.OPENAI_MODEL,
         "anthropic": config.ANTHROPIC_MODEL,
+        "custom": config.CUSTOM_MODEL,
     }.get(provider, "")
 
 
@@ -72,7 +74,22 @@ def effective_key(provider: str) -> str:
         "deepseek": config.DEEPSEEK_API_KEY,
         "openai": config.OPENAI_API_KEY,
         "anthropic": config.ANTHROPIC_API_KEY,
+        "custom": config.CUSTOM_API_KEY,
     }.get(provider, "")
+
+
+def effective_base_url(provider: str) -> str:
+    """Base URL (no trailing slash) for OpenAI-compatible providers, honouring the request override."""
+    ov = _overrides.get()
+    if ov and ov.base_url:
+        return ov.base_url.rstrip("/")
+    if provider == "deepseek":
+        return config.DEEPSEEK_URL.rsplit("/chat/completions", 1)[0].rstrip("/")
+    if provider == "openai":
+        return config.OPENAI_BASE_URL.rstrip("/")
+    if provider == "custom":
+        return (config.CUSTOM_BASE_URL or "").rstrip("/")
+    return ""
 
 
 def effective_local_model() -> str:
@@ -547,12 +564,33 @@ async def _call_openai(user_content: str, emit: Optional[Emit] = None) -> LLMRes
     if not key:
         raise RuntimeError("OPENAI_API_KEY is not set")
     return await _call_openai_compatible(
-        user_content, f"{config.OPENAI_BASE_URL}/chat/completions", key,
+        user_content, f"{effective_base_url('openai')}/chat/completions", key,
         effective_model("openai"), config.CLOUD_MAX_TOKENS, emit,
     )
 
 
-_PROVIDERS = {"deepseek": _call_deepseek, "anthropic": _call_anthropic, "openai": _call_openai}
+async def _call_custom(user_content: str, emit: Optional[Emit] = None) -> LLMResult:
+    """Any OpenAI-compatible endpoint (Groq/OpenRouter/self-hosted) via the base-URL override."""
+    base = effective_base_url("custom")
+    if not base:
+        raise RuntimeError("custom base URL is not set (tokenguard.customBaseUrl / CUSTOM_BASE_URL)")
+    key = effective_key("custom")
+    if not key:
+        raise RuntimeError("CUSTOM_API_KEY is not set")
+    model = effective_model("custom")
+    if not model:
+        raise RuntimeError("custom model is not set")
+    return await _call_openai_compatible(
+        user_content, f"{base}/chat/completions", key, model, config.CLOUD_MAX_TOKENS, emit,
+    )
+
+
+_PROVIDERS = {
+    "deepseek": _call_deepseek,
+    "anthropic": _call_anthropic,
+    "openai": _call_openai,
+    "custom": _call_custom,
+}
 
 
 def _describe_error(e: Exception) -> str:
@@ -637,7 +675,8 @@ async def validate_cloud_provider(force: bool = False) -> dict:
     provider = effective_provider()
     key = effective_key(provider)
     model = effective_model(provider)
-    cache_key = (provider, model, hash(key))
+    base = effective_base_url(provider)
+    cache_key = (provider, model, hash(key), base)
     now = time.time()
     cached = _health_cache.get(cache_key)
     if not force and cached and now - cached[0] < config.CLOUD_HEALTHCHECK_TTL_S:
@@ -679,8 +718,110 @@ async def validate_cloud_provider(force: bool = False) -> dict:
                 info["valid"] = True
             except Exception as e:
                 info["detail"] = _describe_error(e)
+    elif provider == "custom":
+        if not base:
+            info["detail"] = "custom base URL is not set"
+        elif not key:
+            info["detail"] = "CUSTOM_API_KEY is not set"
+        else:
+            info["configured"] = True
+            try:
+                info["detail"] = await _ping_openai_compatible(f"{base}/chat/completions", key, model)
+                info["valid"] = True
+            except Exception as e:
+                info["detail"] = _describe_error(e)
     else:
         info["detail"] = f"unknown cloud provider {provider!r}"
 
     _health_cache[cache_key] = (now, info)
     return info
+
+
+_cloud_models_cache: dict[tuple, tuple[float, list]] = {}
+
+
+async def _fetch_openai_models(base: str, api_key: str) -> list[str]:
+    async with httpx.AsyncClient(timeout=config.CLOUD_TIMEOUT_S) as client:
+        resp = await client.get(f"{base}/models", headers={"Authorization": f"Bearer {api_key}"})
+        resp.raise_for_status()
+        data = resp.json()
+    return [m.get("id") for m in data.get("data", []) if m.get("id")]
+
+
+async def _fetch_anthropic_models(api_key: str) -> list[str]:
+    async with httpx.AsyncClient(timeout=config.CLOUD_TIMEOUT_S) as client:
+        resp = await client.get(
+            "https://api.anthropic.com/v1/models",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    return [m.get("id") for m in data.get("data", []) if m.get("id")]
+
+
+async def list_cloud_models(force: bool = False) -> dict:
+    """Live model ids for the active provider (cached), with an indication of key validity.
+
+    Returns {provider, base_url, configured, valid, detail, ids}. When there is no usable key
+    the caller should fall back to the curated catalog.
+    """
+    provider = effective_provider()
+    key = effective_key(provider)
+    base = effective_base_url(provider)
+    cache_key = (provider, hash(key), base)
+    now = time.time()
+    cached = _cloud_models_cache.get(cache_key)
+    if not force and cached and now - cached[0] < config.CLOUD_MODELS_TTL_S:
+        return cached[1]
+
+    result = {"provider": provider, "base_url": base, "configured": False, "valid": False, "detail": "", "ids": []}
+
+    if provider == "mock":
+        result.update(configured=True, valid=True, detail="mock provider")
+    elif provider == "deepseek":
+        if not key or key == config.DEEPSEEK_API_KEY_PLACEHOLDER:
+            result["detail"] = f"{config.DEEPSEEK_API_KEY_ENV} is not set (still the placeholder)"
+        else:
+            result["configured"] = True
+            try:
+                result["ids"] = await _fetch_openai_models(effective_base_url("deepseek"), key)
+                result["valid"] = True
+            except Exception as e:
+                result["detail"] = _describe_error(e)
+    elif provider == "openai":
+        if not key:
+            result["detail"] = "OPENAI_API_KEY is not set"
+        else:
+            result["configured"] = True
+            try:
+                result["ids"] = await _fetch_openai_models(base, key)
+                result["valid"] = True
+            except Exception as e:
+                result["detail"] = _describe_error(e)
+    elif provider == "anthropic":
+        if not key:
+            result["detail"] = "ANTHROPIC_API_KEY is not set"
+        else:
+            result["configured"] = True
+            try:
+                result["ids"] = await _fetch_anthropic_models(key)
+                result["valid"] = True
+            except Exception as e:
+                result["detail"] = _describe_error(e)
+    elif provider == "custom":
+        if not base:
+            result["detail"] = "custom base URL is not set"
+        elif not key:
+            result["detail"] = "CUSTOM_API_KEY is not set"
+        else:
+            result["configured"] = True
+            try:
+                result["ids"] = await _fetch_openai_models(base, key)
+                result["valid"] = True
+            except Exception as e:
+                result["detail"] = _describe_error(e)
+    else:
+        result["detail"] = f"unknown cloud provider {provider!r}"
+
+    _cloud_models_cache[cache_key] = (now, result)
+    return result

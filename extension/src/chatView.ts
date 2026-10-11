@@ -37,6 +37,10 @@ export interface ChatViewHost {
     apiStream<T>(path: string, body: unknown, onEvent: (event: string, data: any) => void, idleTimeoutMs: number, signal?: AbortSignal): Promise<T>;
     apiUrl(): string;
     localModel(): string;
+    cloudProvider(): string;
+    customBaseUrl(): string;
+    /** Save (or, with an empty key, delete) a provider's API key in SecretStorage. */
+    storeApiKey(provider: string, key: string): Promise<void>;
     switchLocalModel(model: string): Promise<void>;
     downloadLocalModel(model: string): Promise<boolean>;
 }
@@ -47,6 +51,7 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
     private _retryDelayMs = 1_000;
     private _preloadedFor?: string;      // model we've already asked the backend to load
     private _preloadSuppressed = false;  // user explicitly unloaded: don't auto-reload until they pick again
+    private _cloudSig = '';              // provider|baseUrl signature last fetched for /cloud/models
     private readonly _inFlight = new Map<number, AbortController>(); // turn id -> request (for Stop)
     // The sidebar can take focus from the editor, so remember the last one for "Insert at cursor".
     private _lastEditor = vscode.window.activeTextEditor;
@@ -95,6 +100,7 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
                 case 'ready':
                     this._postContext();
                     await this._postStatus();
+                    void this._postCloudModels();
                     break;
                 case 'refreshStatus':
                     await this._host.backend()?.ensureRunning();
@@ -146,6 +152,47 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
                     await this._postStatus();
                     break;
                 }
+                case 'selectCloudProvider': {
+                    const config = vscode.workspace.getConfiguration('tokenguard');
+                    await config.update('cloudProvider', (data.provider || 'deepseek') as string, vscode.ConfigurationTarget.Global);
+                    // A model belongs to one provider; clear it so the backend uses this provider's default.
+                    await config.update('cloudModel', '', vscode.ConfigurationTarget.Global);
+                    await this._refreshCloud();
+                    break;
+                }
+                case 'selectCloudModel':
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('cloudModel', (data.model || '') as string, vscode.ConfigurationTarget.Global);
+                    await this._postStatus();
+                    void this._postCloudModels(); // refresh the price/current line from the cache
+                    break;
+                case 'saveCloudKey': {
+                    const provider = (data.provider || this._host.cloudProvider()) as string;
+                    const key = String(data.key || '').trim();
+                    await this._host.storeApiKey(provider, key);
+                    if (key) {
+                        void vscode.window.showInformationMessage(`TokenGuard: ${provider} API key saved to SecretStorage.`);
+                    }
+                    await this._refreshCloud();
+                    break;
+                }
+                case 'clearCloudKey': {
+                    const provider = (data.provider || this._host.cloudProvider()) as string;
+                    await this._host.storeApiKey(provider, '');
+                    void vscode.window.showInformationMessage(`TokenGuard: cleared the ${provider} API key.`);
+                    await this._refreshCloud();
+                    break;
+                }
+                case 'saveCloudBaseUrl':
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('customBaseUrl', String(data.baseUrl || '').trim(), vscode.ConfigurationTarget.Global);
+                    await this._refreshCloud();
+                    break;
+                case 'testCloud':
+                    await this._host.api('GET', '/health?force=true', undefined, 15_000).catch(() => undefined);
+                    await this._postCloudModels(true);
+                    await this._postStatus();
+                    break;
             }
         });
     }
@@ -198,6 +245,11 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
             this._clearRetry();
             this._post({ type: 'status', online: true, health, stats, apiUrl, localModel });
             void this._maybePreload(health);
+            const sig = `${this._host.cloudProvider()}|${this._host.customBaseUrl()}`;
+            if (sig !== this._cloudSig) {
+                this._cloudSig = sig;
+                void this._postCloudModels();
+            }
         } catch (err) {
             this._post({
                 type: 'status', online: false, retrying: true,
@@ -229,6 +281,26 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
             this._retryTimer = undefined;
         }
         this._retryDelayMs = 1_000;
+    }
+
+    /** Cloud provider, key or base URL changed: refetch the model list and the status card. */
+    private async _refreshCloud() {
+        this._cloudSig = '';
+        await this._postCloudModels(true);
+        await this._postStatus();
+    }
+
+    /** Fetch the provider's model list (backend-cached) and hand it to the sidebar picker. */
+    private async _postCloudModels(force = false) {
+        if (!force && !vscode.workspace.getConfiguration('tokenguard').get<boolean>('cloudModelsAutoFetch', true)) {
+            return;
+        }
+        try {
+            const info = await this._host.api('GET', `/cloud/models${force ? '?force=true' : ''}`, undefined, 10_000);
+            this._post({ type: 'cloudModels', info });
+        } catch {
+            // ignore: the status card already reports cloud problems
+        }
     }
 
     /** Load the selected local model once the backend + Ollama are up, so it isn't shown idle. */

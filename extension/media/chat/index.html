@@ -14,6 +14,33 @@
     <div class="container">
         <header class="top">
             <div id="status" class="status">Connecting to LocalPilot backend…</div>
+            <details id="cloudSection" class="section">
+                <summary>Cloud model</summary>
+                <div class="section-body">
+                    <div class="model-row">
+                        <label for="cloudProvider">Provider</label>
+                        <select id="cloudProvider"></select>
+                    </div>
+                    <div class="model-row" id="cloudBaseUrlRow" hidden>
+                        <label for="cloudBaseUrl">Base URL</label>
+                        <input id="cloudBaseUrl" type="text" placeholder="https://api.groq.com/openai/v1" />
+                    </div>
+                    <div class="model-row">
+                        <label for="cloudModel">Model</label>
+                        <select id="cloudModel"></select>
+                    </div>
+                    <div class="model-row">
+                        <label for="cloudKey">API key</label>
+                        <input id="cloudKey" type="password" placeholder="paste key" />
+                    </div>
+                    <div class="choices">
+                        <button id="saveCloudKey" class="secondary">Save key</button>
+                        <button id="clearCloudKey" class="secondary">Clear</button>
+                        <button id="testCloud" class="secondary">Test</button>
+                    </div>
+                    <div id="cloudState" class="muted"></div>
+                </div>
+            </details>
             <div class="model-row">
                 <label for="localModel">Local model</label>
                 <select id="localModel" title="Ollama model used for local inference"></select>

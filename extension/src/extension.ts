@@ -7,7 +7,7 @@ import { OllamaManager } from './ollama';
 // (backend/main.py). The sidebar chat lives in chatView.ts + media/chat/.
 
 // Providers that accept an API key (mock needs none). Keys live in VS Code SecretStorage.
-const KEY_PROVIDERS = ['deepseek', 'anthropic', 'openai'] as const;
+const KEY_PROVIDERS = ['deepseek', 'anthropic', 'openai', 'custom'] as const;
 type KeyProvider = typeof KEY_PROVIDERS[number];
 const SECRET_PREFIX = 'tokenguard.apiKey.';
 
@@ -31,6 +31,15 @@ export function activate(context: vscode.ExtensionContext) {
         apiStream,
         apiUrl,
         localModel,
+        cloudProvider,
+        customBaseUrl,
+        storeApiKey: async (provider, key) => {
+            if (key) {
+                await extensionContext.secrets.store(secretKey(provider), key);
+            } else {
+                await extensionContext.secrets.delete(secretKey(provider));
+            }
+        },
         switchLocalModel,
         downloadLocalModel
     });
@@ -50,7 +59,7 @@ export function activate(context: vscode.ExtensionContext) {
     // Re-check provider/model when the user edits the VS Code settings.
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
         if (e.affectsConfiguration('tokenguard.cloudProvider') || e.affectsConfiguration('tokenguard.cloudModel')
-            || e.affectsConfiguration('tokenguard.localModel')) {
+            || e.affectsConfiguration('tokenguard.localModel') || e.affectsConfiguration('tokenguard.customBaseUrl')) {
             viewProvider?.refreshStatus();
         }
     }));
@@ -120,6 +129,10 @@ function cloudModel(): string {
     return (vscode.workspace.getConfiguration('tokenguard').get<string>('cloudModel') || '').trim();
 }
 
+function customBaseUrl(): string {
+    return (vscode.workspace.getConfiguration('tokenguard').get<string>('customBaseUrl') || '').trim();
+}
+
 function localModel(): string {
     return (vscode.workspace.getConfiguration('tokenguard').get<string>('localModel') || '').trim();
 }
@@ -139,6 +152,12 @@ async function llmHeaders(): Promise<Record<string, string>> {
     const model = cloudModel();
     if (model) {
         headers['X-LLM-Model'] = model;
+    }
+    if (provider === 'custom') {
+        const base = customBaseUrl();
+        if (base) {
+            headers['X-LLM-Base-Url'] = base;
+        }
     }
     const local = localModel();
     if (local) {

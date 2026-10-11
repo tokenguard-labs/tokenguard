@@ -42,7 +42,7 @@ const ollama_1 = require("./ollama");
 // Activation, commands, settings and the HTTP client for the LocalPilot backend
 // (backend/main.py). The sidebar chat lives in chatView.ts + media/chat/.
 // Providers that accept an API key (mock needs none). Keys live in VS Code SecretStorage.
-const KEY_PROVIDERS = ['deepseek', 'anthropic', 'openai'];
+const KEY_PROVIDERS = ['deepseek', 'anthropic', 'openai', 'custom'];
 const SECRET_PREFIX = 'tokenguard.apiKey.';
 let backend;
 let ollama;
@@ -61,6 +61,16 @@ function activate(context) {
         apiStream,
         apiUrl,
         localModel,
+        cloudProvider,
+        customBaseUrl,
+        storeApiKey: async (provider, key) => {
+            if (key) {
+                await extensionContext.secrets.store(secretKey(provider), key);
+            }
+            else {
+                await extensionContext.secrets.delete(secretKey(provider));
+            }
+        },
         switchLocalModel,
         downloadLocalModel
     });
@@ -75,7 +85,7 @@ function activate(context) {
     // Re-check provider/model when the user edits the VS Code settings.
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
         if (e.affectsConfiguration('tokenguard.cloudProvider') || e.affectsConfiguration('tokenguard.cloudModel')
-            || e.affectsConfiguration('tokenguard.localModel')) {
+            || e.affectsConfiguration('tokenguard.localModel') || e.affectsConfiguration('tokenguard.customBaseUrl')) {
             viewProvider?.refreshStatus();
         }
     }));
@@ -122,6 +132,9 @@ function cloudProvider() {
 function cloudModel() {
     return (vscode.workspace.getConfiguration('tokenguard').get('cloudModel') || '').trim();
 }
+function customBaseUrl() {
+    return (vscode.workspace.getConfiguration('tokenguard').get('customBaseUrl') || '').trim();
+}
 function localModel() {
     return (vscode.workspace.getConfiguration('tokenguard').get('localModel') || '').trim();
 }
@@ -138,6 +151,12 @@ async function llmHeaders() {
     const model = cloudModel();
     if (model) {
         headers['X-LLM-Model'] = model;
+    }
+    if (provider === 'custom') {
+        const base = customBaseUrl();
+        if (base) {
+            headers['X-LLM-Base-Url'] = base;
+        }
     }
     const local = localModel();
     if (local) {

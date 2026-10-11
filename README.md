@@ -103,10 +103,11 @@ All Python runs from the repo root: `backend` and `compression` are sibling pack
 | `GET /stats` | Session totals: local/cloud requests, escalations, tokens saved |
 | `GET /health` | Backend status, Ollama reachability, active local model + available local models, active cloud provider/model, and whether its API key validated |
 | `GET /models` | Installed local models + active/loaded one, host resources (RAM/swap/VRAM), and recommended models that fit and can be pulled |
+| `GET /cloud/models` | Cloud models for the active provider: live ids (via the API key) merged with curated context/price metadata; falls back to the catalog without a key |
 | `POST /models/pull` | Download a model with `ollama pull` in the background (`{model}`) |
 | `PUT /local-model` | Switch the active local model (`{model, preload}`): unloads the previous one first so only one is in memory; `model: null` unloads all |
 
-All endpoints also accept optional `X-LLM-Provider`, `X-LLM-Model`, `X-LLM-Api-Key` and `X-Local-Model` headers (used by the VS Code extension) to override the `.env` settings for that request.
+All endpoints also accept optional `X-LLM-Provider`, `X-LLM-Model`, `X-LLM-Api-Key`, `X-LLM-Base-Url` and `X-Local-Model` headers (used by the VS Code extension) to override the `.env` settings for that request.
 
 ---
 
@@ -141,7 +142,7 @@ The extension then **starts the backend itself** as a child process (`.venv/bin/
 | `make backend` | setup + run the API in the foreground with `--reload` (`PORT=8000`) |
 | `make test` | run the Python tests |
 
-Extension settings: `tokenguard.apiUrl` (default `http://localhost:8000`), `tokenguard.autoStartBackend` (default `true`), `tokenguard.backendPath` and `tokenguard.pythonPath` (empty = the repo's `backend/` and `.venv/`), plus `tokenguard.cloudProvider` (`deepseek`/`anthropic`/`openai`/`mock`), `tokenguard.cloudModel` (empty = provider default) and `tokenguard.localModel` (empty = `LOCAL_MODEL` from `.env`). Ollama lifecycle: `tokenguard.ollamaUrl` (default `http://localhost:11434`), `tokenguard.autoStartOllama` (default `true`), `tokenguard.preloadLocalModel` (default `true`, loads the selected model on startup) and `tokenguard.stopOllamaOnExit` (default `true`). The sidebar's **Local model** dropdown lists the models Ollama has pulled plus **recommended models that fit this machine** (from `GET /models`, based on detected RAM/swap/VRAM); recommended ones are marked "needs download" and offer to pull when selected. Your pick is saved to `tokenguard.localModel`; changing it unloads the previously loaded model and preloads the new one (`PUT /local-model`) so only one local model is in memory at a time. You can also run **TokenGuard: Download Local Model** and **TokenGuard: Unload Local Models** from the command palette.
+Extension settings: `tokenguard.apiUrl` (default `http://localhost:8000`), `tokenguard.autoStartBackend` (default `true`), `tokenguard.backendPath` and `tokenguard.pythonPath` (empty = the repo's `backend/` and `.venv/`), plus `tokenguard.cloudProvider` (`deepseek`/`anthropic`/`openai`/`custom`/`mock`), `tokenguard.cloudModel` (empty = provider default), `tokenguard.customBaseUrl` (for the `custom` provider, e.g. Groq/OpenRouter), `tokenguard.cloudModelsAutoFetch` (fetch the provider's model list for the picker) and `tokenguard.localModel` (empty = `LOCAL_MODEL` from `.env`). The sidebar's **Cloud** section picks the provider and model (from `GET /cloud/models`, which lists the provider's live models merged with curated context/price metadata), stores the API key inline in SecretStorage, and has a **Test connection** button. `/analyze` returns an `estimated_cost_usd` and `/stats` a `total_cost_usd` (real cloud calls only). Ollama lifecycle: `tokenguard.ollamaUrl` (default `http://localhost:11434`), `tokenguard.autoStartOllama` (default `true`), `tokenguard.preloadLocalModel` (default `true`, loads the selected model on startup) and `tokenguard.stopOllamaOnExit` (default `true`). The sidebar's **Local model** dropdown lists the models Ollama has pulled plus **recommended models that fit this machine** (from `GET /models`, based on detected RAM/swap/VRAM); recommended ones are marked "needs download" and offer to pull when selected. Your pick is saved to `tokenguard.localModel`; changing it unloads the previously loaded model and preloads the new one (`PUT /local-model`) so only one local model is in memory at a time. You can also run **TokenGuard: Download Local Model** and **TokenGuard: Unload Local Models** from the command palette.
 
 **Process cleanup.** On exit the extension stops everything it started: the backend process, the local model(s) held in memory (so the multi-GB RAM/VRAM is freed), and the `ollama serve` it launched. An Ollama that was already running (e.g. a systemd service, or one `setup.sh` found running) is **left alone** — only its loaded models are unloaded. If `setup.sh` started `ollama serve`, it records the PID in `.ollama.pid` so the extension can stop that exact process. Set `tokenguard.stopOllamaOnExit=false` to keep the extension-managed Ollama running.
 
@@ -162,13 +163,16 @@ python -m pytest tests                    # context engine tests
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CLOUD_PROVIDER` | `deepseek` | `deepseek`, `anthropic`, `openai` (any OpenAI-compatible API) or `mock` |
+| `CLOUD_PROVIDER` | `deepseek` | `deepseek`, `anthropic`, `openai`, `custom` (any OpenAI-compatible API) or `mock` |
 | `CLOUD_FALLBACK_TO_MOCK` | `false` | If `true`, answer with the mock when the global LLM call fails; by default failures are surfaced as errors |
 | `CLOUD_HEALTHCHECK_TTL_S` | `60` | Seconds a `/health` provider credential check is cached before re-pinging |
+| `CLOUD_MODELS_TTL_S` | `300` | Seconds a provider `/models` listing is cached before re-fetching |
+| `DEFAULT_OUTPUT_TOKENS_ESTIMATE` | `600` | Assumed output tokens used only for the pre-send cost estimate in `/analyze` |
 | `DEEPSEEK_API_KEY` | `your-deepseek-api-key` (placeholder) | Your DeepSeek key |
 | `DEEPSEEK_URL`, `DEEPSEEK_MODEL` | `https://api.deepseek.com/chat/completions`, `deepseek-chat` (DeepSeek-V3) | DeepSeek endpoint and model (output capped at 8,192 tokens) |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | – , `claude-sonnet-5-5` | Anthropic settings |
-| `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | – , OpenAI, `gpt-4o-mini` | OpenAI-compatible settings (OpenAI, Groq, OpenRouter, …) |
+| `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | – , OpenAI, `gpt-4o-mini` | OpenAI settings |
+| `CUSTOM_API_KEY`, `CUSTOM_BASE_URL`, `CUSTOM_MODEL` | – | Custom OpenAI-compatible endpoint (Groq/OpenRouter/self-hosted); also settable per request via `X-LLM-Base-Url` |
 | `OLLAMA_URL`, `LOCAL_MODEL` | `http://localhost:11434`, `qwen2.5-coder:1.5b` | Local model |
 | `LOCAL_KEEP_ALIVE` | `30m` | How long the active local model stays resident. Only one is loaded at a time; switching unloads the previous model first |
 | `LOCAL_THRESHOLD`, `CLOUD_THRESHOLD` | `0.35`, `0.65` | Routing thresholds |

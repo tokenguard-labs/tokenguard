@@ -9,6 +9,13 @@
     const modelSelect = document.getElementById('localModel');
     const emptyState = document.getElementById('empty');
     const scroller = document.getElementById('scroller');
+    const cloudProviderSel = document.getElementById('cloudProvider');
+    const cloudModelSel = document.getElementById('cloudModel');
+    const cloudBaseUrlRow = document.getElementById('cloudBaseUrlRow');
+    const cloudBaseUrlInput = document.getElementById('cloudBaseUrl');
+    const cloudKeyInput = document.getElementById('cloudKey');
+    const cloudStateEl = document.getElementById('cloudState');
+    const CLOUD_PROVIDERS = ['deepseek', 'anthropic', 'openai', 'custom', 'mock'];
 
     let nextId = 1;
     let busy = false;               // one request at a time, like the Streamlit UI
@@ -397,7 +404,8 @@
             details =
                 accordion('Token savings',
                     'Sent ' + fmt(r.sent_tokens) + ' of ' + fmt(r.original_tokens) + ' tokens (saved ' + fmt(r.tokens_saved) +
-                    ', ' + pct + '%) · ' + esc(r.secrets_redacted) + ' secret(s) masked') +
+                    ', ' + pct + '%) · ' + esc(r.secrets_redacted) + ' secret(s) masked' +
+                    (r.cost_usd != null ? ' · <b>Cost:</b> $' + Number(r.cost_usd).toFixed(5) : '')) +
                 accordion('Context sent · ' + files.length + ' file' + (files.length === 1 ? '' : 's'),
                     (r.repo_path ? '<div class="muted">from <code>' + esc(r.repo_path) + '</code></div>' : '') + fileList(files));
         }
@@ -447,23 +455,26 @@
         }
         const h = m.health, s = m.stats;
         const provider = esc(h.cloud_provider);
+        const model = h.cloud_model ? ' <code>' + esc(h.cloud_model) + '</code>' : '';
         let cloudState;
         if (h.cloud_valid) {
-            cloudState = '<code>' + provider + '</code> ✓';
+            cloudState = '<code>' + provider + '</code>' + model + ' ✓';
         } else if (h.cloud_provider === 'mock') {
             cloudState = '<code>mock</code>';
         } else {
-            cloudState = '<code>' + provider + '</code> <span class="warn">⚠ ' +
+            cloudState = '<code>' + provider + '</code>' + model + ' <span class="warn">⚠ ' +
                 esc(h.cloud_detail || 'not configured') + '</span>';
         }
         const keyBtn = (!h.cloud_valid && h.cloud_provider !== 'mock')
             ? '<div class="choices"><button id="setApiKey" class="secondary">🔑 Set API key</button></div>'
             : '';
+        const spend = (s.total_cost_usd != null && s.total_cost_usd > 0)
+            ? '<span>Spend: <b>$' + Number(s.total_cost_usd).toFixed(4) + '</b></span>' : '';
         el.innerHTML = '● API online · cloud: ' + cloudState + ' · local: <code>' +
             esc(h.local_model) + '</code> · Ollama ' + (h.ollama ? '✅' : '❌') + keyBtn +
             '<div class="stats"><span>🖥️ Local: <b>' + esc(s.local_requests) + '</b></span><span>☁️ Cloud: <b>' +
             esc(s.cloud_requests) + '</b></span><span>Tokens saved: <b>' + fmt(s.total_tokens_saved) + '</b> (' +
-            esc(s.cloud_token_reduction_pct) + '%)</span></div>';
+            esc(s.cloud_token_reduction_pct) + '%)</span>' + spend + '</div>';
         const sys = document.getElementById('systemInfo');
         if (sys && h.system) {
             const g = h.system;
@@ -472,6 +483,42 @@
                 (g.has_gpu ? ' · ' + g.gpu_vram_gb + ' GB VRAM' : '') +
                 ' · ' + g.cpu_count + ' CPU' + (g.cpu_count === 1 ? '' : 's');
         }
+    }
+
+    // ---- Cloud provider / model / key picker ------------------------------------------------
+
+    function cloudModelLabel(m) {
+        let label = m.display || m.id;
+        if (m.context) label += ' · ' + Math.round(m.context / 1000) + 'k';
+        if (m.in != null && m.out != null) label += ' · $' + m.in + '/$' + m.out;
+        if (m.note) label += ' — ' + m.note;
+        return label;
+    }
+
+    function renderCloud(info) {
+        if (!info) return;
+        cloudProviderSel.innerHTML = CLOUD_PROVIDERS
+            .map(p => '<option value="' + esc(p) + '">' + esc(p) + '</option>').join('');
+        cloudProviderSel.value = info.provider;
+        cloudBaseUrlRow.hidden = info.provider !== 'custom';
+        if (info.base_url) cloudBaseUrlInput.value = info.base_url;
+
+        const models = info.models || [];
+        const option = m => '<option value="' + esc(m.id) + '">' + esc(cloudModelLabel(m)) + '</option>';
+        const rec = models.filter(m => m.recommended);
+        const rest = models.filter(m => !m.recommended);
+        let opts = '';
+        if (rec.length) opts += '<optgroup label="Recommended">' + rec.map(option).join('') + '</optgroup>';
+        if (rest.length) opts += '<optgroup label="All">' + rest.map(option).join('') + '</optgroup>';
+        cloudModelSel.innerHTML = opts || '<option value="">(no models — check key/base URL)</option>';
+        const current = info.current || info.default;
+        if (current && models.some(m => m.id === current)) cloudModelSel.value = current;
+
+        const cur = models.find(m => m.id === current);
+        let state = info.valid ? 'key ✓' : (info.detail ? '⚠ ' + info.detail : 'key not set');
+        state += ' · model: ' + (current || '—');
+        if (cur && cur.in != null) state += ' · $' + cur.in + '/' + cur.out + ' per 1M';
+        cloudStateEl.textContent = state;
     }
 
     // ---- Events ---------------------------------------------------------------------------
@@ -498,6 +545,18 @@
     input.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
+    cloudProviderSel.addEventListener('change', () => {
+        vscode.postMessage({ type: 'selectCloudProvider', provider: cloudProviderSel.value });
+    });
+    cloudModelSel.addEventListener('change', () => {
+        vscode.postMessage({ type: 'selectCloudModel', model: cloudModelSel.value });
+    });
+    cloudBaseUrlInput.addEventListener('change', () => {
+        vscode.postMessage({ type: 'saveCloudBaseUrl', baseUrl: cloudBaseUrlInput.value });
+    });
+    cloudKeyInput.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { e.preventDefault(); document.getElementById('saveCloudKey').click(); }
+    });
     document.addEventListener('keydown', e => {
         if (e.key === 'Escape' && busy) { e.preventDefault(); stop(); }
     });
@@ -513,6 +572,16 @@
         if (!target) return;
         if (target.id === 'retryStatus') { vscode.postMessage({ type: 'refreshStatus' }); return; }
         if (target.id === 'setApiKey') { vscode.postMessage({ type: 'setApiKey' }); return; }
+        if (target.id === 'saveCloudKey') {
+            vscode.postMessage({ type: 'saveCloudKey', provider: cloudProviderSel.value, key: cloudKeyInput.value });
+            cloudKeyInput.value = '';
+            return;
+        }
+        if (target.id === 'clearCloudKey') {
+            vscode.postMessage({ type: 'clearCloudKey', provider: cloudProviderSel.value });
+            return;
+        }
+        if (target.id === 'testCloud') { vscode.postMessage({ type: 'testCloud' }); return; }
         if (target.dataset.example) {
             input.value = target.dataset.example;
             input.focus();
@@ -553,6 +622,9 @@
             return;
         }
         switch (m.type) {
+            case 'cloudModels':
+                renderCloud(m.info);
+                break;
             case 'modelLoading': {
                 loadingModel = m.model || null;
                 const state = document.getElementById('modelState');
