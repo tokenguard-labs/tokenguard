@@ -91,10 +91,26 @@ st.title("LocalPilot")
 st.caption("Simple tasks run on your machine. Complex ones ask before going to the cloud.")
 
 
+def route_summary(meta):
+    """One line describing the routing decision, from the policy metadata."""
+    parts = []
+    if meta.get("complexity"):
+        score = meta.get("complexity_score_100")
+        parts.append(f"complexity {meta['complexity']}" + (f" ({score}/100)" if score is not None else ""))
+    if meta.get("initial_route"):
+        parts.append(f"initial {meta['initial_route']}")
+    parts.append(f"final {meta.get('final_route') or meta['route']}")
+    if meta.get("escalation_kind"):
+        parts.append(f"escalation {meta['escalation_kind']}")
+    return " · ".join(parts)
+
+
 def render_meta(meta, idx):
+    summary = route_summary(meta)
     if meta["route"] == "local":
         st.caption(f"🖥️ **Local LLM** · `{meta['model']}` · confidence {meta['confidence']} · "
                    f"{meta['latency_ms']} ms · 0 tokens sent to cloud")
+        st.caption(f"Routing: {summary}")
         # Local answer looks shaky -> nudge harder; either way the user can opt in to the cloud
         low_conf = meta["confidence"] is not None and meta["confidence"] < meta["analysis"]["min_local_confidence"]
         if low_conf:
@@ -108,6 +124,7 @@ def render_meta(meta, idx):
         st.caption(f"{'🧪' if mock else '☁️'} **{'Mock LLM' if mock else 'Global LLM'}** · `{meta['model']}` · "
                    f"{meta['latency_ms']} ms · sent {meta['sent_tokens']:,} of {meta['original_tokens']:,} tokens "
                    f"(saved {meta['tokens_saved']:,}) · {meta['secrets_redacted']} secrets masked")
+        st.caption(f"Routing: {summary}")
         if mock:
             detail = meta.get("cloud_fallback_reason") or "CLOUD_PROVIDER=mock"
             st.warning(f"Mock answer — not a real cloud call. {detail}")
@@ -115,11 +132,44 @@ def render_meta(meta, idx):
             st.caption("Context sent: " + ", ".join(f"`{f}`" for f in meta["files_selected"]))
     with st.expander("Why this route?"):
         a = meta["analysis"]
-        st.write(f"Complexity score **{a['complexity_score']}** → `{a['decision']}`")
+        st.write(f"Complexity **{a.get('complexity', '?')}** ({a.get('complexity_score_100', '?')}/100) "
+                 f"→ `{a['decision']}` · initial route `{a.get('initial_route', '?')}`")
+        if a.get("model_complexity"):
+            st.caption(f"heuristic `{a.get('heuristic_complexity', '?')}` → local classifier "
+                       f"`{a['model_complexity']}`"
+                       + (f" — {a['model_complexity_reason']}" if a.get("model_complexity_reason") else ""))
         st.write(f"Repo searched: `{a.get('repo_path') or 'none'}` · " + "; ".join(a.get("context_sources") or []))
         st.write(a["factors"])
         for reason in a["reasons"]:
             st.write(f"- {reason}")
+        if meta.get("capability_reasons"):
+            st.write("Capability: " + "; ".join(meta["capability_reasons"]))
+    cm = meta.get("context_metadata") or {}
+    if cm.get("retrieval_coverage") or meta.get("files_selected"):
+        with st.expander("Retrieved context"):
+            cov = cm.get("retrieval_coverage") or {}
+            files = meta.get("files_selected") or []
+            st.write(f"Optimizer `{meta.get('context_optimizer')}` · files **{cov.get('files_selected', len(files))}** · "
+                     f"candidates {cov.get('candidates', '?')} · adequacy **{cm.get('adequacy_status', 'n/a')}** · "
+                     f"budget {cm.get('context_budget', '?')}"
+                     + (" · semantic **on**" if cov.get("semantic") else ""))
+            scope = cm.get("scope") or {}
+            if scope.get("corpus_wide"):
+                langs = ", ".join(scope.get("source_languages", [])) + (
+                    " → " + ", ".join(scope.get("target_languages", [])) if scope.get("target_languages") else "")
+                st.write(f"Scope: **corpus-wide** · {langs} · {cov.get('in_scope_files', '?')} files · "
+                         f"full {cov.get('represented_full', '?')} · signatures {cov.get('represented_signature', '?')} · "
+                         f"omitted {cov.get('omitted_files', '?')}")
+            if cm.get("adequacy_recommendation"):
+                st.warning(cm["adequacy_recommendation"])
+            if cm.get("missing_required"):
+                st.warning("Missing required context: " + ", ".join(cm["missing_required"]))
+            if cm.get("uncertain_references"):
+                st.caption("Uncertain references: " + ", ".join(cm["uncertain_references"]))
+            if cm.get("evidence"):
+                for e in cm["evidence"][:10]:
+                    st.caption(f"`{e['file']}:{e['start_line']}` {e.get('symbol','')} "
+                               f"[{e.get('retriever','')}] {e.get('reason','')}")
 
 
 for i, msg in enumerate(st.session_state.messages):

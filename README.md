@@ -44,25 +44,39 @@ flowchart TD
 
 1. **Collect the request (sidebar).** The extension sends the prompt, the current editor selection (`code`) and the folder of the active file (`repo_path`).
 2. **Resolve the context sources (gateway).** If the prompt contains an absolute path to an existing folder, that folder becomes the repo to search. If it names a file, the file is attached as code and its project root (nearest `.git`, `package.json`, `pyproject.toml`, …) is searched. The path text is removed from the prompt. Otherwise the workspace folder is used.
-3. **Analyze, no model called (`POST /analyze`).** The analyzer scores the task from 0 to 1 and returns the decision, the reasons, the files the context engine would select, and how many tokens the cloud would receive versus the full context.
+3. **Analyze, no model called (`POST /analyze`).** The policy runs hard checks, local-model capability checks, then scores the task (0–100 → simple/medium/complex) and returns the initial route, the reasons, the files the context engine would select, and how many tokens the cloud would receive versus the full context.
 4. **Decide the route.**
-   - `local` (score < 0.35) and `local_first` (0.35–0.65): the sidebar runs the local LLM automatically.
-   - `cloud` (score > 0.65): the sidebar waits for the user to click **Use local LLM** or **Use global LLM (recommended)**.
+   - `local` (simple) and `local_first` (medium, capable): the sidebar runs the local LLM automatically, then escalates only if the answer looks unreliable.
+   - `cloud` (complex, or not locally capable): the sidebar waits for the user to click **Use local LLM** or **Use global LLM (recommended)**.
 5. **Run the chosen route (`POST /chat` with `force_route`).**
    - **Local:** the context engine builds the context, Ollama answers as JSON `{answer, confidence, needs_cloud}`, and the confidence is adjusted (very short answers and hedges such as "I'm not sure" lower it). Nothing leaves the machine.
    - **Global:** the context engine always runs right before the cloud call: it selects the relevant code, fits it into the token budget and masks secrets in both the code and the prompt. Only that slice is sent to DeepSeek (`deepseek-chat`). If that call fails, the mock answers instead and the card shows why.
 6. **Show the receipts.** The answer card shows the model, latency, confidence (local) or tokens sent / saved, files sent and secrets masked (global), plus a pipeline trace. A local answer always offers **Use global LLM**; it is highlighted when confidence is below 0.7. The header shows backend and Ollama status and the session's local/cloud counts and tokens saved (`GET /health`, `GET /stats`).
 
-### Routing score
+### Routing policy
+
+Three decisions are kept separate: the **routing preference** (`auto`/`local`/`cloud`; an explicit
+`local` never auto-escalates), the **initial route** (hard policy + capability checks + complexity),
+and the **post-response escalation**. A complexity score of `0..100` classifies the task:
 
 | Factor | Weight | Signal |
 |---|---|---|
-| Task type | 40% | Keywords: `refactor`, `race condition`, `architecture` (hard) vs `explain`, `rename`, `regex` (easy) |
-| Reasoning | 20% | Reasoning markers ("why", "trade-off", "step by step") and prompt length |
-| Context size | 20% | Tokens of selected code + repo (8k+ tokens = 1.0) |
+| Task type | 25% | Keywords: `refactor`, `race condition`, `architecture` (hard) vs `explain`, `rename`, `regex` (easy) |
+| Context size | 20% | Tokens of the *relevant* (optimized) context (8k+ tokens = 1.0) |
 | Files | 20% | Files mentioned in the prompt and the size of the attached repo |
+| Dependency scope | 20% | Cross-file markers: imports, modules, "throughout", "across the codebase" |
+| Reasoning | 15% | Reasoning markers ("why", "trade-off", "step by step") and prompt length |
 
-A clearly complex task keeps a floor of `0.8 × task_type`, so a hard prompt with no code attached still reaches the strong model. Rules were chosen over a trained classifier so every decision comes with readable reasons. See [`backend/ROUTING.md`](backend/ROUTING.md) for worked examples.
+Simple (≤34) and medium (35–64) route local-first; complex (≥65) routes cloud-first. Before any of
+that, the router checks whether the local model is reachable and capable (tool calling, context
+window, multi-file), and applies hard policy: `local`/`cloud` preferences, `CLOUD_ENABLED`, and the
+privacy switch `CLOUD_TRANSMISSION_PROHIBITED`. A clearly complex task keeps a floor of
+`0.8 × task_type`, so a hard prompt with no code attached still reaches the strong model. Because
+keywords are shallow, medium-band requests (35–64) can be re-classified by a zero-shot local-LLM
+tie-breaker (`backend/classifier.py`, `LOCAL_LLM_CLASSIFIER`); simple/complex requests never hit it,
+and a failure just falls back to the heuristic. Weights and boundaries are configurable heuristics,
+not learned values. See
+[`docs/routing-policy.md`](docs/routing-policy.md) and [`backend/ROUTING.md`](backend/ROUTING.md).
 
 ### Context engine
 
@@ -77,13 +91,20 @@ Deterministic and LLM-free (`compression/`):
 
 If the engine fails, the router falls back to a simpler keyword-based optimizer so a request never breaks.
 
+By default the repo context now comes from a **persistent, incremental codebase index**
+(`compression/codeindex`, `CONTEXT_INDEX_ENABLED=true`): a SQLite symbol/edge index keyed by content
+hash *and* a derivation environment (so a parser/resolver/model upgrade re-derives only what it must),
+with uncertainty-aware edges (syntactic references are recorded but never asserted as dependencies)
+and per-item provenance plus an adequacy verdict. It degrades to the in-memory engine above on any
+error. Design: [`docs/codebase-intelligence.md`](docs/codebase-intelligence.md).
+
 ---
 
 ## Repository layout
 
 | Path | What |
 |---|---|
-| `backend/` | LLM gateway service (FastAPI): `analyzer.py`, `router.py`, `context.py` (path resolution + optimizer adapter), `llm.py` (Ollama + cloud clients), `main.py` (API). Also holds `.env`, `requirements.txt`, `ROUTING.md` |
+| `backend/` | LLM gateway service (FastAPI): `analyzer.py` (complexity scoring), `routing.py` (routing/escalation policy), `router.py` (pipeline), `context.py` (path resolution + optimizer adapter), `llm.py` (Ollama + cloud clients), `main.py` (API). Also holds `.env`, `requirements.txt`, `ROUTING.md` |
 | `compression/` | Context compression engine: `adapter.py` (contract the gateway calls), `context_engine/` (walker, chunker, selector, import graph, budget allocator, redaction) |
 | `extension/` | VS Code extension (frontend): the LocalPilot sidebar (`src/extension.ts`) and the backend launcher (`src/backend.ts`) |
 | `scripts/` | `setup.sh` (used by `make setup`), `streamlit_ui.py` (optional browser UI with the same flow as the sidebar), `smoke_test.py` (calls a running API) |
@@ -91,14 +112,14 @@ If the engine fails, the router falls back to a simpler keyword-based optimizer 
 | `bench/`, `run_demo.py`, `examples/` | Benchmarks, a CLI demo and a generator for the demo repo |
 
 All Python runs from the repo root: `backend` and `compression` are sibling packages (`uvicorn backend.main:app`, `python -m compression.check_contract`).
-| `docs/` | Context engine spec, benchmark notes, pipeline trace |
+| `docs/` | Context engine spec, routing policy, [codebase-intelligence architecture](docs/codebase-intelligence.md), benchmark notes, pipeline trace |
 
 ### API
 
 | Endpoint | Purpose |
 |---|---|
 | `POST /analyze` | `{prompt, code, repo_path}` → decision, score, reasons, repo searched, files selected, token estimate. No model called. |
-| `POST /chat` | Same body + `force_route: auto \| local \| cloud` → answer, route, model, confidence, tokens sent/saved, files, secrets masked, trace |
+| `POST /chat` | Same body + `force_route: auto \| local \| cloud` → answer, route, model, confidence, tokens sent/saved, files, secrets masked, trace, plus routing metadata (`requested_route`, `initial_route`, `final_route`, `complexity`, `complexity_score_100`, `local_capable`, `capability_reasons`, `escalation_kind`) |
 | `POST /chat/stream` | Same as `/chat`, streamed as Server-Sent Events: `start` {route, model} when a model begins answering, `delta` {text} per token chunk, `reset` {reason} if the text so far is discarded, then `done` {the `/chat` response} or `error` {status, message}. Sends a `: ping` comment every `SSE_HEARTBEAT_S` (15s) while idle. Used by the VS Code sidebar. |
 | `GET /stats` | Session totals: local/cloud requests, escalations, tokens saved |
 | `GET /health` | Backend status, Ollama reachability, active local model + available local models, active cloud provider/model, and whether its API key validated |
@@ -144,7 +165,15 @@ The extension then **starts the backend itself** as a child process (`.venv/bin/
 
 Extension settings: `tokenguard.apiUrl` (default `http://localhost:8000`), `tokenguard.autoStartBackend` (default `true`), `tokenguard.backendPath` and `tokenguard.pythonPath` (empty = the repo's `backend/` and `.venv/`), plus `tokenguard.cloudProvider` (`deepseek`/`anthropic`/`openai`/`custom`/`mock`), `tokenguard.cloudModel` (empty = provider default), `tokenguard.customBaseUrl` (for the `custom` provider, e.g. Groq/OpenRouter), `tokenguard.cloudModelsAutoFetch` (fetch the provider's model list for the picker) and `tokenguard.localModel` (empty = `LOCAL_MODEL` from `.env`). The sidebar's **Cloud** section picks the provider and model (from `GET /cloud/models`, which lists the provider's live models merged with curated context/price metadata), stores the API key inline in SecretStorage, and has a **Test connection** button. `/analyze` returns an `estimated_cost_usd` and `/stats` a `total_cost_usd` (real cloud calls only). Ollama lifecycle: `tokenguard.ollamaUrl` (default `http://localhost:11434`), `tokenguard.autoStartOllama` (default `true`), `tokenguard.preloadLocalModel` (default `true`, loads the selected model on startup) and `tokenguard.stopOllamaOnExit` (default `true`). The sidebar's **Local model** dropdown lists the models Ollama has pulled plus **recommended models that fit this machine** (from `GET /models`, based on detected RAM/swap/VRAM); recommended ones are marked "needs download" and offer to pull when selected. Your pick is saved to `tokenguard.localModel`; changing it unloads the previously loaded model and preloads the new one (`PUT /local-model`) so only one local model is in memory at a time. You can also run **TokenGuard: Download Local Model** and **TokenGuard: Unload Local Models** from the command palette.
 
-**Process cleanup.** On exit the extension stops everything it started: the backend process, the local model(s) held in memory (so the multi-GB RAM/VRAM is freed), and the `ollama serve` it launched. An Ollama that was already running (e.g. a systemd service, or one `setup.sh` found running) is **left alone** — only its loaded models are unloaded. If `setup.sh` started `ollama serve`, it records the PID in `.ollama.pid` so the extension can stop that exact process. Set `tokenguard.stopOllamaOnExit=false` to keep the extension-managed Ollama running.
+**Process cleanup.** On exit the extension stops everything it started: the backend process, the local model(s) held in memory (so the multi-GB RAM/VRAM is freed), and the `ollama serve` it launched. The backend also unloads **every** model Ollama reports as resident on shutdown (not just the one it used), so models loaded by the classifier, reranker or embedding backend don't linger. An Ollama that was already running (e.g. a systemd service, or one `setup.sh` found running) is **left alone** — only its loaded models are unloaded. If `setup.sh` started `ollama serve`, it records the PID in `.ollama.pid` so the extension can stop that exact process. Set `tokenguard.stopOllamaOnExit=false` to keep the extension-managed Ollama running.
+
+For runs **outside** the extension (`make backend`, or a crashed session) run:
+
+```bash
+make stop        # unload all local models + stop the Ollama that setup.sh started
+```
+
+It reads the same `.ollama.pid` marker and never kills an external Ollama.
 
 **API keys** live in VS Code's SecretStorage, not in any file. Run **TokenGuard: Set Cloud API Key** to pick a provider and paste its key; the extension sends the provider, model and key to the backend as request headers (`X-LLM-Provider` / `X-LLM-Model` / `X-LLM-Api-Key`), overriding `backend/.env` for that request only. `GET /health` reports whether the active key actually validated (`cloud_valid`, `cloud_detail`).
 

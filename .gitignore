@@ -11,6 +11,12 @@ examples/frozen_repo/
 # Local env
 .env
 
+# Codebase index (default lives in ~/.cache/localpilot/index; kept out if set inside a repo)
+.localpilot/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
 # Ollama process started by setup.sh (killed by the extension on exit)
 .ollama.pid
 .ollama.log

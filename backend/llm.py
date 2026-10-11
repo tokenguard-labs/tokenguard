@@ -117,6 +117,20 @@ async def list_local_models() -> list[str]:
     return names
 
 
+_reach_cache: tuple[float, bool] = (0.0, False)
+
+
+async def ollama_reachable(force: bool = False) -> bool:
+    """Whether Ollama is reachable, cached for OLLAMA_REACH_TTL_S (capability checks poll it)."""
+    global _reach_cache
+    now = time.time()
+    if not force and now - _reach_cache[0] < config.OLLAMA_REACH_TTL_S:
+        return _reach_cache[1]
+    reachable, _ = await ollama_models()
+    _reach_cache = (now, reachable)
+    return reachable
+
+
 # --- Model downloads (ollama pull) --------------------------------------------------------
 _pulls: dict[str, str] = {}  # model name -> "pulling" | "installed" | "error: ..."
 
@@ -232,11 +246,42 @@ async def switch_local_model(model: Optional[str], preload: bool = True) -> dict
         return {"loaded": _loaded_local_model, "previous": previous}
 
 
+def parse_ps(data: dict) -> list[str]:
+    """Model names Ollama reports as currently loaded (/api/ps)."""
+    names = []
+    for m in (data or {}).get("models", []):
+        name = m.get("name") or m.get("model")
+        if name:
+            names.append(name)
+    return names
+
+
+async def loaded_models() -> list[str]:
+    """Every model Ollama currently holds in memory (/api/ps). Empty when unreachable."""
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{config.OLLAMA_URL}/api/ps")
+            resp.raise_for_status()
+            return parse_ps(resp.json())
+    except Exception as e:
+        log.warning("could not list loaded Ollama models: %s", e)
+        return []
+
+
 async def unload_local_model_on_exit() -> None:
-    """Best-effort unload of the tracked model when the backend shuts down."""
-    model = _loaded_local_model
-    if model:
+    """Free ALL resident local models when the backend shuts down.
+
+    Unloads the model we tracked (via call_local) AND anything Ollama reports as loaded, so models
+    pulled in by the classifier, reranker, sufficiency proposer or the embedding backend don't stay
+    resident after we exit. Best-effort: never raises.
+    """
+    models = set(await loaded_models())
+    if _loaded_local_model:
+        models.add(_loaded_local_model)
+    for model in models:
         await _ollama_unload(model)
+    if models:
+        log.info("unloaded local model(s) on exit: %s", ", ".join(sorted(models)))
 
 SYSTEM_PROMPT = "You are an expert coding assistant. Be concise and correct. Use markdown code blocks for code."
 

@@ -1,0 +1,52 @@
+[
+  {
+    "id": "explain_test_cases",
+    "prompt": "Can you explain the test cases used to evaluate various components of the system?",
+    "task_type": "explain",
+    "budget_tokens": 3000,
+    "expected_files": [
+      "tests/test_routing.py",
+      "tests/test_codeindex.py",
+      "tests/test_context_eval.py"
+    ]
+  },
+  {
+    "id": "index_invalidation",
+    "prompt": "How does the codebase index invalidate derived data when a file or a parser version changes?",
+    "task_type": "explain",
+    "budget_tokens": 2500,
+    "expected_files": [
+      "compression/codeindex/store.py",
+      "compression/codeindex/env.py"
+    ]
+  },
+  {
+    "id": "routing_escalation",
+    "prompt": "How does routing decide whether to escalate a request to the cloud?",
+    "task_type": "explain",
+    "budget_tokens": 2500,
+    "expected_files": [
+      "backend/routing.py",
+      "backend/router.py"
+    ]
+  },
+  {
+    "id": "edge_confidence",
+    "prompt": "How are edge resolution and confidence decided in the code graph?",
+    "task_type": "explain",
+    "budget_tokens": 2000,
+    "expected_files": [
+      "compression/codeindex/resolve.py"
+    ]
+  },
+  {
+    "id": "secret_redaction",
+    "prompt": "Where are secrets redacted before any context leaves the machine?",
+    "task_type": "security_review",
+    "budget_tokens": 2500,
+    "expected_files": [
+      "compression/context_engine/redact.py",
+      "compression/adapter.py"
+    ]
+  }
+]

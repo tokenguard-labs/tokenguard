@@ -3,7 +3,7 @@
 Changing a field here is a breaking change for both sides - agree on it first.
 """
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, Dict, List
 
 
 @dataclass
@@ -15,3 +15,7 @@ class ContextResult:
     secrets_redacted: int = 0                                     # how many secrets were masked
     redaction_details: List[str] = field(default_factory=list)    # e.g. "AWS access key in config.py" (never the secret itself)
     optimizer: str = "fallback"   # who produced this result; Person 2 sets e.g. "person2-v1"
+    # Retrieval provenance/adequacy for observability (empty for the simple fallback). Shape is
+    # codeindex.ContextPackage.router_view() plus "evidence" (per-item file:line + why). Never
+    # contains secrets (the context is already redacted).
+    metadata: Dict[str, Any] = field(default_factory=dict)

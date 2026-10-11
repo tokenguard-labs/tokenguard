@@ -1,63 +1,85 @@
 # LocalPilot: How the Router Decides Local vs Cloud
 
-The router answers one question for every coding request:
+The router answers two questions for every coding request:
 
 > **Can the small model on my laptop handle this, or do we need to pay for a big cloud model?**
+> **If it answered, is the answer good enough to keep, or should we escalate?**
 
-It works in two stages:
+It keeps three decisions apart:
 
-1. **Before calling any model**, score how hard the request looks (0 = trivial, 1 = very hard).
-2. **After calling the local model**, check whether the local model sounds confident. If it doesn't, escalate to the cloud.
+1. **Routing preference** — what the user asked for (`auto` / `local` / `cloud`). An explicit
+   `local` is never silently overridden by automatic escalation; a privacy restriction is never
+   overridden by routing optimization.
+2. **Before calling any model** — hard policy, **capability checks**, then a complexity score.
+3. **After calling the local model** — validate the answer and check its confidence; escalate only
+   when warranted.
 
-Everything is rule-based: no training and no extra ML model. Every decision comes with plain-English `reasons`, so the UI can show *why* each request was routed the way it was.
+Everything is rule-based: no training and no extra ML model. Every decision comes with plain-English
+`reasons`. The full policy spec (capabilities, weights, categories, escalation kinds, configuration)
+is in [`docs/routing-policy.md`](../docs/routing-policy.md); the decision code lives in
+[`backend/routing.py`](routing.py).
 
 ---
 
 ## The full flow
 
 ```text
-Request (prompt + optional code + optional repo_path)
+Request (prompt + optional code + optional repo_path, force_route)
    │
    ▼
-1. Task Analyzer ──► complexity score (0..1) + reasons
+1. Context optimizer: pick the relevant files (≤ CLOUD_CONTEXT_TOKEN_BUDGET)
    │
    ▼
-2. Decide
-   ├─ score < 0.35          → LOCAL
-   ├─ 0.35 ≤ score ≤ 0.65   → LOCAL FIRST (cloud if local is unsure)
-   └─ score > 0.65          → CLOUD
+2. RoutePlan (routing.plan_route)
+   A. Hard policy:  local-only / cloud-only / privacy / cloud-enabled
+   B. Capability:   Ollama reachable? needs tools? relevant context fits the local window? multi-file?
+   C. Complexity:   weighted score 0..100 → SIMPLE / MEDIUM / COMPLEX
+   │
+   ├─ local_only / cloud_only       → forced
+   ├─ capable + simple/medium       → LOCAL FIRST (escalate if unsure)
+   ├─ complex or not local-capable  → CLOUD FIRST (when permitted)
+   └─ cloud prohibited              → local, explain the limitation
+   │
+   ├─ LOCAL FIRST ─► Ollama (LOCAL_MODEL)
+   │                  returns {answer, confidence, needs_cloud}
+   │                  │
+   │                  ▼
+   │                3. Escalation check (routing.decide_escalation)
+   │                  failure → error · malformed → validation · needs_cloud · low/missing confidence
+   │                  │
+   │                  ├─ no  → return local answer ✅
+   │                  └─ yes → ESCALATE to cloud (≤ MAX_CLOUD_ESCALATIONS, context preserved)
+   │
+   └─ CLOUD / CLOUD FIRST ─► Cloud LLM with the optimized, redacted context only
    │
    ▼
-3. Context optimizer: pick the relevant files, keep them under a 3,000-token budget
-   │
-   ├─ LOCAL / LOCAL FIRST ─► Ollama (qwen2.5-coder:1.5b)
-   │                          returns {answer, confidence, needs_cloud}
-   │                          │
-   │                          ├─ confidence ≥ 0.7 and needs_cloud = false → return local answer ✅
-   │                          └─ otherwise (or Ollama crashed)            → ESCALATE to cloud
-   │
-   └─ CLOUD ─────────────────► Cloud LLM with the optimized context only
-   │
-   ▼
-4. Response + metrics (route, confidence, tokens sent and saved, latency, reasons)
+4. Response + routing metadata (requested/initial/final route, complexity, reasons, tokens, latency)
 ```
 
-Code: [`backend/analyzer.py`](analyzer.py) (scoring), [`backend/router.py`](router.py) (decision and escalation), [`backend/llm.py`](llm.py) (model calls and confidence).
+Code: [`backend/analyzer.py`](analyzer.py) (scoring), [`backend/routing.py`](routing.py) (policy),
+[`backend/router.py`](router.py) (pipeline), [`backend/llm.py`](llm.py) (model calls and confidence).
 
 ---
 
 ## Stage 1: The complexity score
 
-The score is a weighted sum of four factors. Each factor is between 0 and 1:
+The score is a weighted sum of five factors. Each factor is between 0 and 1 (weights are
+configurable heuristics, see `COMPLEXITY_WEIGHTS`):
 
 ```text
-weighted = 0.40 × task_type  +  0.20 × reasoning  +  0.20 × context_size  +  0.20 × files
+weighted = 0.25 × task_type  +  0.20 × context_size  +  0.20 × files  +  0.20 × dependency  +  0.15 × reasoning
 score    = max(weighted, 0.8 × task_type)        ← "strong task signal" floor (only when complex keywords matched)
+
+complexity_score_100 = 100 × score    →  SIMPLE (≤34) · MEDIUM (35–64) · COMPLEX (≥65)
 ```
+
+`context_size` uses the **relevant** (optimized) context, not the whole repository. `dependency`
+captures cross-file scope (imports, modules, "throughout the codebase"); the strategy here is
+capability-first, not score-first — see the next stage.
 
 **Why the floor?** Without it, a prompt with no code attached has context_size = files = 0, so it could never score above 0.6. That means it could never go to the cloud, however hard the task. The floor makes sure a clearly hard task (e.g. "refactor the architecture across the codebase", task_type = 1.0 → score ≥ 0.8) still routes to the cloud with no code attached.
 
-### Factor 1: Task type (40%), the biggest signal
+### Factor 1: Task type (25%), the biggest single signal
 
 We look for keywords in the prompt. Each keyword has a difficulty value:
 
@@ -76,7 +98,7 @@ The rules:
 - **Only simple keywords:** take the lowest (easiest) value.
 - **No keywords at all:** 0.45, a neutral "medium" guess.
 
-### Factor 2: Reasoning (20%)
+### Factor 2: Reasoning (15%)
 
 Does the request need multi-step thinking?
 
@@ -88,10 +110,10 @@ Reasoning markers: *why, trade-off, compare, best approach, step by step, should
 
 ### Factor 3: Context size (20%)
 
-How much code comes with the request: the selected code plus the whole repo, if one is attached.
+How much *relevant* code comes with the request — the optimized context, not the whole repo.
 
 ```text
-context_size = total_tokens / 8000      (capped at 1)
+context_size = optimized_context_tokens / 8000      (capped at 1)
 ```
 
 A 7B local model gets noticeably worse with large contexts, so at 8k+ tokens this factor is maxed out.
@@ -103,29 +125,37 @@ files = files_mentioned_in_prompt / 4                      (e.g. "auth.py", "rou
 if a repo is attached: files = max(files, min(repo_files / 50, 0.6))
 ```
 
+### Factor 5: Dependency scope (20%)
+
+Cross-file / repository-wide work: imports, modules, "throughout", "across the codebase",
+"multiple files", "end-to-end". Scored from those markers and the number of files in scope. This
+feeds both the score and the capability check (`requires_multifile`).
+
 ### Worked examples (real outputs)
 
 **"Write a Python one-liner to reverse a string"**
 
 | Factor | Value | × Weight |
 |---|---|---|
-| task_type ("one-liner") | 0.10 | 0.040 |
-| reasoning (8 words) | 0.067 | 0.013 |
+| task_type ("one-liner") | 0.10 | 0.025 |
 | context_size | 0 | 0 |
 | files | 0 | 0 |
-| Weighted sum | | 0.053 |
-| **Score** (no complex keywords, so no floor) | | **0.053 → LOCAL** |
+| dependency | 0 | 0 |
+| reasoning (8 words) | 0.067 | 0.010 |
+| Weighted sum | | 0.035 |
+| **Score** (no complex keywords, so no floor) | | **0.035 → 4/100 SIMPLE → LOCAL** |
 
 **"Refactor the routing architecture across the codebase to support multiple cloud providers and explain the trade-offs"**, with a repo attached:
 
 | Factor | Value | × Weight |
 |---|---|---|
-| task_type (5 complex keywords: 1.0 + 4×0.05, capped) | 1.00 | 0.400 |
-| reasoning ("trade-off" = 1 marker) | 0.333 | 0.067 |
+| task_type (5 complex keywords: 1.0 + 4×0.05, capped) | 1.00 | 0.250 |
 | context_size (~6,400 tokens) | 0.80 | 0.160 |
 | files (8-file repo) | 0.16 | 0.032 |
-| Weighted sum | | 0.659 |
-| **Score** = max(0.659, 0.8 × 1.0) | | **0.80 → CLOUD** |
+| dependency ("across the codebase") | 1.00 | 0.200 |
+| reasoning ("trade-off" = 1 marker) | 0.333 | 0.050 |
+| Weighted sum | | 0.692 |
+| **Score** = max(0.692, 0.8 × 1.0) | | **0.80 → 80/100 COMPLEX → CLOUD** |
 
 ---
 
@@ -155,12 +185,17 @@ Small models tend to overrate their confidence, so we adjust the number they giv
 - **−0.4** if the answer is under 20 characters (empty or near-empty)
 - **−0.1 per hedging phrase**, up to 3: *"I'm not sure", "might be", "it depends", "without more context", "unclear"*...
 
-**We escalate to the cloud if any of these are true:**
-- adjusted confidence **< 0.7**
-- the local model itself says `needs_cloud: true`
-- Ollama failed (crashed, timed out, not running)
+**We escalate to the cloud if any of these are true** (first match wins; each has a `kind`):
+- Ollama failed (crashed, timed out, not running) — `error`
+- the local answer was empty/malformed — `validation` (even when confidence is high)
+- the local model itself says `needs_cloud: true` — `needs_cloud`
+- confidence is missing/invalid — `missing_confidence` (per `MISSING_CONFIDENCE_POLICY`)
+- adjusted confidence **< 0.7** — `confidence`
 
-When we escalate, the user still gets an answer, from the cloud. The response shows `escalated: true` and the reason.
+Escalation is capped at `MAX_CLOUD_ESCALATIONS` (default 1) per request, so it can never loop. An
+explicit local-only request and a privacy-restricted request are never escalated. When we escalate,
+the user still gets an answer, from the cloud, with the same prompt and optimized context; the
+response shows `escalated: true`, `escalation_kind` and the reason.
 
 ---
 

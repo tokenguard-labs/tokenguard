@@ -7,12 +7,13 @@ PORT      ?= 8000
 # Folder opened in the Extension Development Host (the project you want to ask questions about)
 WORKSPACE ?= $(CURDIR)
 
-.PHONY: dev setup backend test clean help
+.PHONY: dev setup backend stop test clean help
 
 help:
 	@echo "make dev        setup + open VS Code with the extension (backend auto-starts)"
 	@echo "make setup      venv, deps, .env, Ollama + model, compile extension (idempotent)"
 	@echo "make backend    setup + run the API in the foreground on PORT=$(PORT)"
+	@echo "make stop       unload local models + stop the Ollama started by setup (for non-extension runs)"
 	@echo "make test       run the Python tests"
 	@echo "make clean      remove the Python venv"
 
@@ -26,6 +27,10 @@ dev: setup
 
 backend: setup
 	$(PY) -m uvicorn backend.main:app --reload --reload-dir backend --reload-dir compression --host 127.0.0.1 --port $(PORT)
+
+# For runs outside VS Code, where nothing else stops what setup started.
+stop:
+	@bash scripts/stop.sh
 
 test: setup
 	$(PY) -m pytest tests

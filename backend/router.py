@@ -1,19 +1,50 @@
-"""The brain: analyze -> decide -> call local/cloud -> escalate if needed -> metrics."""
+"""The brain: analyze -> hard-policy + capability checks -> decide -> call local/cloud ->
+post-response escalation -> metrics.
+
+The decision logic lives in `routing.py`; this module supplies the runtime facts (which model is
+selected, whether Ollama and the cloud are reachable/permitted) and runs the pipeline.
+"""
 import logging
+import re
 import time
 from typing import Any, Dict, List, Optional
 
-from . import cloud_catalog, config
+from . import classifier, cloud_catalog, config, routing
 from .analyzer import analyze
 from .contracts import ContextResult
 from .context import ResolvedRequest, optimize_context, redact_text, repo_stats, resolve_request
-from .llm import Emit, LLMResult, call_cloud, call_local, effective_local_model, effective_model, effective_provider
+from .llm import (
+    Emit,
+    LLMResult,
+    call_cloud,
+    call_local,
+    effective_local_model,
+    effective_model,
+    effective_provider,
+    ollama_reachable,
+)
 from .tokens import count_tokens
 
 log = logging.getLogger("localpilot.router")
 
+# Local models often answer with a refusal when the context is missing or the task is beyond them.
+# A refusal is a validation failure, not a confident answer, so it may be escalated even at high
+# self-reported confidence.
+_REFUSAL = re.compile(
+    r"\b(i apologize|i'?m sorry|i can(?:no|')t (?:see|access|provide|determine|answer|help)|"
+    r"cannot (?:see|access|provide|determine|answer)|i don'?t have (?:access|enough)|"
+    r"there is no (?:code|context|information)|not enough (?:context|information)|"
+    r"i am unable to|i'?m unable to|as an ai)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_refusal(answer: str) -> bool:
+    return bool(_REFUSAL.search(answer or ""))
+
 
 def decide(score: float) -> str:
+    """Legacy single-score decision, kept for backward compatibility (see routing.plan_route)."""
     if score < config.LOCAL_THRESHOLD:
         return "local"
     if score > config.CLOUD_THRESHOLD:
@@ -21,9 +52,38 @@ def decide(score: float) -> str:
     return "local_first"
 
 
-def compress(req: ResolvedRequest, trace: Optional[List[str]] = None) -> ContextResult:
+def cloud_allowed() -> bool:
+    """Whether anything may leave the machine: cloud on and not blocked by the privacy policy."""
+    return config.CLOUD_ENABLED and not config.CLOUD_TRANSMISSION_PROHIBITED
+
+
+def context_budget(requested: str, complexity: str, *, task_type: str = "general",
+                   dependency: float = 0.0) -> int:
+    """Context budget for this request: large for complex/cloud tasks, the local window for local.
+
+    Complex cloud tasks should not be capped at the tiny default; but we stay well under the
+    destination model's window to leave room for the answer (see CLOUD_MAX_CONTEXT_TOKENS).
+    Uses the task signals too, because the weighted category needs context size it does not have
+    yet (a keyword-hard task like "refactor ..." scores only medium before context is attached)."""
+    complex_like = complexity == "complex" or task_type == "complex" or dependency >= 0.6
+    wants_cloud = requested == "cloud" or (requested == "auto" and complex_like)
+    if not wants_cloud:
+        return max(1000, config.LOCAL_MAX_CONTEXT_TOKENS - config.LOCAL_CONTEXT_MARGIN_TOKENS)
+    provider = effective_provider()
+    model = effective_model(provider)
+    info = cloud_catalog.model_info(provider, model) or {}
+    window = int(info.get("context") or 0) or config.CLOUD_MODEL_CONTEXT_DEFAULT
+    reserve = config.DEFAULT_OUTPUT_TOKENS_ESTIMATE + 1000
+    return max(1000, min(config.CLOUD_MAX_CONTEXT_TOKENS, window - reserve))
+
+
+def compress(req: ResolvedRequest, trace: Optional[List[str]] = None,
+             budget: Optional[int] = None, *, assist: bool = True,
+             semantic: bool = True) -> ContextResult:
     """Run the context optimizer (selection + compression + redaction) for this request's repo."""
-    ctx = optimize_context(req.prompt, req.repo_path, code=req.code, token_budget=config.CLOUD_CONTEXT_TOKEN_BUDGET)
+    ctx = optimize_context(req.prompt, req.repo_path, code=req.code,
+                           token_budget=budget or config.CLOUD_CONTEXT_TOKEN_BUDGET,
+                           assist=assist, semantic=semantic)
     if trace is not None:
         trace.append(
             f"context compression [{ctx.optimizer}] on {req.repo_path or 'no repo'}: "
@@ -33,20 +93,67 @@ def compress(req: ResolvedRequest, trace: Optional[List[str]] = None) -> Context
     return ctx
 
 
-def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dict[str, Any]:
+async def _plan_for(req: ResolvedRequest, requested: str, *, assist: bool = True,
+                    semantic: bool = True, classify: bool = True):
+    """Build the RoutePlan for a resolved request: compress, size the relevant context, classify."""
+    repo_tokens, num_files = repo_stats(req.repo_path)  # noqa: F841 (repo size feeds the file factor)
+    local_model = effective_local_model()
+    local_available = await ollama_reachable()
+    # Choose the budget from the task (and destination model) before compressing, so a complex,
+    # repo-wide, cloud-bound request isn't squeezed into the small local-context default.
+    preliminary = analyze(req.prompt, code=req.code, num_repo_files=num_files, context_tokens=0)
+    budget = context_budget(requested, preliminary.complexity, task_type=preliminary.task_type,
+                            dependency=preliminary.factors.get("dependency", 0.0))
+    ctx = compress(req, budget=budget, assist=assist, semantic=semantic)
+    # The capability check and the scorer use the *relevant* (optimized) context, not the whole repo.
+    estimated_context_tokens = count_tokens(req.prompt) + ctx.optimized_tokens
+    analysis = analyze(
+        req.prompt,
+        code=req.code,
+        num_repo_files=num_files,
+        context_tokens=ctx.optimized_tokens,
+    )
+    # Tie-breaker: only in the medium band, only for auto routing, only when the local model is up.
+    # Simple/complex requests and forced routes stay instant and deterministic.
+    hint = None
+    hint_reason = None
+    if (classify and config.LOCAL_LLM_CLASSIFIER and analysis.complexity == "medium"
+            and requested == "auto" and local_available):
+        model_cls = await classifier.classify_local(req.prompt, model=local_model)
+        if model_cls is not None:
+            hint = model_cls.complexity
+            hint_reason = model_cls.reason
+    plan = routing.plan_route(
+        requested,
+        prompt=req.prompt,
+        analysis=analysis,
+        estimated_context_tokens=estimated_context_tokens,
+        local_model=local_model,
+        local_available=local_available,
+        cloud_allowed=cloud_allowed(),
+        complexity_hint=hint,
+        model_complexity=hint,
+        model_complexity_reason=hint_reason,
+    )
+    return plan, ctx
+
+
+async def preview(prompt: str, repo_path: Optional[str] = None, code: str = "", force_route: str = "") -> Dict[str, Any]:
     """Dry run: the routing decision and token estimates, without calling any model.
     Lets a UI ask the user for consent before anything is sent to the cloud."""
     req = resolve_request(prompt, repo_path, code)
-    repo_tokens, num_files = repo_stats(req.repo_path)
-    analysis = analyze(req.prompt, code=req.code, repo_context_tokens=repo_tokens, num_repo_files=num_files)
-    ctx = compress(req)
+    # Fast, model-free preview: no local-LLM classifier, rerank, propose, or embeddings. The full
+    # assistance runs on /chat; the preview only needs a representative decision and token estimate.
+    plan, ctx = await _plan_for(req, force_route or config.DEFAULT_ROUTE,
+                                assist=False, semantic=False, classify=False)
+    analysis = plan.analysis
     prompt_tokens = count_tokens(req.prompt)
     provider = effective_provider()
     model = effective_model(provider)
     estimated_input = prompt_tokens + ctx.optimized_tokens
     in_price, out_price = cloud_catalog.price(provider, model)
     return {
-        "decision": decide(analysis.score),
+        "decision": plan.decision,
         "complexity_score": analysis.score,
         "task_type": analysis.task_type,
         "factors": analysis.factors,
@@ -65,6 +172,10 @@ def preview(prompt: str, repo_path: Optional[str] = None, code: str = "") -> Dic
             provider, model, estimated_input, config.DEFAULT_OUTPUT_TOKENS_ESTIMATE),
         "pricing": {"input": in_price, "output": out_price},
         "prices_updated": cloud_catalog.PRICES_UPDATED,
+        # --- explainable routing policy (Phases 3-5, 9) ---
+        **plan.as_dict(),
+        "routing_reasons": analysis.reasons + plan.reasons,
+        "context_metadata": ctx.metadata,
     }
 
 
@@ -81,44 +192,69 @@ async def handle(
     req = resolve_request(prompt, repo_path, code)
     prompt = req.prompt
     trace.append("context sources: " + ("; ".join(req.sources) or "prompt only"))
-    repo_tokens, num_files = repo_stats(req.repo_path)
-    analysis = analyze(prompt, code=req.code, repo_context_tokens=repo_tokens, num_repo_files=num_files)
-    decision = decide(analysis.score) if force_route == "auto" else force_route
-    trace.append(f"score={analysis.score} -> {decision}")
 
-    ctx: Optional[ContextResult] = None
+    plan, ctx = await _plan_for(req, force_route or config.DEFAULT_ROUTE)
+    analysis = plan.analysis
+    trace.append(
+        f"routing: requested={plan.requested} complexity={plan.complexity} ({plan.complexity_score_100}/100) "
+        f"local_capable={plan.local_capable} -> {plan.initial_route}"
+    )
+    if plan.classified_by == "local_llm":
+        trace.append(
+            f"local classifier: {plan.model_complexity} (keyword heuristic: {plan.heuristic_complexity})")
+    trace.append(f"score={analysis.score} -> {plan.decision}")
+
     local: Optional[LLMResult] = None
     cloud: Optional[LLMResult] = None
     escalated = False
     escalation_reason = None
+    escalation_kind = None
+    escalations_used = 0
+    local_failed = False
+    local_error: Optional[Exception] = None
+    output_valid = True
 
-    if decision in ("local", "local_first"):
+    if plan.initial_route in ("local_only", "local_first"):
         try:
             # Local model is private, so it can see the same optimized context
-            ctx = compress(req, trace)
             if emit:
-                emit("start", {"route": "local", "model": effective_local_model()})
+                emit("start", {"route": "local", "model": plan.local_model})
             local = await call_local(prompt, ctx.context, emit)
             trace.append(f"local confidence={local.confidence} needs_cloud={local.needs_cloud}")
-            if local.confidence < config.MIN_LOCAL_CONFIDENCE:
-                escalation_reason = f"local confidence {local.confidence} < {config.MIN_LOCAL_CONFIDENCE}"
-            elif local.needs_cloud:
-                escalation_reason = "local model flagged needs_cloud"
+            output_valid = bool((local.answer or "").strip()) and not looks_like_refusal(local.answer)
+            if not output_valid and (local.answer or "").strip():
+                trace.append("local output looks like a refusal -> validation failure")
         except Exception as e:
             log.exception("local model failed")
-            escalation_reason = f"local model error: {e}"
-        if escalation_reason and force_route != "local":
+            local_failed = True
+            local_error = e
+            trace.append(f"local model error: {e}")
+
+        decision = routing.decide_escalation(
+            requested=plan.requested,
+            confidence=local.confidence if local else None,
+            initial_route=plan.initial_route,
+            needs_cloud=bool(local and local.needs_cloud),
+            local_failed=local_failed,
+            local_error=str(local_error) if local_error else None,
+            output_valid=output_valid,
+            cloud_allowed=plan.cloud_allowed,
+            escalation_enabled=plan.escalate_allowed,
+            escalations_used=escalations_used,
+        )
+        if decision.escalate:
             escalated = True
-            trace.append(f"escalating: {escalation_reason}")
+            escalation_reason = decision.reason
+            escalation_kind = decision.kind
+            escalations_used += 1
+            trace.append(f"escalating ({decision.kind}): {decision.reason}")
+        elif decision.reason:
+            trace.append(f"no escalation: {decision.reason}")
 
     prompt_secrets = 0
-    if decision == "cloud" or escalated:
+    if plan.initial_route in ("cloud_only", "cloud_first") or escalated:
         # Only the cloud path needs redaction: local never leaves the machine
         cloud_prompt, prompt_secrets = redact_text(prompt)
-        # Every global call goes through the optimizer: only the selected, compressed, redacted
-        # context leaves the machine (reused if the local attempt already built it for this request)
-        if ctx is None:
-            ctx = compress(req, trace)
         if emit:
             provider = effective_provider()
             emit("start", {"route": "cloud", "model": effective_model(provider) or provider,
@@ -129,9 +265,13 @@ async def handle(
 
     final = cloud or local
     if final is None:
-        raise RuntimeError(escalation_reason or "no model produced an answer")
+        if plan.requested == "local":
+            raise RuntimeError(
+                "local-only request could not be completed locally"
+                + (f": {local_error}" if local_error else "")
+                + "; cloud escalation is disabled by your preference")
+        raise RuntimeError(escalation_reason or (str(local_error) if local_error else None) or "no model produced an answer")
 
-    assert ctx is not None  # whichever model answered ran compress() first
     # Cloud-only baseline: what a normal assistant would send (prompt + all code/repo)
     baseline_tokens = count_tokens(prompt) + ctx.original_tokens
     sent_tokens = cloud.input_tokens if cloud else 0
@@ -146,7 +286,9 @@ async def handle(
         "model": final.model,
         "escalated": escalated,
         "escalation_reason": escalation_reason if escalated else None,
+        "escalation_kind": escalation_kind if escalated else None,
         "confidence": local.confidence if local else None,
+        "confidence_threshold": config.MIN_LOCAL_CONFIDENCE,
         "complexity_score": analysis.score,
         "task_type": analysis.task_type,
         "factors": analysis.factors,
@@ -168,5 +310,10 @@ async def handle(
         "cloud_input_tokens": cloud.input_tokens if cloud else 0,
         "cloud_output_tokens": cloud.output_tokens if cloud else 0,
         "cost_usd": cost_usd,
+        # --- explainable routing policy (Phases 3-6, 9) ---
+        **plan.as_dict(),
+        "final_route": "cloud" if cloud else "local",
+        "escalations_used": escalations_used,
+        "context_metadata": ctx.metadata,
         "trace": trace,
     }

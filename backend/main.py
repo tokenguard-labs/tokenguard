@@ -75,7 +75,9 @@ class ChatResponse(BaseModel):
     model: str
     escalated: bool
     escalation_reason: Optional[str]
+    escalation_kind: Optional[str] = None
     confidence: Optional[float]
+    confidence_threshold: float = 0.7
     complexity_score: float
     task_type: str
     factors: Dict[str, float]
@@ -97,6 +99,28 @@ class ChatResponse(BaseModel):
     cloud_input_tokens: int = 0
     cloud_output_tokens: int = 0
     cost_usd: Optional[float] = None
+    # --- explainable routing policy ---
+    requested_route: str = "auto"
+    initial_route: str = "local_first"
+    final_route: str = "local"
+    complexity: str = "medium"
+    heuristic_complexity: str = "medium"
+    model_complexity: Optional[str] = None
+    model_complexity_reason: Optional[str] = None
+    classified_by: str = "heuristic"
+    complexity_score_100: int = 0
+    local_capable: bool = True
+    cloud_allowed: bool = True
+    escalate_allowed: bool = True
+    capability_reasons: List[str] = []
+    routing_reasons: List[str] = []
+    local_model: str = ""
+    model_profile: Dict[str, Any] = {}
+    estimated_context_tokens: int = 0
+    requires_tools: bool = False
+    requires_multifile: bool = False
+    escalations_used: int = 0
+    context_metadata: Dict[str, Any] = {}
     trace: List[str]
 
 
@@ -104,12 +128,13 @@ class AnalyzeRequest(BaseModel):
     prompt: str
     repo_path: Optional[str] = None
     code: str = ""
+    force_route: Literal["auto", "local", "cloud"] = "auto"
 
 
 @app.post("/analyze")
 async def analyze_route(req: AnalyzeRequest):
     """Routing decision only - no model is called. decision: local | local_first | cloud"""
-    return router.preview(req.prompt, req.repo_path, req.code)
+    return await router.preview(req.prompt, req.repo_path, req.code, req.force_route)
 
 
 _RECOMMENDED_FIELDS = ("name", "params", "size_gb", "min_ram_gb", "comfortable", "note", "tags", "description")

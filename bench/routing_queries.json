@@ -1,0 +1,202 @@
+[
+  {"id": "regex", "prompt": "Write a regex to match an email address",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Trivial, self-contained generation."},
+
+  {"id": "explain_function", "prompt": "Explain what this function does",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Short explanation of already-selected code."},
+
+  {"id": "what_line", "prompt": "What does this line of code do?",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Single-line understanding."},
+
+  {"id": "rename_var", "prompt": "Rename this variable to something clearer",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Localized rename."},
+
+  {"id": "add_docstring", "prompt": "Add a docstring to this function",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Documentation of one function."},
+
+  {"id": "dict_comprehension", "prompt": "Convert this list to a dictionary comprehension",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Small syntax transformation."},
+
+  {"id": "type_hints", "prompt": "Add type hints to this function",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Localized annotation."},
+
+  {"id": "python_oneliner", "prompt": "Write a Python one-liner to reverse a string",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Tiny utility."},
+
+  {"id": "syntax_error", "prompt": "Fix the syntax error in this line",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "One-line syntax fix."},
+
+  {"id": "format_json", "prompt": "Format this JSON nicely",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Formatting."},
+
+  {"id": "time_complexity", "prompt": "What is the time complexity of this loop?",
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Conceptual question about a snippet."},
+
+  {"id": "to_dataclasses", "prompt": "Convert this class to use dataclasses",
+   "context_tokens": 300, "num_repo_files": 1,
+   "expected_complexity": "simple", "expected_initial_route": "local_first",
+   "note": "Localized refactor of one class."},
+
+  {"id": "unit_tests_util", "prompt": "Write unit tests for the selected utility function",
+   "context_tokens": 200, "num_repo_files": 1,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Spec lists unit-test generation as medium."},
+
+  {"id": "unit_tests_service", "prompt": "Write unit tests for the authentication service",
+   "context_tokens": 1200, "num_repo_files": 4,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Unit tests plus auth/service scope."},
+
+  {"id": "debug_returns_none", "prompt": "Debug why this function returns None",
+   "context_tokens": 300, "num_repo_files": 1,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Localized debugging."},
+
+  {"id": "modify_function", "prompt": "Modify this function to handle empty input",
+   "context_tokens": 300, "num_repo_files": 1,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Spec: 'modify one function' is medium."},
+
+  {"id": "refactor_small_function", "prompt": "Refactor this function to be easier to read",
+   "context_tokens": 300, "num_repo_files": 1,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Localized refactor."},
+
+  {"id": "add_error_handling", "prompt": "Add error handling to this method",
+   "context_tokens": 300, "num_repo_files": 1,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Localized, moderate change."},
+
+  {"id": "input_validation", "prompt": "Add input validation to this endpoint",
+   "context_tokens": 400, "num_repo_files": 2,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Localized, moderate change."},
+
+  {"id": "optimize_function", "prompt": "Optimize this function for performance",
+   "context_tokens": 600, "num_repo_files": 2,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Bounded optimization."},
+
+  {"id": "fix_bug_loop", "prompt": "Fix the bug in this loop",
+   "context_tokens": 300, "num_repo_files": 1,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Localized bug fix."},
+
+  {"id": "module_improvements", "prompt": "Explain how this module is structured and suggest improvements",
+   "context_tokens": 1000, "num_repo_files": 3,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Single-module analysis."},
+
+  {"id": "localized_feature", "prompt": "Implement a localized feature and modify one function",
+   "context_tokens": 1200, "num_repo_files": 2,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Spec: localized change is medium."},
+
+  {"id": "debug_small_module", "prompt": "Debug this small module and explain the trade-offs",
+   "context_tokens": 1500, "num_repo_files": 3,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Localized debugging with reasoning."},
+
+  {"id": "docs_entire_module", "prompt": "Write documentation for the entire module",
+   "context_tokens": 800, "num_repo_files": 4,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "One module, so medium (not repo-wide)."},
+
+  {"id": "repo_auth_explain", "prompt": "Explain how authentication works throughout this repository",
+   "context_tokens": 3500, "num_repo_files": 20,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Ambiguous boundary case: repo-wide understanding without a change stays lower-risk."},
+
+  {"id": "refactor_architecture", "prompt": "Refactor the authentication architecture across the codebase",
+   "context_tokens": 4000, "num_repo_files": 12,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Cross-cutting architecture change."},
+
+  {"id": "race_condition", "prompt": "Find and fix a race condition in the user service across multiple files",
+   "context_tokens": 3000, "num_repo_files": 8,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Difficult concurrency bug across files."},
+
+  {"id": "migrate_orm", "prompt": "Migrate the data access layer to a new ORM",
+   "context_tokens": 5000, "num_repo_files": 15,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Large migration."},
+
+  {"id": "design_plugin_system", "prompt": "Design a plugin system for the editor",
+   "context_tokens": 2500, "num_repo_files": 10,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Architecture/design."},
+
+  {"id": "memory_leak", "prompt": "Debug a memory leak in the background worker",
+   "context_tokens": 3000, "num_repo_files": 6,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Hard runtime debugging."},
+
+  {"id": "rewrite_scheduler", "prompt": "Rewrite the scheduler to support priority queues end-to-end",
+   "context_tokens": 4000, "num_repo_files": 11,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Rewrite with across-component scope."},
+
+  {"id": "dependency_graph", "prompt": "Analyze the dependency graph and refactor shared utilities across modules",
+   "context_tokens": 5000, "num_repo_files": 25,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Cross-module dependency analysis."},
+
+  {"id": "e2e_encryption", "prompt": "Implement end-to-end encryption across the API and clients",
+   "context_tokens": 6000, "num_repo_files": 18,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Security + cross-component."},
+
+  {"id": "redesign_cloud", "prompt": "Redesign the architecture to support multiple cloud providers",
+   "context_tokens": 5000, "num_repo_files": 14,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Architecture redesign."},
+
+  {"id": "deadlock", "prompt": "Investigate a deadlock in the distributed job system",
+   "context_tokens": 4000, "num_repo_files": 9,
+   "expected_complexity": "complex", "expected_initial_route": "cloud_first",
+   "note": "Difficult concurrency debugging."},
+
+  {"id": "explicit_local_on_complex", "prompt": "Refactor the authentication architecture across the codebase",
+   "context_tokens": 4000, "num_repo_files": 12, "force_route": "local",
+   "expected_complexity": "complex", "expected_initial_route": "local_only",
+   "note": "Explicit local-only wins over complexity; never auto-escalates."},
+
+  {"id": "explicit_cloud_on_simple", "prompt": "Explain what this function does", "force_route": "cloud",
+   "expected_complexity": "simple", "expected_initial_route": "cloud_only",
+   "note": "Explicit cloud-only skips local."},
+
+  {"id": "privacy_medium", "prompt": "Add error handling to this method",
+   "context_tokens": 300, "num_repo_files": 1, "cloud_allowed": false,
+   "expected_complexity": "medium", "expected_initial_route": "local_first",
+   "note": "Privacy restriction keeps it local."},
+
+  {"id": "privacy_complex", "prompt": "Refactor the authentication architecture across the codebase",
+   "context_tokens": 4000, "num_repo_files": 12, "cloud_allowed": false, "local_model": "qwen2.5-coder:7b",
+   "expected_complexity": "complex", "expected_initial_route": "local_first",
+   "note": "Complex but cloud prohibited: run locally even if complex."},
+
+  {"id": "requires_tools_simple", "prompt": "Explain what this function does", "requires_tools": true,
+   "expected_complexity": "simple", "expected_initial_route": "cloud_first",
+   "note": "Local path has no tool calling, so capability check forces cloud."},
+
+  {"id": "big_context_small_model", "prompt": "Explain what this function does",
+   "context_tokens": 9000, "local_model": "qwen2.5-coder:0.5b",
+   "expected_complexity": "simple", "expected_initial_route": "cloud_first",
+   "note": "Relevant context exceeds the local model window."},
+
+  {"id": "local_unavailable", "prompt": "Explain what this function does", "local_available": false,
+   "expected_complexity": "simple", "expected_initial_route": "cloud_first",
+   "note": "No local model reachable."}
+]

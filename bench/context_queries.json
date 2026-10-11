@@ -1,0 +1,37 @@
+[
+  {
+    "id": "symbol_lookup",
+    "prompt": "Where is validate_token defined?",
+    "task_type": "explain",
+    "budget_tokens": 400,
+    "expected_files": ["src/auth/auth.py"]
+  },
+  {
+    "id": "caller_flow",
+    "prompt": "How does login validate a token?",
+    "task_type": "explain",
+    "budget_tokens": 500,
+    "expected_files": ["src/auth/login.py", "src/auth/auth.py"]
+  },
+  {
+    "id": "class_member",
+    "prompt": "Explain ConnectionPool.acquire",
+    "task_type": "explain",
+    "budget_tokens": 400,
+    "expected_files": ["src/db/pool.py"]
+  },
+  {
+    "id": "route_to_store",
+    "prompt": "How are users fetched for the login route?",
+    "task_type": "fix_bug",
+    "budget_tokens": 600,
+    "expected_files": ["src/api/routes.py", "src/db/store.py"]
+  },
+  {
+    "id": "config_usage",
+    "prompt": "What is POOL_TIMEOUT used for?",
+    "task_type": "explain",
+    "budget_tokens": 400,
+    "expected_files": ["src/config.py", "src/db/pool.py"]
+  }
+]

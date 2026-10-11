@@ -298,10 +298,20 @@
         const isCloud = a.decision === 'cloud';
         turn.el.innerHTML =
             '<span class="badge ' + esc(a.decision) + '">' + decisionLabel(a.decision) + '</span>' +
-            '<div class="metrics"><b>Complexity:</b> ' + esc(a.complexity_score) +
+            '<div class="metrics"><b>Complexity:</b> ' + esc(a.complexity || '?') +
+            ' (' + esc(a.complexity_score_100 != null ? a.complexity_score_100 : '?') + '/100)' +
             ' · <b>Task:</b> ' + esc(a.task_type) +
+            ' · initial: ' + esc(a.initial_route || '?') +
             ' · ~' + fmt(a.estimated_cloud_tokens) + ' tokens if sent to cloud</div>' +
-            (reasons ? accordion('Why this route', '<ul>' + reasons + '</ul>') : '') +
+            (a.local_capable === false
+                ? '<div class="warn">Local model not capable: ' +
+                  esc((a.capability_reasons || []).join('; ') || 'capability check failed') + '</div>'
+                : '') +
+            (reasons || Object.keys(a.factors || {}).length
+                ? accordion('Why this route',
+                    '<div class="muted">factors: ' + Object.keys(a.factors || {}).map(k => esc(k) + ': ' + esc(a.factors[k])).join(' · ') + '</div>' +
+                    (reasons ? '<ul>' + reasons + '</ul>' : ''))
+                : '') +
             accordion('Context · ' + files.length + ' file' + (files.length === 1 ? '' : 's'),
                 '<div class="muted">Repo searched: ' + (a.repo_path ? '<code>' + esc(a.repo_path) + '</code>' : 'none') +
                 ' · from ' + esc((a.context_sources || []).join('; ') || contextInfo) + '</div>' +
@@ -316,6 +326,57 @@
                 '<button data-route="local" data-id="' + id + '" class="' + (isCloud ? 'secondary' : '') + '">🖥️ Use local LLM</button>' +
                 '<button data-route="cloud" data-id="' + id + '" class="' + (isCloud ? '' : 'secondary') + '">☁️ Use global LLM' + (isCloud ? ' (recommended)' : '') + '</button>' +
             '</div>';
+    }
+
+    /** Why this task got its complexity category: heuristic reasons, factors, and classifier verdict. */
+    function complexityReason(r) {
+        const reasons = (r.reasons || []).map(x => '<li>' + esc(x) + '</li>').join('');
+        const factors = r.factors || {};
+        const facts = Object.keys(factors).map(k => esc(k) + ': ' + esc(factors[k])).join(' · ');
+        if (!reasons && !facts && !r.model_complexity_reason) return '';
+        const verdict = r.model_complexity
+            ? ' · local classifier: <b>' + esc(r.model_complexity) + '</b>'
+            : '';
+        return accordion('Why this complexity · ' + esc(r.complexity || '?') + ' (' + esc(r.complexity_score_100) + '/100)',
+            '<div class="muted">heuristic: ' + esc(r.heuristic_complexity || '?') + verdict + '</div>' +
+            (r.model_complexity_reason ? '<div class="muted">classifier reason: ' + esc(r.model_complexity_reason) + '</div>' : '') +
+            (facts ? '<div class="muted">factors: ' + facts + '</div>' : '') +
+            (reasons ? '<ul>' + reasons + '</ul>' : ''));
+    }
+
+    /** "Retrieved context" from the router_view metadata: what was retrieved, why, and adequacy. */
+    function contextDetails(r) {
+        const cm = r.context_metadata || {};
+        if (!cm.retrieval_coverage && !r.files_selected) return '';
+        const cov = cm.retrieval_coverage || {};
+        const missing = cm.missing_required || [];
+        const uncertain = cm.uncertain_references || [];
+        const evidence = cm.evidence || [];
+        const count = cov.files_selected != null ? cov.files_selected : (r.files_selected || []).length;
+        const lines = evidence.slice(0, 10).map(e =>
+            '<div class="muted"><code>' + esc(e.file) + ':' + esc(e.start_line) + '</code> ' +
+            esc(e.symbol || '') + ' <span class="muted">[' + esc(e.retriever || '') + '] ' + esc(e.reason || '') + '</span></div>'
+        ).join('');
+        const scope = cm.scope || {};
+        let scopeLine = '';
+        if (scope.corpus_wide) {
+            const langs = (scope.source_languages || []).join(', ') +
+                ((scope.target_languages || []).length ? ' → ' + scope.target_languages.join(', ') : '');
+            scopeLine = '<div class="muted">scope: <b>corpus-wide</b>' + (langs ? ' · ' + esc(langs) : '') +
+                ' · ' + esc(cov.in_scope_files != null ? cov.in_scope_files : '?') + ' files · full ' +
+                esc(cov.represented_full != null ? cov.represented_full : '?') + ' · signatures ' +
+                esc(cov.represented_signature != null ? cov.represented_signature : '?') + ' · omitted ' +
+                esc(cov.omitted_files != null ? cov.omitted_files : '?') + '</div>';
+        }
+        return accordion('Retrieved context · ' + esc(r.context_optimizer || 'n/a'),
+            '<div class="muted">files: <b>' + esc(count) + '</b> · candidates: ' + esc(cov.candidates != null ? cov.candidates : '?') +
+            ' · adequacy: <b>' + esc(cm.adequacy_status || 'n/a') + '</b>' + (cov.semantic ? ' · semantic: on' : '') +
+            ' · budget: ' + esc(cm.context_budget != null ? cm.context_budget : '?') + '</div>' +
+            scopeLine +
+            (cm.adequacy_recommendation ? '<div class="warn">' + esc(cm.adequacy_recommendation) + '</div>' : '') +
+            (missing.length ? '<div class="warn">missing required: ' + esc(missing.join(', ')) + '</div>' : '') +
+            (uncertain.length ? '<div class="muted">uncertain refs: ' + esc(uncertain.join(', ')) + '</div>' : '') +
+            fileList(r.files_selected || []) + lines);
     }
 
     function routeBadge(isLocal) {
@@ -390,6 +451,14 @@
         const files = r.files_selected || [];
         const trace = (r.trace || []).map(t => '<li>' + esc(t) + '</li>').join('');
 
+        const routing = accordion('Routing policy',
+            '<div class="muted">requested: <code>' + esc(r.requested_route) + '</code> · initial: <code>' +
+            esc(r.initial_route) + '</code> · final: <code>' + esc(r.final_route || r.route) + '</code></div>' +
+            '<div class="muted">complexity: <b>' + esc(r.complexity) + '</b> (' + esc(r.complexity_score_100) +
+            '/100) · escalation: ' + esc(r.escalation_kind || 'none') + '</div>' +
+            (r.capability_reasons && r.capability_reasons.length
+                ? '<div class="muted">capability: ' + esc(r.capability_reasons.join('; ')) + '</div>' : ''));
+
         let metrics;
         let details;
         if (isLocal) {
@@ -409,6 +478,9 @@
                 accordion('Context sent · ' + files.length + ' file' + (files.length === 1 ? '' : 's'),
                     (r.repo_path ? '<div class="muted">from <code>' + esc(r.repo_path) + '</code></div>' : '') + fileList(files));
         }
+        details += routing;
+        details += complexityReason(r);
+        details += contextDetails(r);
 
         const el = turn.pendingEl;
         el.innerHTML =

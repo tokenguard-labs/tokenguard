@@ -91,10 +91,12 @@ def _fallback_optimize(prompt: str, repo_path: Optional[str], code: str, token_b
     )
 
 
-def optimize_context(prompt: str, repo_path: Optional[str], code: str = "", token_budget: int = 3000) -> ContextResult:
+def optimize_context(prompt: str, repo_path: Optional[str], code: str = "", token_budget: int = 3000,
+                     *, assist: bool = True, semantic: bool = True) -> ContextResult:
     if _person2 is not None:
         try:
-            result = _person2.optimize_context(prompt, repo_path, code=code, token_budget=token_budget)
+            result = _person2.optimize_context(prompt, repo_path, code=code, token_budget=token_budget,
+                                               assist=assist, semantic=semantic)
             if not isinstance(result, ContextResult):
                 raise TypeError(f"expected ContextResult, got {type(result).__name__}")
             return result
