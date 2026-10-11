@@ -26,6 +26,13 @@ LOCAL_NUM_CTX = int(os.getenv("LOCAL_NUM_CTX", "8192"))  # Ollama's default wind
 # How long to keep the active local model resident between prompts. Only one is kept loaded at a
 # time regardless: switching models unloads the previous one first.
 LOCAL_KEEP_ALIVE = os.getenv("LOCAL_KEEP_ALIVE", "30m")
+# Answer length for the local model. The word budget is told to the model (so it plans an answer
+# that fits); the token cap is a hard stop (num_predict) with headroom, only hit when it ignores
+# the budget. "brief" is the default; "detailed" is what the "More detail" button asks for.
+LOCAL_BRIEF_WORDS = int(os.getenv("LOCAL_BRIEF_WORDS", "200"))
+LOCAL_BRIEF_MAX_TOKENS = int(os.getenv("LOCAL_BRIEF_MAX_TOKENS", "1200"))
+LOCAL_DETAILED_WORDS = int(os.getenv("LOCAL_DETAILED_WORDS", "800"))
+LOCAL_DETAILED_MAX_TOKENS = int(os.getenv("LOCAL_DETAILED_MAX_TOKENS", "4000"))
 
 # Cloud (global) LLM: "deepseek", "anthropic", "openai" (any OpenAI-compatible API), or "mock"
 CLOUD_PROVIDER = os.getenv("CLOUD_PROVIDER", "deepseek")

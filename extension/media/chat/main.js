@@ -240,27 +240,44 @@
     function analyze(id) {
         const turn = turns.get(id);
         turn.el.innerHTML = '<span class="spinner">Analyzing prompt (local vs global)…</span>';
+        turn.stopped = false;
         setBusy(true, id);
         vscode.postMessage({ type: 'sendPrompt', id, prompt: turn.prompt });
     }
 
-    /** Run the turn on `route`, rendering into `el` (a retried card) or a new card. */
-    function run(id, route, el) {
+    /** Run the turn on `route`, rendering into `el` (a retried card) or a new card.
+     *  `detail` is the local answer length: 'brief' (default) or 'detailed' ("More detail"). */
+    function run(id, route, el, detail = 'brief') {
         const turn = turns.get(id);
         if (!turn || busy) return;
-        const label = route === 'local' ? 'local LLM' : 'global (cloud) LLM';
+        const label = route === 'local'
+            ? (detail === 'detailed' ? 'local LLM for a detailed explanation' : 'local LLM')
+            : 'global (cloud) LLM';
         turn.pendingEl = el || addCard('');
         turn.pendingEl.innerHTML = '<span class="spinner">Asking the ' + label + '…</span>';
         turn.route = route;
+        turn.detail = detail;
+        turn.stopped = false;
         endStream(turn);
         setBusy(true, id);
-        vscode.postMessage({ type: 'run', id, req: turn.req, route });
+        vscode.postMessage({ type: 'run', id, req: { ...turn.req, detail }, route });
     }
 
     function stop() {
         if (!busy || activeId === null) return;
         sendBtn.disabled = true;
         sendBtn.textContent = 'Stopping…';
+        // Freeze the answer now: whatever is still in flight from the model is dropped,
+        // rather than rendering on until the cancellation round-trip completes.
+        const turn = turns.get(activeId);
+        if (turn) {
+            turn.stopped = true;
+            turn.stoppedText = endStream(turn);
+            const answer = turn.pendingEl && turn.pendingEl.querySelector('.answer');
+            if (answer) fillMarkdown(answer, turn.stoppedText);
+            const spinner = turn.pendingEl && turn.pendingEl.querySelector('.metrics .spinner');
+            if (spinner) spinner.textContent = 'stopping…';
+        }
         vscode.postMessage({ type: 'cancel', id: activeId });
     }
 
@@ -393,7 +410,7 @@
     function onStream(id, event, data) {
         const turn = turns.get(id);
         const el = turn.pendingEl;
-        if (!el) return;
+        if (!el || turn.stopped) return;
         if (event === 'start') {
             // A second start (escalation from local to cloud) replaces the first answer.
             endStream(turn);
@@ -461,7 +478,13 @@
 
         let metrics;
         let details;
+        let actions = '';
         if (isLocal) {
+            if (r.more_available) {
+                actions += '<button data-route="local" data-detail="detailed" data-id="' + id + '">📖 More detailed explanation</button>';
+            }
+            actions += '<button data-route="cloud" data-id="' + id + '" class="' + (lowConf ? '' : 'secondary') + '">' +
+                (lowConf ? '☁️ Retry with global LLM' : 'Not satisfied? ☁️ Use global LLM') + '</button>';
             metrics = '<b>Model:</b> ' + esc(r.model) + ' · ' + fmt(r.latency_ms) + ' ms · confidence ' + conf +
                 ' · <b>0</b> tokens sent to cloud';
             details = accordion('Confidence & escalation',
@@ -490,10 +513,10 @@
             (r.is_mock ? '<div class="warn">⚠️ Mock answer — not a real cloud call. ' + esc(r.cloud_fallback_reason || 'CLOUD_PROVIDER=mock') + '</div>' : '') +
             (lowConf ? '<div class="warn">The local model wasn\'t confident about this answer.</div>' : '') +
             '<div class="answer"></div>' +
+            (r.truncated ? '<div class="muted">✂️ The answer reached its length limit.</div>' : '') +
             details +
             (trace ? accordion('Pipeline trace', '<ul>' + trace + '</ul>') : '') +
-            (isLocal ? '<div class="choices"><button data-route="cloud" data-id="' + id + '" class="' + (lowConf ? '' : 'secondary') + '">' +
-                (lowConf ? '☁️ Retry with global LLM' : 'Not satisfied? ☁️ Use global LLM') + '</button></div>' : '');
+            (actions ? '<div class="choices">' + actions + '</div>' : '');
         fillMarkdown(el.querySelector('.answer'), r.answer);
         turn.pendingEl = null;
     }
@@ -503,10 +526,14 @@
         const el = turn.pendingEl || turn.el;
         // Before the analysis arrives the whole turn is retried; after it, only the run.
         const retry = turn.pendingEl
-            ? '<button class="secondary" data-retry="run" data-id="' + id + '" data-retry-route="' + esc(turn.route) + '">↻ Retry</button>'
+            ? '<button class="secondary" data-retry="run" data-id="' + id + '" data-retry-route="' + esc(turn.route) +
+                '" data-detail="' + esc(turn.detail || 'brief') + '">↻ Retry</button>'
             : '<button class="secondary" data-retry="analyze" data-id="' + id + '">↻ Retry</button>';
         el.innerHTML = '<div class="cancelled">⏹ Stopped.</div><div class="choices">' + retry + '</div>';
-        partialAnswer(el, endStream(turn));
+        const text = endStream(turn) || turn.stoppedText || '';
+        turn.stopped = false;
+        turn.stoppedText = '';
+        partialAnswer(el, text);
         turn.pendingEl = null;
     }
 
@@ -678,10 +705,10 @@
             turns.get(id).el = target.closest('.msg');
             analyze(id);
         } else if (target.dataset.retry === 'run') {
-            run(id, target.dataset.retryRoute, target.closest('.msg'));
+            run(id, target.dataset.retryRoute, target.closest('.msg'), target.dataset.detail);
         } else if (target.dataset.route) {
             target.dataset.used = '1';
-            run(id, target.dataset.route);
+            run(id, target.dataset.route, undefined, target.dataset.detail);
         }
     });
 
@@ -725,6 +752,11 @@
                 clearChat();
                 break;
             case 'analysis':
+                if (turn.stopped) { // Stop raced the analysis: don't start a run behind the user's back
+                    renderCancelled(m.id);
+                    setBusy(false);
+                    break;
+                }
                 turn.req = m.req;
                 turn.analysis = m.analysis;
                 renderAnalysis(m.id, m.analysis, m.contextInfo);
@@ -739,7 +771,9 @@
                 onStream(m.id, m.event, m.data);
                 break;
             case 'result':
-                renderResult(m.id, m.result);
+                // Finished just as Stop was pressed: honor the Stop, keep what was shown.
+                if (turn.stopped) renderCancelled(m.id);
+                else renderResult(m.id, m.result);
                 setBusy(false);
                 break;
             case 'cancelled':
@@ -747,6 +781,11 @@
                 setBusy(false);
                 break;
             case 'error': {
+                if (turn && turn.stopped) { // an error from a run the user already stopped
+                    renderCancelled(m.id);
+                    setBusy(false);
+                    break;
+                }
                 const el = turn ? (turn.pendingEl || turn.el) : addCard('');
                 el.innerHTML = '<div class="error">⚠️ ' + esc(m.message) + '</div>';
                 if (turn) {

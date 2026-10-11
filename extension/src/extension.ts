@@ -398,12 +398,26 @@ async function apiStream<T>(
             throw new Error('Backend returned an empty stream');
         }
         const reader = resp.body.getReader();
+        // Stop reading as soon as we're aborted, without relying on fetch to error the body
+        // (VS Code's patched fetch doesn't always); cancelling the reader also drops the connection.
+        const aborted = new Promise<never>((_, reject) => {
+            const stop = () => {
+                reader.cancel().catch(() => undefined);
+                reject(new DOMException('The operation was aborted.', 'AbortError'));
+            };
+            if (controller.signal.aborted) {
+                stop();
+            } else {
+                controller.signal.addEventListener('abort', stop, { once: true });
+            }
+        });
+        aborted.catch(() => undefined); // only observed through the race below
         const decoder = new TextDecoder();
         let buffer = '';
         for (;;) {
             let chunk: Awaited<ReturnType<typeof reader.read>>;
             try {
-                chunk = await reader.read();
+                chunk = await Promise.race([reader.read(), aborted]);
             } catch (err) {
                 if (timedOut && !signal?.aborted) {
                     throw new Error(`LocalPilot backend stopped responding (no data for ${Math.round(idleTimeoutMs / 1000)}s).`);
@@ -416,7 +430,7 @@ async function apiStream<T>(
             resetIdle();
             buffer = (buffer + decoder.decode(chunk.value, { stream: true })).replace(/\r\n/g, '\n');
             let end: number;
-            while ((end = buffer.indexOf('\n\n')) >= 0) {
+            while (!controller.signal.aborted && (end = buffer.indexOf('\n\n')) >= 0) {
                 const block = buffer.slice(0, end);
                 buffer = buffer.slice(end + 2);
                 let event = 'message';
@@ -440,6 +454,9 @@ async function apiStream<T>(
                 }
                 onEvent(event, payload);
             }
+        }
+        if (controller.signal.aborted) {
+            throw new DOMException('The operation was aborted.', 'AbortError');
         }
         throw new Error('LocalPilot backend closed the stream before the answer finished.');
     } finally {

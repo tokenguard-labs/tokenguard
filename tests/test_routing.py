@@ -181,7 +181,7 @@ class TestRouterIntegration(unittest.TestCase):
 
     def _run(self, prompt, *, force_route="auto", confidence=0.2, local_answer="draft",
              cloud_enabled=True, local_error=None, model_complexity=None, model_reason=""):
-        async def fake_local(p, context, emit=None):
+        async def fake_local(p, context, emit=None, detail="brief"):
             if local_error:
                 raise RuntimeError(local_error)
             return LLMResult(answer=local_answer, model="local", latency_ms=5, confidence=confidence)

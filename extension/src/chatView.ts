@@ -16,6 +16,7 @@ interface ChatRequest {
     prompt: string;
     code: string;
     repo_path: string | null;
+    detail?: 'brief' | 'detailed'; // local answer length; 'detailed' = the "More detail" button
 }
 
 const ANALYZE_TIMEOUT_MS = 60_000;
@@ -368,7 +369,11 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
         try {
             // start / delta / reset events render the answer while it's generated; 'result' finalizes it.
             const result = await this._host.apiStream('/chat/stream', { ...req, force_route: route },
-                (event, data) => this._post({ type: 'stream', id, event, data }),
+                (event, data) => {
+                    if (!controller.signal.aborted) { // Stop pressed: forward nothing more
+                        this._post({ type: 'stream', id, event, data });
+                    }
+                },
                 STREAM_IDLE_TIMEOUT_MS, controller.signal);
             this._post({ type: 'result', id, route, result });
         } catch (err) {
