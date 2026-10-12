@@ -173,11 +173,17 @@ def resolve_request(prompt: str, repo_path: Optional[str], code: str = "") -> Re
         sources.append("editor selection")
     prompt_dir: Optional[str] = None
     prompt_file_repo: Optional[str] = None
+    attached: set = set()
     for text, path in _paths_in_prompt(prompt):
-        prompt = prompt.replace(text, " ")
+        # A file keeps its name in the prompt (a pasted traceback still says which file); a
+        # folder is dropped, since it only says where to search.
+        prompt = prompt.replace(text, " " if os.path.isdir(path) else os.path.basename(path))
         if os.path.isdir(path):
             prompt_dir = prompt_dir or path
+        elif path in attached:
+            continue  # named several times (e.g. every frame of a traceback): attach it once
         elif os.path.getsize(path) <= MAX_FILE_BYTES:
+            attached.add(path)
             try:
                 with open(path, encoding="utf-8") as f:
                     code = f"{code}\n\n# File: {os.path.basename(path)}\n{f.read()}".strip()

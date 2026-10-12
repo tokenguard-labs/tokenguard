@@ -63,6 +63,14 @@
         </main>
 
         <footer class="bottom">
+            <div class="model-row">
+                <label for="mode">Mode</label>
+                <select id="mode" title="Ask answers questions. Agent reads your code, proposes edits you review, and runs tests (with your approval).">
+                    <option value="ask">Ask: answer questions</option>
+                    <option value="agent-cloud">Agent: edit code with the global LLM</option>
+                    <option value="agent-local">Agent: edit code with the local LLM</option>
+                </select>
+            </div>
             <textarea id="prompt" placeholder="Ask LocalPilot about your repository… (Enter to send, Shift+Enter for newline)"></textarea>
             <button id="send" title="Send (Enter)">Send Request</button>
         </footer>

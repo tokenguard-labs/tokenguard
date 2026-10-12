@@ -168,6 +168,11 @@
           "type": "boolean",
           "default": true,
           "description": "On exit, stop the `ollama serve` process that TokenGuard/setup started. Local models are always unloaded to free RAM; an Ollama you started yourself (e.g. a systemd service) is never killed."
+        },
+        "tokenguard.agentInlineReview": {
+          "type": "boolean",
+          "default": true,
+          "description": "When the agent finishes, open each modified file with its changes marked in place (red = removed, green = added) and Accept / Reject above each change, like Cursor. Nothing is saved until every change in the file is decided."
         }
       }
     }

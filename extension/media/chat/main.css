@@ -250,3 +250,61 @@ button.example:hover { background: var(--vscode-list-hoverBackground); }
 .section .model-row > label { flex: 0 0 52px; width: 52px; }
 .section .choices { margin-top: 0; }
 .section .choices button { width: auto; flex: 1 1 0; padding: 4px 6px; font-weight: normal; }
+
+/* Agent mode */
+.badge.agent { background: #3c1f5c; color: #c39bea; border: 1px solid #c39bea; }
+.agent-steps { display: flex; flex-direction: column; gap: 4px; }
+.agent-step { font-size: 11px; overflow-wrap: anywhere; }
+.agent-step details.acc { margin: 2px 0 2px 16px; }
+.agent-thought { font-size: 11px; opacity: 0.9; padding: 2px 0; }
+.step-icon { display: inline-block; width: 1em; text-align: center; }
+.step-icon.ok, .ok { color: var(--vscode-testing-iconPassed, #52b788); }
+.step-icon.fail { color: var(--vscode-errorForeground); }
+pre.tool-out {
+    margin: 4px 0;
+    padding: 6px;
+    max-height: 220px;
+    overflow: auto;
+    font-family: var(--vscode-editor-font-family);
+    font-size: 11px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--vscode-textCodeBlock-background);
+    border-radius: 3px;
+}
+.agent-approval {
+    border: 1px solid var(--vscode-editorWarning-foreground);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 11px;
+}
+.agent-approval .choices { margin-top: 4px; }
+.agent-approval .choices button { width: auto; padding: 4px 10px; }
+.agent-live { margin: 4px 0; }
+.agent-final { margin-top: 8px; }
+.agent-final > .answer { margin-bottom: 8px; }
+.agent-changes {
+    border: 1px solid var(--vscode-widget-border, transparent);
+    border-radius: 4px;
+    padding: 6px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.agent-changes-head, .change-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.agent-changes-head > b { flex: 1; }
+.change-row { font-size: 11px; }
+.change-row.rejected .chg-path { text-decoration: line-through; opacity: 0.6; }
+.chg-path { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--vscode-textLink-foreground); text-decoration: none; }
+.chg-path:hover { text-decoration: underline; }
+.chg-status { font-weight: bold; width: 1.2em; text-align: center; }
+.chg-status.added { color: var(--vscode-gitDecoration-addedResourceForeground, #52b788); }
+.chg-status.modified { color: var(--vscode-gitDecoration-modifiedResourceForeground, #e9c46a); }
+.chg-status.deleted { color: var(--vscode-gitDecoration-deletedResourceForeground, #e76f51); }
+.adds { color: var(--vscode-gitDecoration-addedResourceForeground, #52b788); }
+.dels { color: var(--vscode-gitDecoration-deletedResourceForeground, #e76f51); }
+.row-actions { display: flex; gap: 2px; margin-left: auto; }
+button.icon-btn.accept { color: var(--vscode-gitDecoration-addedResourceForeground, #52b788); }
+button.icon-btn.reject { color: var(--vscode-gitDecoration-deletedResourceForeground, #e76f51); }
+.row-note { flex-basis: 100%; margin: 0 0 0 1.8em; font-size: 11px; }
+.chg-reviewing { font-size: 10px; color: var(--vscode-gitDecoration-modifiedResourceForeground, #e9c46a); white-space: nowrap; }

@@ -2,8 +2,9 @@
 import asyncio
 import json
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -11,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from . import cloud_catalog, config, llm, model_catalog, router, system
+from . import agent, cloud_catalog, config, context, llm, model_catalog, router, system
 
 logging.basicConfig(level=logging.INFO)
 
@@ -259,7 +260,7 @@ def _http_error(e: Exception) -> HTTPException:
         return e
     if isinstance(e, httpx.HTTPStatusError):
         return HTTPException(502, f"upstream LLM error: {e.response.status_code} {e.response.text[:300]}")
-    return HTTPException(500, str(e))
+    return HTTPException(500, str(e) or type(e).__name__)  # e.g. httpx.ReadTimeout has no message
 
 
 def _record(prompt: str, result: Dict[str, Any]) -> None:
@@ -303,30 +304,41 @@ async def chat_stream(req: ChatRequest, request: Request):
     then exactly one of done {ChatResponse} or error {status, message}. A ": ping" comment is
     sent every SSE_HEARTBEAT_S while nothing else is, so clients can detect a dead connection.
     """
+    async def run(emit) -> Dict[str, Any]:
+        result = await router.handle(req.prompt, req.repo_path, req.code, req.force_route, emit=emit, detail=req.detail)
+        _record(req.prompt, result)
+        return ChatResponse(**result).model_dump()
+
+    return _sse_response(request, run, "/chat/stream")
+
+
+def _sse_response(request: Request, run: Callable[[Callable], Awaitable[Dict[str, Any]]], name: str) -> StreamingResponse:
+    """Run `run(emit)` and stream what it emits as SSE, ending with done {its result} or error.
+
+    The task is created here so it inherits this request's LLM overrides. A client disconnect
+    cancels it, which stops generation and frees the local-model lock.
+    """
     queue: asyncio.Queue = asyncio.Queue()
 
     def emit(event: str, data: Dict[str, Any]) -> None:
         queue.put_nowait((event, data))
 
-    async def run() -> None:
+    async def work_fn() -> None:
         try:
-            result = await router.handle(req.prompt, req.repo_path, req.code, req.force_route, emit=emit, detail=req.detail)
+            result = await run(emit)
         except Exception as e:
             err = _http_error(e)
             emit("error", {"status": err.status_code, "message": err.detail})
             return
-        _record(req.prompt, result)
-        emit("done", ChatResponse(**result).model_dump())
+        emit("done", result)
 
-    # Created here so the task inherits this request's LLM overrides. As with /chat, a client
-    # disconnect cancels it, which stops generation and frees the local-model lock.
-    work = asyncio.create_task(run())
+    work = asyncio.create_task(work_fn())
 
     async def watch_hangup() -> None:
         await _wait_for_disconnect(request)
         if not work.done():
             work.cancel()
-            logging.info("/chat/stream cancelled by client")
+            logging.info("%s cancelled by client", name)
 
     hangup = asyncio.create_task(watch_hangup())
 
@@ -354,6 +366,65 @@ async def chat_stream(req: ChatRequest, request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+class AgentRequest(BaseModel):
+    prompt: str
+    repo_path: Optional[str] = None
+    code: str = ""  # editor selection
+    active_file: Optional[str] = None  # workspace-relative path of the open file
+    route: Literal["cloud", "local"] = "cloud"
+    history: List[Dict[str, str]] = []  # earlier agent tasks this session: {prompt, summary}
+
+
+@app.post("/agent/stream")
+async def agent_stream(req: AgentRequest, request: Request):
+    """Agent mode as Server-Sent Events: the model explores, edits (staged, never written) and
+    verifies in a tool loop.
+
+    Events: start {run_id, route, model, repo_path}, thought {text}, tool_call {call_id, name, args},
+    tool_result {call_id, name, ok, output}, changes {changes: [{path, status, additions, deletions}]},
+    approval {request_id, kind, command, cwd} (answer with POST /agent/approve), approval_resolved
+    {request_id, approved}, then done {summary, changes: [{path, status, original, proposed, diff, ...}],
+    commands, ...} or error {status, message}.
+    """
+    resolved = context.resolve_request(req.prompt, req.repo_path, req.code)
+    if not resolved.repo_path:
+        raise HTTPException(400, "Agent mode needs a workspace folder: open a folder in VS Code first.")
+    if req.route == "cloud" and not router.cloud_allowed():
+        raise HTTPException(403, "Cloud use is disabled by policy (CLOUD_ENABLED / CLOUD_TRANSMISSION_PROHIBITED); "
+                                 "run the agent on the local LLM instead.")
+
+    # The agent gets the prompt as typed (a pasted traceback keeps its paths) and reads files with
+    # its tools; files the prompt names are passed along so it starts from them.
+    root = os.path.realpath(resolved.repo_path)
+    mentioned = list(dict.fromkeys(
+        os.path.relpath(path, root) for _, path in context._paths_in_prompt(req.prompt)
+        if os.path.isfile(path) and path.startswith(root + os.sep)
+    ))
+
+    async def run(emit) -> Dict[str, Any]:
+        return await agent.AgentRun(
+            req.prompt, resolved.repo_path, req.route, emit, code=req.code, active_file=req.active_file,
+            history=req.history, mentioned_files=mentioned,
+        ).run()
+
+    return _sse_response(request, run, "/agent/stream")
+
+
+class ApprovalRequest(BaseModel):
+    run_id: str
+    request_id: str
+    approved: bool
+    always: bool = False  # approve every further command in this run
+
+
+@app.post("/agent/approve")
+async def agent_approve(req: ApprovalRequest):
+    run = agent.RUNS.get(req.run_id)
+    if run is None or not run.resolve_approval(req.request_id, req.approved, req.always):
+        raise HTTPException(404, "no pending approval with that id (the agent run may have ended)")
+    return {"ok": True}
 
 
 @app.get("/stats")

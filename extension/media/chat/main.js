@@ -15,12 +15,25 @@
     const cloudBaseUrlInput = document.getElementById('cloudBaseUrl');
     const cloudKeyInput = document.getElementById('cloudKey');
     const cloudStateEl = document.getElementById('cloudState');
+    const modeSelect = document.getElementById('mode');
     const CLOUD_PROVIDERS = ['deepseek', 'anthropic', 'openai', 'custom', 'mock'];
 
     let nextId = 1;
     let busy = false;               // one request at a time, like the Streamlit UI
     let activeId = null;            // turn whose request is in flight (what Stop cancels)
-    const turns = new Map();        // id -> { prompt, req, analysis, el, pendingEl, stream }
+    const turns = new Map();        // id -> { prompt, req, analysis, el, pendingEl, stream } (agent: { agent, runId, ... })
+    let agentHistory = [];          // finished agent tasks { prompt, summary }, sent along for follow-ups
+
+    const PLACEHOLDERS = {
+        ask: 'Ask LocalPilot about your repository… (Enter to send, Shift+Enter for newline)',
+        agent: 'Describe the change you want. The agent reads the code, proposes edits for you to review, and runs tests…'
+    };
+    const savedState = (() => { try { return vscode.getState() || {}; } catch { return {}; } })();
+    function applyMode(mode) {
+        modeSelect.value = ['ask', 'agent-cloud', 'agent-local'].includes(mode) ? mode : 'ask';
+        input.placeholder = modeSelect.value === 'ask' ? PLACEHOLDERS.ask : PLACEHOLDERS.agent;
+    }
+    applyMode(savedState.mode);
 
     const EXAMPLES = [
         'Explain what the selected code does',
@@ -229,6 +242,11 @@
     function send() {
         const prompt = input.value.trim();
         if (!prompt || busy) return;
+        if (modeSelect.value !== 'ask') {
+            sendAgent(prompt, modeSelect.value === 'agent-local' ? 'local' : 'cloud');
+            input.value = '';
+            return;
+        }
         const id = nextId++;
         addCard('<b>You:</b> ' + esc(prompt), 'msg user');
         const el = addCard('');
@@ -286,6 +304,7 @@
             vscode.postMessage({ type: 'cancel', id: activeId });
         }
         turns.clear();
+        agentHistory = [];
         history.innerHTML = '';
         setBusy(false);
         updateEmptyState();
@@ -536,6 +555,275 @@
         turn.pendingEl = null;
     }
 
+    // ---- Agent mode -----------------------------------------------------------------------
+    // The agent works in steps (read, search, edit, run) shown live in its card. Its edits are
+    // staged by the backend and listed at the end for review: Diff opens VS Code's diff editor,
+    // Accept writes the file, Reject drops it. Commands wait for Run / Skip in the card.
+
+    function sendAgent(prompt, route) {
+        const id = nextId++;
+        addCard('<b>You:</b> ' + esc(prompt), 'msg user');
+        const el = addCard(
+            '<span class="badge agent">🛠 Agent · ' + (route === 'local' ? 'local LLM' : 'global LLM') + '</span>' +
+            '<div class="metrics agent-metrics"><span class="spinner">Starting the agent…</span></div>' +
+            '<details class="acc agent-log" open><summary>Steps</summary><div class="acc-body agent-steps"></div></details>' +
+            '<div class="agent-live muted"></div>' +
+            '<div class="agent-final"></div>', 'msg agent');
+        turns.set(id, { prompt, el, agent: true, route, stepCount: 0 });
+        setBusy(true, id);
+        vscode.postMessage({ type: 'agentRun', id, prompt, route, history: agentHistory.slice(-3) });
+    }
+
+    function code(s) { return '<code>' + esc(s) + '</code>'; }
+
+    function stepLabel(name, a) {
+        a = a || {};
+        switch (name) {
+            case 'read_file':
+                return 'Read ' + code(a.path) + (a.start_line || a.end_line
+                    ? ' <span class="muted">lines ' + esc(a.start_line || 1) + '–' + esc(a.end_line || 'end') + '</span>' : '');
+            case 'list_files': return 'List ' + code(a.path || '.') + (a.recursive ? ' <span class="muted">(recursive)</span>' : '');
+            case 'search': return 'Search ' + code(a.pattern) + (a.glob ? ' in ' + code(a.glob) : '') +
+                (a.path && a.path !== '.' ? ' under ' + code(a.path) : '');
+            case 'edit_file': return 'Edit ' + code(a.path);
+            case 'write_file': return 'Write ' + code(a.path);
+            case 'delete_file': return 'Delete ' + code(a.path);
+            case 'run_command': return 'Run ' + code(a.command) + (a.cwd && a.cwd !== '.' ? ' in ' + code(a.cwd) : '');
+            default: return esc(name);
+        }
+    }
+
+    function agentStepsEl(turn) { return turn.el.querySelector('.agent-steps'); }
+
+    function appendStep(turn, html, cls) {
+        const div = document.createElement('div');
+        div.className = cls;
+        div.innerHTML = html;
+        agentStepsEl(turn).appendChild(div);
+        return div;
+    }
+
+    function setAgentStatus(turn, html) {
+        turn.el.querySelector('.agent-metrics').innerHTML = html;
+    }
+
+    function onAgentEvent(id, event, data) {
+        const turn = turns.get(id);
+        if (!turn || turn.stopped) return;
+        switch (event) {
+            case 'start':
+                turn.runId = data.run_id;
+                turn.model = data.model;
+                setAgentStatus(turn, '<b>Model:</b> ' + esc(data.model) + ' · <span class="spinner">working…</span>');
+                if (data.warning) {
+                    turn.el.querySelector('.agent-metrics').insertAdjacentHTML('afterend', '<div class="warn">⚠️ ' + esc(data.warning) + '</div>');
+                }
+                break;
+            case 'progress':
+                // A slow local step: show that tokens are still coming.
+                setAgentStatus(turn, '<b>Model:</b> ' + esc(turn.model || '') +
+                    ' · <span class="spinner">generating… ' + fmt(data.tokens) + ' tokens</span>');
+                break;
+            case 'notice':
+                appendStep(turn, '<span class="warn">⚠ ' + esc(data.text) + '</span>', 'agent-step');
+                break;
+            case 'thought': {
+                const div = appendStep(turn, '', 'agent-thought answer');
+                fillMarkdown(div, data.text);
+                break;
+            }
+            case 'tool_call':
+                turn.stepCount++;
+                appendStep(turn, '<span class="step-icon spinner">…</span> ' + stepLabel(data.name, data.args), 'agent-step')
+                    .dataset.call = data.call_id;
+                break;
+            case 'tool_result': {
+                setAgentStatus(turn, '<b>Model:</b> ' + esc(turn.model || '') + ' · <span class="spinner">working…</span>');
+                const step = agentStepsEl(turn).querySelector('.agent-step[data-call="' + CSS.escape(data.call_id) + '"]');
+                if (!step) break;
+                const icon = step.querySelector('.step-icon');
+                icon.className = 'step-icon ' + (data.ok ? 'ok' : 'fail');
+                icon.textContent = data.ok ? '✓' : '✗';
+                if (data.output) {
+                    const exit = data.name === 'run_command' && /\[exit code (-?\d+)\]/.exec(data.output);
+                    const label = exit ? 'output · exit ' + exit[1] : (data.ok ? 'output' : 'error');
+                    if (exit && exit[1] !== '0') icon.className = 'step-icon fail';
+                    step.insertAdjacentHTML('beforeend', accordion(esc(label), '<pre class="tool-out">' + esc(data.output) + '</pre>'));
+                }
+                break;
+            }
+            case 'changes': {
+                const list = data.changes || [];
+                turn.el.querySelector('.agent-live').innerHTML = list.length
+                    ? 'Staged so far: ' + list.map(c => code(c.path) + ' <span class="adds">+' + esc(c.additions) +
+                        '</span> <span class="dels">−' + esc(c.deletions) + '</span>').join(', ')
+                    : '';
+                break;
+            }
+            case 'approval':
+                if (data.kind === 'sensitive_files') {
+                    const files = data.files || [];
+                    const card = appendStep(turn,
+                        '<div><b>Copy files that may hold secrets into the sandbox?</b> <span class="muted">(the sandbox copies the whole workspace, gitignored files included, to run commands; these look like credentials)</span></div>' +
+                        '<pre class="tool-out">' + files.map(esc).join('\n') + '</pre>' +
+                        '<div class="choices">' +
+                            '<button data-approve="run" data-id="' + id + '" data-request="' + esc(data.request_id) + '">Include</button>' +
+                            '<button class="secondary" data-approve="skip" data-id="' + id + '" data-request="' + esc(data.request_id) + '" title="Run commands without these files">Leave out</button>' +
+                        '</div>', 'agent-approval');
+                    card.dataset.request = data.request_id;
+                    card.dataset.kind = data.kind;
+                    setAgentStatus(turn, '<b>Model:</b> ' + esc(turn.model || '') + ' · <span class="warn">waiting for your approval</span>');
+                    break;
+                }
+                appendStep(turn,
+                    '<div><b>Run this command?</b> <span class="muted">(in a sandbox copy of the workspace with the proposed changes; your files are not touched)</span></div>' +
+                    '<pre class="tool-out">' + esc(data.command) + '</pre>' +
+                    (data.cwd && data.cwd !== '.' ? '<div class="muted">in ' + code(data.cwd) + '</div>' : '') +
+                    '<div class="choices">' +
+                        '<button data-approve="run" data-id="' + id + '" data-request="' + esc(data.request_id) + '">▶ Run</button>' +
+                        '<button class="secondary" data-approve="always" data-id="' + id + '" data-request="' + esc(data.request_id) + '" title="Run this and every further command in this task without asking">Run all for this task</button>' +
+                        '<button class="secondary" data-approve="skip" data-id="' + id + '" data-request="' + esc(data.request_id) + '">Skip</button>' +
+                    '</div>', 'agent-approval').dataset.request = data.request_id;
+                setAgentStatus(turn, '<b>Model:</b> ' + esc(turn.model || '') + ' · <span class="warn">waiting for your approval</span>');
+                break;
+            case 'approval_resolved': {
+                const card = agentStepsEl(turn).querySelector('.agent-approval[data-request="' + CSS.escape(data.request_id) + '"]');
+                const choices = card && card.querySelector('.choices');
+                const labels = card && card.dataset.kind === 'sensitive_files' ? ['✓ Included', '✗ Left out'] : ['✓ Approved', '✗ Skipped'];
+                if (choices) choices.outerHTML = '<div class="muted">' + labels[data.approved ? 0 : 1] + '</div>';
+                setAgentStatus(turn, '<b>Model:</b> ' + esc(turn.model || '') + ' · <span class="spinner">working…</span>');
+                break;
+            }
+        }
+    }
+
+    function changeRow(id, c) {
+        const letter = { added: 'A', modified: 'M', deleted: 'D' }[c.status] || '?';
+        return '<div class="change-row" data-path="' + esc(c.path) + '">' +
+            '<span class="chg-status ' + esc(c.status) + '" title="' + esc(c.status) + '">' + letter + '</span>' +
+            '<a href="#" class="chg-path" data-agent="open" data-id="' + id + '" data-path="' + esc(c.path) + '" title="Show the diff">' + esc(c.path) + '</a>' +
+            '<span class="adds">+' + esc(c.additions) + '</span><span class="dels">−' + esc(c.deletions) + '</span>' +
+            '<span class="row-actions">' +
+                '<button class="icon-btn" data-agent="review" data-id="' + id + '" data-path="' + esc(c.path) + '" title="Show the change in the file itself, with Accept / Reject per change">Review in file</button>' +
+                '<button class="icon-btn" data-agent="diff" data-id="' + id + '" data-path="' + esc(c.path) + '" title="Open in the side-by-side diff editor">Diff</button>' +
+                '<button class="icon-btn accept" data-agent="accept" data-id="' + id + '" data-path="' + esc(c.path) + '" title="Write this change to the file">✓ Accept</button>' +
+                '<button class="icon-btn reject" data-agent="reject" data-id="' + id + '" data-path="' + esc(c.path) + '" title="Discard this change">✗ Reject</button>' +
+            '</span></div>';
+    }
+
+    /** Run the same task again on the other model (e.g. after a small local model gave up). */
+    function retryButton(id, turn) {
+        const other = turn.route === 'local' ? 'cloud' : 'local';
+        return '<div class="choices"><button class="secondary" data-agent="retry" data-route="' + other + '" data-id="' + id + '">' +
+            (other === 'cloud' ? '☁️ Retry with global LLM' : '🖥️ Retry with local LLM') + '</button></div>';
+    }
+
+    function renderAgentResult(id, r) {
+        const turn = turns.get(id);
+        const changes = r.changes || [];
+        const commands = r.commands || [];
+        const log = turn.el.querySelector('.agent-log');
+        log.open = false;
+        log.querySelector('summary').textContent = 'Steps · ' + turn.stepCount + ' tool call' + (turn.stepCount === 1 ? '' : 's');
+        turn.el.querySelector('.agent-live').innerHTML = '';
+        setAgentStatus(turn, '<b>Model:</b> ' + esc(r.model) + ' · ' + esc(r.steps) + ' step' + (r.steps === 1 ? '' : 's') +
+            ' · ' + fmt(r.latency_ms) + ' ms' +
+            (r.route === 'cloud'
+                ? ' · ' + fmt(r.input_tokens) + ' in / ' + fmt(r.output_tokens) + ' out tokens' +
+                  (r.secrets_masked ? ' · ' + esc(r.secrets_masked) + ' secret(s) masked' : '')
+                : ' · <b>0</b> tokens sent to cloud'));
+        const cmdList = commands.map(c => '<li>' + code(c.command) + ' — ' +
+            (c.declined ? 'skipped' : (c.exit_code === 0 ? '✓ exit 0' : '✗ exit ' + esc(c.exit_code))) + '</li>').join('');
+        const panel = changes.length
+            ? '<div class="agent-changes">' +
+                '<div class="agent-changes-head"><b>Proposed changes · ' + changes.length + ' file' + (changes.length === 1 ? '' : 's') + '</b>' +
+                    '<span class="row-actions">' +
+                        '<button class="icon-btn accept" data-agent="accept-all" data-id="' + id + '">✓ Accept all</button>' +
+                        '<button class="icon-btn reject" data-agent="reject-all" data-id="' + id + '">✗ Reject all</button>' +
+                    '</span></div>' +
+                changes.map(c => changeRow(id, c)).join('') +
+                '<div class="muted">Nothing is saved until you accept. Changed files open with the edits marked in place ' +
+                    '(red = removed, green = added) and Accept / Reject above each change.</div>' +
+              '</div>'
+            : '<div class="muted">No file changes proposed.</div>';
+        const final = turn.el.querySelector('.agent-final');
+        final.innerHTML =
+            (r.is_mock ? '<div class="warn">⚠️ Mock agent: no real model ran.</div>' : '') +
+            (r.stopped_reason === 'max_steps' ? '<div class="warn">The agent hit its step limit before finishing.</div>' : '') +
+            (r.stopped_reason === 'invalid_tool_calls' ? '<div class="warn">The model could not make valid tool calls.</div>' : '') +
+            '<div class="answer"></div>' + panel +
+            (cmdList ? accordion('Commands run · ' + commands.length, '<ul>' + cmdList + '</ul>') : '') +
+            retryButton(id, turn);
+        fillMarkdown(final.querySelector('.answer'), r.summary || '(no summary)');
+        turn.changePaths = changes.map(c => c.path);
+        agentHistory.push({ prompt: turn.prompt, summary: String(r.summary || '').slice(0, 1500) });
+    }
+
+    function renderAgentApplied(id, results) {
+        const turn = turns.get(id);
+        (results || []).forEach(res => {
+            const row = turn.el.querySelector('.change-row[data-path="' + CSS.escape(res.path) + '"]');
+            if (!row) return;
+            const actions = row.querySelector('.row-actions');
+            const label = row.querySelector('.chg-reviewing');
+            if (label) label.remove();
+            if (res.state === 'accepted' || res.state === 'partial') {
+                actions.innerHTML = '<span class="ok">' + (res.state === 'partial' ? '✓ Partly accepted' : '✓ Accepted') + '</span>';
+            } else if (res.state === 'cancelled') {
+                row.insertAdjacentHTML('beforeend', '<div class="muted row-note">Review closed without a decision; still pending.</div>');
+            } else if (res.state === 'rejected') {
+                actions.innerHTML = '<span class="muted">✗ Rejected</span>';
+                row.classList.add('rejected');
+            } else if (res.reason) {
+                row.insertAdjacentHTML('beforeend', '<div class="warn row-note">Not applied: ' + esc(res.reason) + '</div>');
+            }
+        });
+        const pending = turn.el.querySelectorAll('.change-row .row-actions button[data-agent="accept"]').length;
+        if (!pending) {
+            const head = turn.el.querySelector('.agent-changes-head .row-actions');
+            if (head) head.innerHTML = '';
+        }
+    }
+
+    function renderAgentStopped(id, message) {
+        const turn = turns.get(id);
+        turn.stopped = false;
+        turn.el.querySelectorAll('.agent-steps .step-icon.spinner').forEach(i => { i.className = 'step-icon fail'; i.textContent = '■'; });
+        turn.el.querySelectorAll('.agent-approval .choices').forEach(c => { c.outerHTML = '<div class="muted">not answered</div>'; });
+        setAgentStatus(turn, '<b>Model:</b> ' + esc(turn.model || '?'));
+        turn.el.querySelector('.agent-final').innerHTML = (message
+            ? '<div class="error">⚠️ ' + esc(message) + '</div><div class="muted">No files were changed.</div>'
+            : '<div class="cancelled">⏹ Stopped. No files were changed.</div>') + retryButton(id, turn);
+    }
+
+    function onAgentButton(target) {
+        const id = Number(target.dataset.id);
+        const turn = turns.get(id);
+        if (!turn) return;
+        if (target.dataset.approve) {
+            target.closest('.choices').querySelectorAll('button').forEach(b => { b.disabled = true; });
+            vscode.postMessage({
+                type: 'agentApprove', id, runId: turn.runId, requestId: target.dataset.request,
+                approved: target.dataset.approve !== 'skip', always: target.dataset.approve === 'always'
+            });
+            return;
+        }
+        const action = target.dataset.agent;
+        if (action === 'retry') {
+            if (!busy) sendAgent(turn.prompt, target.dataset.route);
+            return;
+        }
+        const pending = () => Array.from(turn.el.querySelectorAll('.change-row'))
+            .filter(r => r.querySelector('button[data-agent="accept"]')).map(r => r.dataset.path);
+        if (action === 'diff') vscode.postMessage({ type: 'agentDiff', id, path: target.dataset.path });
+        else if (action === 'review') vscode.postMessage({ type: 'agentReview', id, path: target.dataset.path });
+        else if (action === 'open') vscode.postMessage({ type: 'agentOpen', id, path: target.dataset.path });
+        else if (action === 'accept') vscode.postMessage({ type: 'agentAccept', id, paths: [target.dataset.path] });
+        else if (action === 'reject') vscode.postMessage({ type: 'agentReject', id, paths: [target.dataset.path] });
+        else if (action === 'accept-all') vscode.postMessage({ type: 'agentAccept', id, paths: pending() });
+        else if (action === 'reject-all') vscode.postMessage({ type: 'agentReject', id, paths: pending() });
+    }
+
     // ---- Status ---------------------------------------------------------------------------
 
     function renderStatus(m) {
@@ -643,6 +931,11 @@
     input.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
+    modeSelect.addEventListener('change', () => {
+        applyMode(modeSelect.value);
+        try { vscode.setState({ ...(vscode.getState() || {}), mode: modeSelect.value }); } catch { /* ignore */ }
+        input.focus();
+    });
     cloudProviderSel.addEventListener('change', () => {
         vscode.postMessage({ type: 'selectCloudProvider', provider: cloudProviderSel.value });
     });
@@ -659,6 +952,12 @@
         if (e.key === 'Escape' && busy) { e.preventDefault(); stop(); }
     });
     document.addEventListener('click', e => {
+        const agentEl = e.target.closest('[data-agent], button[data-approve]');
+        if (agentEl) {
+            e.preventDefault();
+            onAgentButton(agentEl);
+            return;
+        }
         const link = e.target.closest('a[href]');
         if (link) {
             // Webviews can't navigate; the extension opens http(s) links in the browser.
@@ -715,7 +1014,8 @@
         const m = event.data;
         const turn = turns.get(m.id);
         // A late reply for a turn that was cleared from the view: drop it.
-        if (['analysis', 'stream', 'result', 'error', 'cancelled'].includes(m.type) && m.id !== undefined && !turn) {
+        if (['analysis', 'stream', 'result', 'error', 'cancelled', 'agentEvent', 'agentResult', 'agentApplied', 'agentReviewing'].includes(m.type)
+            && m.id !== undefined && !turn) {
             if (m.id === activeId && m.type !== 'stream') setBusy(false);
             return;
         }
@@ -775,11 +1075,36 @@
                 else renderResult(m.id, m.result);
                 setBusy(false);
                 break;
+            case 'agentEvent':
+                onAgentEvent(m.id, m.event, m.data);
+                break;
+            case 'agentResult':
+                if (turn.stopped) renderAgentStopped(m.id);
+                else renderAgentResult(m.id, m.result);
+                setBusy(false);
+                break;
+            case 'agentApplied':
+                renderAgentApplied(m.id, m.results);
+                break;
+            case 'agentReviewing': {
+                const row = turn.el.querySelector('.change-row[data-path="' + CSS.escape(m.path) + '"]');
+                if (row && !row.querySelector('.chg-reviewing')) {
+                    row.querySelector('.chg-path').insertAdjacentHTML('afterend', '<span class="chg-reviewing" title="Open in the editor with the changes marked">● in editor</span>');
+                    row.querySelectorAll('.row-note').forEach(n => n.remove());
+                }
+                break;
+            }
             case 'cancelled':
-                renderCancelled(m.id);
+                if (turn.agent) renderAgentStopped(m.id);
+                else renderCancelled(m.id);
                 setBusy(false);
                 break;
             case 'error': {
+                if (turn && turn.agent) {
+                    renderAgentStopped(m.id, turn.stopped ? '' : m.message);
+                    setBusy(false);
+                    break;
+                }
                 if (turn && turn.stopped) { // an error from a run the user already stopped
                     renderCancelled(m.id);
                     setBusy(false);

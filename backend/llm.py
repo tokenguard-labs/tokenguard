@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import time
+from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Callable, Dict, Optional
@@ -246,6 +247,18 @@ async def switch_local_model(model: Optional[str], preload: bool = True) -> dict
         return {"loaded": _loaded_local_model, "previous": previous}
 
 
+@asynccontextmanager
+async def local_model_slot(model: str):
+    """Hold the local-model lock with `model` as the only one loaded (unloading any other first).
+    The lock also keeps a model switch (PUT /local-model) from racing the generation."""
+    global _loaded_local_model
+    async with _local_lock:
+        if _loaded_local_model and not _same_model(_loaded_local_model, model):
+            await _ollama_unload(_loaded_local_model)
+        _loaded_local_model = model
+        yield
+
+
 def parse_ps(data: dict) -> list[str]:
     """Model names Ollama reports as currently loaded (/api/ps)."""
     names = []
@@ -456,7 +469,6 @@ async def call_local(
     and the hard token cap behind it."""
     user_content = f"{prompt}\n\n### Code context\n{context}" if context else prompt
     model = effective_local_model()
-    global _loaded_local_model
     max_tokens = config.LOCAL_DETAILED_MAX_TOKENS if detail == "detailed" else config.LOCAL_BRIEF_MAX_TOKENS
     payload = {
         "model": model,
@@ -470,11 +482,7 @@ async def call_local(
         "options": {"temperature": 0.2, "num_ctx": config.LOCAL_NUM_CTX, "num_predict": max_tokens},
     }
     # Enforce one local model at a time: unload any other model before this one is loaded.
-    # The lock also keeps a model switch (PUT /local-model) from racing the generation.
-    async with _local_lock:
-        if _loaded_local_model and not _same_model(_loaded_local_model, model):
-            await _ollama_unload(_loaded_local_model)
-        _loaded_local_model = model
+    async with local_model_slot(model):
         start = time.perf_counter()
         stream = _JSONAnswerStream()
         data: Dict[str, Any] = {}

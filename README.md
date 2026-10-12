@@ -45,7 +45,7 @@ flowchart TD
 ### Step by step
 
 1. **Collect the request (sidebar).** The extension sends the prompt, the current editor selection (`code`) and the folder of the active file (`repo_path`).
-2. **Resolve the context sources (gateway).** If the prompt contains an absolute path to an existing folder, that folder becomes the repo to search. If it names a file, the file is attached as code and its project root (nearest `.git`, `package.json`, `pyproject.toml`, …) is searched. The path text is removed from the prompt. Otherwise the workspace folder is used.
+2. **Resolve the context sources (gateway).** If the prompt contains an absolute path to an existing folder, that folder becomes the repo to search. If it names a file, the file is attached as code and its project root (nearest `.git`, `package.json`, `pyproject.toml`, …) is searched. In the prompt, a file path is replaced by the file name and a folder path is removed; a file named several times (say, in every frame of a traceback) is attached once. Otherwise the workspace folder is used.
 3. **Analyze, no model called (`POST /analyze`).** The policy runs hard checks, local-model capability checks, then scores the task (0–100 → simple/medium/complex) and returns the initial route, the reasons, the files the context engine would select, and how many tokens the cloud would receive versus the full context.
 4. **Decide the route.**
    - `local` (simple) and `local_first` (medium, capable): the sidebar runs the local LLM automatically, then escalates only if the answer looks unreliable.
@@ -103,6 +103,17 @@ requests ("convert all the python code to typescript") get a signature map of ev
 The local model may only rerank a shortlist and propose missing names, which the index resolves.
 It degrades to the in-memory engine above on any error. Design: [`docs/codebase-intelligence.md`](docs/codebase-intelligence.md).
 
+### Agent mode
+
+Pick **Agent** in the sidebar's *Mode* menu (global or local LLM) to have LocalPilot make changes, not just answer:
+
+1. **Explore.** The model reads, lists and searches the workspace with tools, the same way a person would, before it changes anything.
+2. **Edit.** It makes exact string edits (`edit_file`), whole-file writes or deletions. Edits are **staged in the backend, never written to your files**.
+3. **Verify.** It runs tests, builds or quick scripts (`run_command`) in a **sandbox copy of the workspace with its staged edits applied**: every file is copied, gitignored ones included (only `.git` is left out), dependency folders (`node_modules`, `.venv`, …) are symlinked, the workspace's venv is put on `PATH`, and provider API keys are removed from the environment. Before the first command, files that look like credentials (`.env`, private keys, gitignored files containing API keys, …) are listed and you choose **Include** or **Leave out**. Every command waits for **Run / Run all for this task / Skip** in the sidebar. If something fails, the agent fixes it and runs it again.
+4. **Review.** Each modified file opens with the changes marked **in the file itself**, as in Cursor: removed lines in red, the new lines in green right below them, and **✓ Accept / ✗ Reject** above every change (plus *Accept all / Reject all* at the top). Accepting a change drops its red lines, rejecting drops the green ones; when every change in the file is decided it is saved. Until then the edit exists only in the unsaved editor buffer. The sidebar card lists every file with **Review in file**, **Diff** (side-by-side diff editor), **Accept** and **Reject**; new and deleted files are only shown in the file when you click *Review in file*. If a file changed after the agent read it, you are asked first. Turn off the automatic in-file review with `tokenguard.agentInlineReview`.
+
+Steps, tool output and approvals stream live into the card; **Stop** cancels the run without touching any file. On the global route, secrets in anything sent to the model are replaced with placeholders and restored in the agent's edits. The local route needs a tool-capable model. `qwen2.5-coder:7b` handles real tasks; models under ~7B (such as the default 1.5b) get a warning, because they often pick the wrong line or loop on the same failing edit. The loop guards against that: malformed tool calls and empty replies are sent back with instructions, failed edits list the matching lines, a repeated failing call stops the run with a clear message, and `finish` is refused while a changed Python/JSON file does not parse (compiled, never run). Files named in the prompt (for example in a pasted traceback) are given to the agent up front. Code: `backend/agent.py` (loop, approvals, secret masking), `backend/agent_tools.py` (staged workspace, sandbox, tools), `backend/agent_llm.py` (tool calling for OpenAI-compatible APIs, Anthropic and Ollama), `extension/src/inlineDiff.ts` (in-file review).
+
 ---
 
 ## Repository layout
@@ -110,7 +121,7 @@ It degrades to the in-memory engine above on any error. Design: [`docs/codebase-
 | Path | What |
 |---|---|
 | `backend/` | LLM gateway service (FastAPI): `analyzer.py` (complexity scoring), `routing.py` (routing/escalation policy), `router.py` (pipeline), `context.py` (path resolution + optimizer adapter), `llm.py` (Ollama + cloud clients), `main.py` (API). Also holds `.env`, `requirements.txt`, `ROUTING.md` |
-| `backend/` (cont.) | `classifier.py` (local-LLM complexity tie-breaker), `config.py` (all settings, validated on startup), `cloud_catalog.py` / `model_catalog.py` (cloud and local model metadata) |
+| `backend/` (cont.) | `agent.py`, `agent_tools.py`, `agent_llm.py` (agent mode), `classifier.py` (local-LLM complexity tie-breaker), `config.py` (all settings, validated on startup), `cloud_catalog.py` / `model_catalog.py` (cloud and local model metadata) |
 | `compression/` | Context compression: `adapter.py` (contract the gateway calls), `codeindex/` (persistent SQLite index, hybrid retrieval, adequacy), `context_engine/` (in-memory fallback: walker, chunker, selector, import graph, budget allocator, redaction) |
 | `extension/` | VS Code extension (frontend): the LocalPilot sidebar (`src/extension.ts`) and the backend launcher (`src/backend.ts`) |
 | `scripts/` | `setup.sh` (used by `make setup`), `stop.sh` (used by `make stop`), `streamlit_ui.py` (optional browser UI with the same flow as the sidebar), `smoke_test.py` (calls a running API) |
@@ -127,6 +138,8 @@ All Python runs from the repo root: `backend` and `compression` are sibling pack
 | `POST /analyze` | `{prompt, code, repo_path, force_route?}` → decision, complexity, reasons, repo searched, files selected, token and cost estimate, plus the same routing metadata as `/chat`. No model called. |
 | `POST /chat` | Same body + `force_route: auto \| local \| cloud` and `detail: brief \| detailed` → answer, route, model, confidence, `low_confidence`, `more_available`, `truncated`, tokens sent/saved, files, secrets masked, trace, plus routing metadata (`requested_route`, `initial_route`, `final_route`, `complexity`, `complexity_score_100`, `local_capable`, `capability_reasons`, `escalation_kind`) and `context_metadata` (retrieval coverage, adequacy, evidence) |
 | `POST /chat/stream` | Same as `/chat`, streamed as Server-Sent Events: `start` {route, model} when a model begins answering, `delta` {text} per token chunk, `reset` {reason} if the text so far is discarded, then `done` {the `/chat` response} or `error` {status, message}. Sends a `: ping` comment every `SSE_HEARTBEAT_S` (15s) while idle. Used by the VS Code sidebar. |
+| `POST /agent/stream` | Agent mode, as Server-Sent Events. Body `{prompt, repo_path, code, active_file, route: cloud \| local, history}`. Events: `start` {run_id, model}, `thought` {text}, `tool_call` {call_id, name, args}, `tool_result` {call_id, ok, output}, `changes` {staged file stats}, `approval` {request_id, command, cwd}, `approval_resolved`, then `done` {summary, changes: [{path, status, original, proposed, diff, additions, deletions}], commands, tokens} or `error`. Never writes to the repo. |
+| `POST /agent/approve` | `{run_id, request_id, approved, always}`: answers an `approval` event (`always` approves the rest of the run's commands) |
 | `GET /stats` | Session totals: local/cloud requests, escalations, tokens saved |
 | `GET /health` | Backend status, Ollama reachability, active local model + available local models, active cloud provider/model, and whether its API key validated |
 | `GET /models` | Installed local models + active/loaded one, host resources (RAM/swap/VRAM), and recommended models that fit and can be pulled |
@@ -222,6 +235,10 @@ python -m pytest tests                    # all Python tests (same as make test)
 | `CLOUD_MAX_CONTEXT_TOKENS` | `16000` | Cap on context sent to a cloud model |
 | `CLOUD_CONTEXT_TOKEN_BUDGET` | `3000` | Fallback context budget when none is computed for the request |
 | `CONTEXT_INDEX_ENABLED`, `CONTEXT_LLM_ASSIST`, `CONTEXT_SEMANTIC_ENABLED` | `true` | Codebase index, local-model rerank/propose, and semantic retrieval (each fails open) |
+| `AGENT_MAX_STEPS`, `AGENT_COMMAND_TIMEOUT_S` | `30`, `180` | Agent: model calls per task, and the per-command time limit |
+| `AGENT_AUTO_APPROVE_COMMANDS` | `false` | Run agent commands without asking (they still run only in the sandbox copy) |
+| `AGENT_SHADOW_MAX_MB`, `AGENT_CONTEXT_TOKENS`, `AGENT_LOCAL_NUM_CTX` | `300`, `60000`, `16384` | Largest repo the sandbox copies, transcript budget before old tool output is elided, local agent context window |
+| `AGENT_LOCAL_TIMEOUT_S` | `600` | Max wait for the next chunk of a local agent step (covers a cold model load on CPU) |
 
 Every setting, with comments, is in [`backend/.env.example`](backend/.env.example).
 

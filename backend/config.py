@@ -183,3 +183,23 @@ validate()
 # POST /chat/stream sends an SSE comment this often (seconds) while no tokens are flowing (e.g. a
 # cold local model loading), so clients can use a short idle timeout instead of a huge total one.
 SSE_HEARTBEAT_S = float(os.getenv("SSE_HEARTBEAT_S", "15"))
+
+# --- Agent mode (POST /agent/stream) ---------------------------------------------------------
+# The agent explores the repo with tools, stages edits (never written to disk: the editor shows
+# them as diffs to accept or reject) and runs commands in a sandbox copy with those edits applied.
+AGENT_MAX_STEPS = int(os.getenv("AGENT_MAX_STEPS", "30"))  # model calls per task
+AGENT_COMMAND_TIMEOUT_S = float(os.getenv("AGENT_COMMAND_TIMEOUT_S", "180"))
+AGENT_TOOL_OUTPUT_CHARS = int(os.getenv("AGENT_TOOL_OUTPUT_CHARS", "16000"))  # per tool result
+AGENT_MAX_READ_LINES = int(os.getenv("AGENT_MAX_READ_LINES", "600"))  # per read_file call
+# The sandbox copies every file in the repo, gitignored ones included (dependency folders are
+# symlinked); above this size commands are disabled rather than copying a huge tree.
+AGENT_SHADOW_MAX_MB = int(os.getenv("AGENT_SHADOW_MAX_MB", "300"))
+# Transcript budget: older tool results are elided once the conversation grows past it.
+AGENT_CONTEXT_TOKENS = int(os.getenv("AGENT_CONTEXT_TOKENS", "60000"))
+# Context window for a local agent; agent transcripts outgrow the chat default quickly.
+AGENT_LOCAL_NUM_CTX = int(os.getenv("AGENT_LOCAL_NUM_CTX", "16384"))
+# Max wait for the next chunk from a local agent step. The first one waits for a model load plus
+# evaluating the whole transcript on CPU, far longer than a chat prompt.
+AGENT_LOCAL_TIMEOUT_S = float(os.getenv("AGENT_LOCAL_TIMEOUT_S", "600"))
+# Run agent commands without asking. Off by default: every command needs approval in the sidebar.
+AGENT_AUTO_APPROVE_COMMANDS = os.getenv("AGENT_AUTO_APPROVE_COMMANDS", "false").lower() in ("1", "true", "yes")
