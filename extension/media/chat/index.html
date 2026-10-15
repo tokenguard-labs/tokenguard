@@ -14,6 +14,7 @@
     <div class="container">
         <header class="top">
             <div id="status" class="status">Connecting to LocalPilot backend…</div>
+            <div id="ollamaState" class="ollama-state"><span class="spinner">Checking Ollama server…</span></div>
             <details id="cloudSection" class="section">
                 <summary>Cloud model</summary>
                 <div class="section-body">
@@ -46,6 +47,12 @@
                 <select id="localModel" title="Ollama model used for local inference"></select>
             </div>
             <div id="modelState" class="muted"></div>
+            <div id="setupCard" class="setup-card" hidden></div>
+            <div id="downloads" class="downloads"></div>
+            <details id="modelsSection" class="section">
+                <summary>Manage local models</summary>
+                <div id="modelsList" class="section-body"></div>
+            </details>
             <div id="systemInfo" class="muted"></div>
         </header>
 

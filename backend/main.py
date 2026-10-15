@@ -149,7 +149,8 @@ _RECOMMENDED_FIELDS = ("name", "params", "size_gb", "min_ram_gb", "comfortable",
 
 async def _local_model_info() -> Dict[str, Any]:
     """Installed local models, host resources, and pullable recommendations that fit."""
-    reachable, installed = await llm.ollama_models()
+    reachable, installed_list = await llm.ollama_model_list()
+    installed = [m["name"] for m in installed_list]
     resources = system.system_resources()
     recommended = [
         {k: m[k] for k in _RECOMMENDED_FIELDS}
@@ -161,8 +162,10 @@ async def _local_model_info() -> Dict[str, Any]:
         "local_model": llm.effective_local_model(),
         "local_loaded": llm.loaded_local_model(),
         "installed": installed,
+        "installed_sizes": {m["name"]: m["size"] for m in installed_list},
         "recommended": recommended,
         "pulling": llm.pulling_models(),
+        "pull_progress": llm.pull_progress(),
         "system": resources,
     }
 
@@ -175,8 +178,10 @@ async def models():
         "local_model": info["local_model"],
         "local_loaded": info["local_loaded"],
         "available": info["installed"],
+        "installed_sizes": info["installed_sizes"],
         "recommended": info["recommended"],
         "pulling": info["pulling"],
+        "pull_progress": info["pull_progress"],
         "system": info["system"],
         "ollama": info["ollama"],
     }
@@ -222,6 +227,33 @@ async def pull_model(req: PullRequest):
     if name in installed:
         return {"model": name, "status": "installed"}
     return {"model": name, "status": llm.start_pull(name)}
+
+
+@app.get("/models/pull")
+async def pull_progress():
+    """Download progress per model: state, Ollama's status line, bytes completed/total, percent."""
+    return llm.pull_progress()
+
+
+@app.post("/models/pull/cancel")
+async def cancel_pull(req: PullRequest):
+    """Stop an in-flight download. Ollama keeps finished layers, so pulling again resumes."""
+    return {"model": req.model, "cancelled": llm.cancel_pull(req.model.strip())}
+
+
+@app.delete("/models/{name:path}")
+async def delete_model(name: str):
+    """Delete a pulled model from disk to free space (unloads it first if it is in memory)."""
+    name = name.strip()
+    if not name:
+        raise HTTPException(400, "model name is required")
+    try:
+        await llm.delete_local_model(name)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Ollama could not delete {name!r}: {e}")
+    return {"model": name, "deleted": True}
 
 
 class LocalModelRequest(BaseModel):
@@ -470,6 +502,8 @@ async def health(force: bool = False):
         "local_models": local["installed"],
         "local_recommended": local["recommended"],
         "local_pulling": local["pulling"],
+        "local_pull_progress": local["pull_progress"],
+        "local_sizes": local["installed_sizes"],
         "system": local["system"],
         "cloud_provider": cloud["provider"],
         "cloud_model": cloud["model"],

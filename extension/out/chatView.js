@@ -101,11 +101,40 @@ class LocalPilotViewProvider {
             switch (data.type) {
                 case 'ready':
                     this._postContext();
+                    // Opening the sidebar checks Ollama right away (and starts it if it is down).
+                    this.postOllamaState();
+                    void this._host.ollama()?.ensureRunning();
                     await this._postStatus();
                     void this._postCloudModels();
                     break;
                 case 'refreshStatus':
                     await this._host.backend()?.ensureRunning();
+                    await this._postStatus();
+                    break;
+                case 'startOllama':
+                    await vscode.commands.executeCommand('tokenguard.startOllama');
+                    await this._postStatus();
+                    break;
+                case 'installOllama':
+                    await vscode.commands.executeCommand('tokenguard.installOllama');
+                    await this._postStatus();
+                    break;
+                case 'showOllamaLog':
+                    await vscode.commands.executeCommand('tokenguard.showBackendLog');
+                    break;
+                case 'downloadModel':
+                    await this._host.downloadLocalModel(String(data.model ?? ''));
+                    await this._postStatus();
+                    break;
+                case 'cancelDownload':
+                    await this._host.cancelDownload(String(data.model ?? ''));
+                    break;
+                case 'deleteModel':
+                    if (await this._host.deleteLocalModel(String(data.model ?? ''), Number(data.size) || undefined)) {
+                        if (this._preloadedFor === data.model) {
+                            this._preloadedFor = undefined;
+                        }
+                    }
                     await this._postStatus();
                     break;
                 case 'sendPrompt':
@@ -153,12 +182,16 @@ class LocalPilotViewProvider {
                 case 'selectLocalModel': {
                     const model = (data.model || '');
                     if (model && data.installed === false) {
-                        const size = data.size_gb ? ` (~${data.size_gb} GB)` : '';
-                        const choice = await vscode.window.showInformationMessage(`"${model}" isn't downloaded yet${size}. Download it now?`, { modal: false }, 'Download');
-                        if (choice !== 'Download') {
-                            await this._postStatus(); // reset the dropdown to the saved value
-                            break;
+                        // `confirmed`: the user already agreed in the sidebar (first-run / Download button).
+                        if (!data.confirmed) {
+                            const size = data.size_gb ? ` (~${data.size_gb} GB)` : '';
+                            const choice = await vscode.window.showInformationMessage(`"${model}" isn't downloaded yet${size}. Download it now?`, { modal: false }, 'Download');
+                            if (choice !== 'Download') {
+                                await this._postStatus(); // reset the dropdown to the saved value
+                                break;
+                            }
                         }
+                        void this._postStatus(); // show the progress bar straight away
                         if (!(await this._host.downloadLocalModel(model))) {
                             await this._postStatus();
                             break;
@@ -223,6 +256,17 @@ class LocalPilotViewProvider {
     }
     refreshStatus() {
         void this._postStatus();
+    }
+    /** Tell the sidebar whether Ollama is being checked, started, running or failed. */
+    postOllamaState() {
+        const ollama = this._host.ollama();
+        if (ollama) {
+            this._post({ type: 'ollama', state: ollama.state, error: ollama.lastError });
+        }
+    }
+    /** Live download progress (model -> state/bytes/percent) for the sidebar's progress bars. */
+    postPullProgress(progress) {
+        this._post({ type: 'pullProgress', progress });
     }
     /** "TokenGuard: Clear Chat": stop any request and show the empty state again. */
     clearChat() {

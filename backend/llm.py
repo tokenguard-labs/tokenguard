@@ -98,8 +98,8 @@ def effective_local_model() -> str:
     return (ov.local_model if ov and ov.local_model else None) or config.LOCAL_MODEL
 
 
-async def ollama_models() -> tuple[bool, list[str]]:
-    """(reachable, names) of the models Ollama has pulled. Names is empty when unreachable."""
+async def ollama_model_list() -> tuple[bool, list[dict]]:
+    """(reachable, [{name, size}]) for the models Ollama has pulled; size is bytes on disk."""
     try:
         async with httpx.AsyncClient(timeout=3) as client:
             resp = await client.get(f"{config.OLLAMA_URL}/api/tags")
@@ -108,8 +108,18 @@ async def ollama_models() -> tuple[bool, list[str]]:
     except Exception as e:
         log.warning("could not list Ollama models: %s", e)
         return False, []
-    names = [(m.get("name") or m.get("model")) for m in data.get("models", [])]
-    return True, sorted({n for n in names if n})
+    models: dict[str, int] = {}
+    for m in data.get("models", []):
+        name = m.get("name") or m.get("model")
+        if name:
+            models[name] = int(m.get("size") or 0)
+    return True, [{"name": n, "size": models[n]} for n in sorted(models)]
+
+
+async def ollama_models() -> tuple[bool, list[str]]:
+    """(reachable, names) of the models Ollama has pulled. Names is empty when unreachable."""
+    reachable, models = await ollama_model_list()
+    return reachable, [m["name"] for m in models]
 
 
 async def list_local_models() -> list[str]:
@@ -133,7 +143,10 @@ async def ollama_reachable(force: bool = False) -> bool:
 
 
 # --- Model downloads (ollama pull) --------------------------------------------------------
-_pulls: dict[str, str] = {}  # model name -> "pulling" | "installed" | "error: ..."
+_pulls: dict[str, str] = {}  # model name -> "pulling" | "installed" | "cancelled" | "error: ..."
+# model name -> {"status", "completed", "total", "percent"}; bytes summed over every layer seen
+_pull_progress: dict[str, dict] = {}
+_pull_tasks: dict[str, asyncio.Task] = {}
 
 
 def pull_status(name: str) -> Optional[str]:
@@ -144,7 +157,27 @@ def pulling_models() -> list[str]:
     return [name for name, status in _pulls.items() if status == "pulling"]
 
 
+def pull_progress() -> dict[str, dict]:
+    """Progress of every download this backend started (finished ones keep their final state)."""
+    return {name: {**_pull_progress.get(name, {}), "state": state} for name, state in _pulls.items()}
+
+
+def _record_progress(name: str, layers: dict[str, tuple[int, int]], chunk: dict) -> None:
+    digest = chunk.get("digest")
+    if digest and chunk.get("total"):
+        layers[digest] = (int(chunk.get("completed") or 0), int(chunk["total"]))
+    completed = sum(c for c, _ in layers.values())
+    total = sum(t for _, t in layers.values())
+    _pull_progress[name] = {
+        "status": chunk.get("status") or "",
+        "completed": completed,
+        "total": total,
+        "percent": round(100 * completed / total, 1) if total else 0.0,
+    }
+
+
 async def _run_pull(name: str) -> None:
+    layers: dict[str, tuple[int, int]] = {}  # digest -> (completed, total)
     try:
         # timeout=None: a model download can take many minutes
         async with httpx.AsyncClient(timeout=None) as client:
@@ -161,11 +194,20 @@ async def _run_pull(name: str) -> None:
                         continue
                     if chunk.get("error"):
                         raise RuntimeError(chunk["error"])  # Ollama streams errors with HTTP 200
+                    _record_progress(name, layers, chunk)
         _pulls[name] = "installed"
+        done = _pull_progress.get(name, {})
+        # Ollama's last per-layer update often stops short of the total; success means all of it.
+        _pull_progress[name] = {**done, "completed": done.get("total", 0), "percent": 100.0}
         log.info("pulled local model %s", name)
+    except asyncio.CancelledError:
+        _pulls[name] = "cancelled"  # Ollama keeps the finished layers, so a retry resumes
+        log.info("cancelled pull of %s", name)
     except Exception as e:
         _pulls[name] = f"error: {_describe_error(e)}"
         log.warning("pull failed for %s: %s", name, _describe_error(e))
+    finally:
+        _pull_tasks.pop(name, None)
 
 
 def start_pull(name: str) -> str:
@@ -173,8 +215,40 @@ def start_pull(name: str) -> str:
     if _pulls.get(name) == "pulling":
         return "pulling"
     _pulls[name] = "pulling"
-    asyncio.create_task(_run_pull(name))
+    _pull_progress[name] = {"status": "starting", "completed": 0, "total": 0, "percent": 0.0}
+    _pull_tasks[name] = asyncio.create_task(_run_pull(name))
     return "pulling"
+
+
+def cancel_pull(name: str) -> bool:
+    """Stop an in-flight download (closing the stream makes Ollama abort it)."""
+    task = _pull_tasks.get(name)
+    if not task or task.done():
+        return False
+    task.cancel()
+    return True
+
+
+async def delete_local_model(name: str) -> None:
+    """Remove a pulled model from disk (unloading it first if it is in memory)."""
+    global _loaded_local_model
+    async with _local_lock:
+        if _same_model(_loaded_local_model, name):
+            _loaded_local_model = None
+        await _ollama_unload(name)
+        async with httpx.AsyncClient(timeout=30) as client:
+            # "model" is the current field; older Ollama versions read "name"
+            resp = await client.request(
+                "DELETE", f"{config.OLLAMA_URL}/api/delete", json={"model": name, "name": name}
+            )
+        if resp.status_code == 404:
+            raise LookupError(f"model {name!r} is not installed")
+        resp.raise_for_status()
+    # A pull of "x" installs "x:latest": forget both spellings.
+    for key in {name, name.removesuffix(":latest")}:
+        _pulls.pop(key, None)
+        _pull_progress.pop(key, None)
+    log.info("deleted local model %s", name)
 
 
 # --- Single local model at a time ---------------------------------------------------------
@@ -298,31 +372,33 @@ async def unload_local_model_on_exit() -> None:
 
 SYSTEM_PROMPT = "You are an expert coding assistant. Be concise and correct. Use markdown code blocks for code."
 
-LOCAL_JSON_INSTRUCTIONS = """You are a coding assistant running as a small local model.
-Answer the user's request, then honestly rate your confidence that the answer is fully correct and complete.
-If the task needs deep multi-file reasoning, architecture decisions, or knowledge you lack, set needs_cloud to true.
+# The answer is streamed as plain markdown, not as a JSON string: small models can't reliably
+# escape the quotes in code samples, and one unescaped quote used to end the answer mid-code-block
+# (JSON mode then padded out the rest silently). The self-rating is a second, JSON-only call.
+LOCAL_INSTRUCTIONS = """You are a coding assistant running as a small local model.
+Answer the user's request in markdown.
 
 LENGTH: {length}
 Plan the answer to fit this budget before writing; code blocks count toward it. Put the most
-important points first and always finish the answer: never stop mid-sentence or mid-list.
-In code examples prefer single quotes; any double quote inside the answer must be escaped as \\".
+important points first and always finish the answer: never stop mid-sentence or mid-list."""
 
-Respond ONLY with a JSON object of this exact shape:
-{{"answer": "<your full answer in markdown>", "confidence": <number 0.0-1.0>, "needs_cloud": <true|false>, "more_available": <true|false>}}"""
+LOCAL_RATING_PROMPT = """Rate the answer you just gave. Respond ONLY with a JSON object of this exact shape:
+{"confidence": <number 0.0-1.0: how sure you are that it is fully correct and complete>,
+ "needs_cloud": <true if the task needs deep multi-file reasoning, architecture decisions, or knowledge you lack>,
+ "more_available": <true if a longer, more detailed explanation would genuinely help>}"""
 
 LOCAL_LENGTH_RULES = {
     "brief": ("Keep the answer short: at most about {words} words and at most 7 bullet points or steps. "
-              "If a fuller explanation would genuinely help, summarize the key points and set "
-              "more_available to true; otherwise set it to false."),
+              "If a fuller explanation would genuinely help, summarize the key points."),
     "detailed": ("The user asked for a detailed explanation: be thorough, up to about {words} words, "
-                 "with examples where useful. Set more_available to false."),
+                 "with examples where useful."),
 }
 
 
 def local_instructions(detail: str) -> str:
     words = config.LOCAL_DETAILED_WORDS if detail == "detailed" else config.LOCAL_BRIEF_WORDS
     rule = LOCAL_LENGTH_RULES.get(detail, LOCAL_LENGTH_RULES["brief"]).format(words=words)
-    return LOCAL_JSON_INSTRUCTIONS.format(length=rule)
+    return LOCAL_INSTRUCTIONS.format(length=rule)
 
 HEDGE_PATTERNS = re.compile(
     r"\b(i'?m not sure|i am not sure|not certain|i don'?t know|cannot determine|can'?t determine|"
@@ -346,92 +422,21 @@ class LLMResult:
     is_mock: bool = False  # true when no real cloud model answered (mock stand-in)
 
 
-def _parse_local_json(raw: str):
+def _parse_local_rating(raw: str):
+    """(confidence, needs_cloud, more_available) from the rating call's JSON; neutral if garbled."""
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
     try:
-        data = json.loads(raw)
+        data = json.loads(match.group(0)) if match else {}
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if not match:
-            return raw, 0.5, False, False
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            return raw, 0.5, False, False
-    answer = str(data.get("answer", "")).strip()
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
     try:
         confidence = float(data.get("confidence", 0.5))
     except (TypeError, ValueError):
         confidence = 0.5
-    return (answer, max(0.0, min(confidence, 1.0)), bool(data.get("needs_cloud", False)),
-            bool(data.get("more_available", False)))
-
-
-class _JSONAnswerStream:
-    """Decode the "answer" string of the local model's JSON reply while it is still streaming,
-    so the answer can be shown token by token. The full raw text is kept for the final parse."""
-
-    _KEY = re.compile(r'"answer"\s*:\s*"')
-    _ESCAPES = {'"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
-
-    def __init__(self) -> None:
-        self.raw = ""
-        self.answer = ""  # the answer decoded so far (all of it once the closing quote arrives)
-        self._pos: Optional[int] = None  # index just past the decoded part of the answer
-        self._done = False
-
-    def feed(self, chunk: str) -> str:
-        """Append raw model output; return the newly decoded part of the answer (may be "")."""
-        self.raw += chunk
-        if self._done:
-            return ""
-        if self._pos is None:
-            match = self._KEY.search(self.raw)
-            if not match:
-                return ""
-            self._pos = match.end()
-        buf, i, out = self.raw, self._pos, []
-        while i < len(buf):
-            c = buf[i]
-            if c == '"':
-                self._done = True
-                break
-            if c != "\\":
-                out.append(c)
-                i += 1
-                continue
-            if i + 1 >= len(buf):
-                break  # escape split across chunks: wait for the rest
-            esc = buf[i + 1]
-            if esc != "u":
-                out.append(self._ESCAPES.get(esc, esc))
-                i += 2
-                continue
-            if i + 6 > len(buf):
-                break
-            try:
-                cp = int(buf[i + 2:i + 6], 16)
-            except ValueError:
-                out.append(buf[i + 2:i + 6])
-                i += 6
-                continue
-            if 0xD800 <= cp < 0xDC00:  # high surrogate: decode it together with its low half
-                if i + 8 > len(buf):
-                    break  # can't tell yet whether "\u<low>" follows
-                if buf[i + 6:i + 8] == "\\u" and i + 12 > len(buf):
-                    break
-                try:
-                    low = int(buf[i + 8:i + 12], 16)
-                    out.append(chr(0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)))
-                    i += 12
-                    continue
-                except ValueError:
-                    pass
-            out.append(chr(cp))
-            i += 6
-        self._pos = i
-        delta = "".join(out)
-        self.answer += delta
-        return delta
+    return (max(0.0, min(confidence, 1.0)), data.get("needs_cloud") is True,
+            data.get("more_available") is True)
 
 
 async def _raise_for_status(resp: httpx.Response) -> None:
@@ -462,6 +467,33 @@ def _adjust_confidence(answer: str, confidence: float) -> float:
     return round(max(0.0, min(confidence, 1.0)), 2)
 
 
+async def _rate_local_answer(client: httpx.AsyncClient, payload: Dict[str, Any], answer: str):
+    """Ask the local model to rate its own answer: (confidence, needs_cloud, more_available).
+
+    A short JSON-mode follow-up in the same conversation, so Ollama reuses the cached prompt. JSON
+    mode is safe here because the reply has no free text to escape. Neutral on any failure.
+    """
+    if not answer:
+        return 0.0, False, False
+    rating = {
+        **payload,
+        "messages": payload["messages"] + [
+            {"role": "assistant", "content": answer},
+            {"role": "user", "content": LOCAL_RATING_PROMPT},
+        ],
+        "format": "json",
+        "stream": False,
+        "options": {**payload["options"], "temperature": 0, "num_predict": 80},
+    }
+    try:
+        resp = await client.post(f"{config.OLLAMA_URL}/api/chat", json=rating)
+        resp.raise_for_status()
+        return _parse_local_rating((resp.json().get("message") or {}).get("content", ""))
+    except (httpx.HTTPError, ValueError) as e:
+        log.warning("local self-rating failed: %s", _describe_error(e))
+        return 0.5, False, False
+
+
 async def call_local(
     prompt: str, context: str = "", emit: Optional[Emit] = None, detail: str = "brief"
 ) -> LLMResult:
@@ -476,7 +508,6 @@ async def call_local(
             {"role": "system", "content": local_instructions(detail)},
             {"role": "user", "content": user_content},
         ],
-        "format": "json",
         "stream": True,
         "keep_alive": config.LOCAL_KEEP_ALIVE,
         "options": {"temperature": 0.2, "num_ctx": config.LOCAL_NUM_CTX, "num_predict": max_tokens},
@@ -484,7 +515,7 @@ async def call_local(
     # Enforce one local model at a time: unload any other model before this one is loaded.
     async with local_model_slot(model):
         start = time.perf_counter()
-        stream = _JSONAnswerStream()
+        parts: list[str] = []
         data: Dict[str, Any] = {}
         # Streamed: the timeout applies between chunks, not to the whole generation.
         async with httpx.AsyncClient(timeout=config.LOCAL_TIMEOUT_S) as client:
@@ -495,31 +526,35 @@ async def call_local(
                         continue
                     chunk = json.loads(line)
                     if chunk.get("error"):
-                        # Ollama aborts a run that loops on one token (typically after an unescaped
-                        # quote ended the JSON string). Keep what was answered so far, if anything.
-                        if "repeat limit" in str(chunk["error"]) and stream.answer.strip():
+                        # Ollama aborts a run that loops on one token. Keep what was answered so
+                        # far, if anything.
+                        if "repeat limit" in str(chunk["error"]) and "".join(parts).strip():
                             data = {"done_reason": "length"}
                             break
                         raise RuntimeError(chunk["error"])  # Ollama streams errors with HTTP 200
-                    delta = stream.feed((chunk.get("message") or {}).get("content", ""))
-                    if delta and emit:
-                        emit("delta", {"text": delta})
+                    delta = (chunk.get("message") or {}).get("content", "")
+                    if delta:
+                        parts.append(delta)
+                        if emit:
+                            emit("delta", {"text": delta})
                     if chunk.get("done"):
                         data = chunk  # the final chunk carries the token counts
+            answer = "".join(parts).strip()
+            truncated = data.get("done_reason") == "length"
+            if truncated:
+                # Hit num_predict: keep the answer streamed so far. The model never finished, so
+                # rating it is pointless; confidence stays neutral and the longer answer is offered.
+                confidence, needs_cloud, more_available = 0.5, False, True
+                log.info("local answer hit the %d-token cap (%s)", max_tokens, detail)
+            else:
+                confidence, needs_cloud, more_available = await _rate_local_answer(
+                    client, payload, answer)
+                # Small models rarely flag more_available themselves; an answer that used most of
+                # its word budget was squeezed to fit, so a longer one is worth offering too.
+                if detail != "detailed" and len(answer.split()) >= 0.75 * config.LOCAL_BRIEF_WORDS:
+                    more_available = True
         latency = int((time.perf_counter() - start) * 1000)
 
-    truncated = data.get("done_reason") == "length"
-    if truncated:
-        # Hit num_predict mid-JSON: keep the answer streamed so far rather than the broken raw JSON.
-        # The model never got to rate itself, so confidence stays neutral; offer the longer answer.
-        answer, confidence, needs_cloud, more_available = stream.answer.strip(), 0.5, False, True
-        log.info("local answer hit the %d-token cap (%s)", max_tokens, detail)
-    else:
-        answer, confidence, needs_cloud, more_available = _parse_local_json(stream.raw)
-        # Small models rarely flag more_available themselves; an answer that used most of its
-        # word budget was squeezed to fit, so a longer one is worth offering too.
-        if detail != "detailed" and len(answer.split()) >= 0.75 * config.LOCAL_BRIEF_WORDS:
-            more_available = True
     return LLMResult(
         answer=answer,
         model=model,

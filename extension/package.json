@@ -49,8 +49,23 @@
         "category": "TokenGuard"
       },
       {
+        "command": "tokenguard.startOllama",
+        "title": "Start Ollama Server",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.installOllama",
+        "title": "Install Ollama",
+        "category": "TokenGuard"
+      },
+      {
         "command": "tokenguard.pullLocalModel",
         "title": "Download Local Model",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.deleteLocalModel",
+        "title": "Delete Local Model",
         "category": "TokenGuard"
       },
       {

@@ -200,6 +200,216 @@
         }
     }
 
+    // ---- Ollama server, first-run download, progress, model manager -----------------------
+
+    let ollamaState = null;     // { state, error } from the extension's OllamaManager
+    let lastHealth = null;      // latest /health payload (null while the backend is offline)
+    let pullProgress = {};      // model -> { state, status, completed, total, percent }
+    let setupDismissed = !!(vscode.getState() || {}).setupDismissed;
+
+    function fmtBytes(n) {
+        if (!n) return '0 B';
+        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+        const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+        return (n / Math.pow(1024, i)).toFixed(i >= 3 ? 2 : 0) + ' ' + units[i];
+    }
+
+    function renderOllama() {
+        const el = document.getElementById('ollamaState');
+        if (!el || !ollamaState) return;
+        const err = esc(ollamaState.error || '');
+        switch (ollamaState.state) {
+            case 'checking':
+                el.innerHTML = '<span class="spinner">Checking Ollama server…</span>';
+                break;
+            case 'starting':
+                el.innerHTML = '<span class="spinner">Ollama server was not running — starting it…</span>';
+                break;
+            case 'running':
+                el.innerHTML = '<span class="ok">●</span> Ollama server started by TokenGuard';
+                break;
+            case 'external':
+                el.innerHTML = '<span class="ok">●</span> Ollama server is running';
+                break;
+            case 'missing':
+                el.innerHTML = '<span class="offline">● Ollama is not installed</span>' +
+                    (err ? '<div class="muted">' + err + '</div>' : '') +
+                    '<div class="choices"><button data-model-action="install-ollama">Install Ollama</button>' +
+                    '<button class="secondary" data-model-action="start-ollama">Check again</button></div>';
+                break;
+            case 'installing':
+                el.innerHTML = '<span class="spinner">Installing Ollama… follow the "Install Ollama" terminal</span>';
+                break;
+            case 'failed':
+                el.innerHTML = '<span class="offline">● Could not start Ollama</span><div class="muted">' + err + '</div>' +
+                    '<div class="choices"><button class="secondary" data-model-action="start-ollama">Try again</button>' +
+                    '<button class="secondary" data-model-action="ollama-log">Show log</button></div>';
+                break;
+            default: // stopped (auto-start disabled)
+                el.innerHTML = '<span class="offline">● Ollama server is not running</span>' +
+                    (err ? '<div class="muted">' + err + '</div>' : '') +
+                    '<div class="choices"><button class="secondary" data-model-action="start-ollama">Start Ollama</button></div>';
+        }
+    }
+
+    // A download the user just asked for shows its bar immediately, before the backend reports it.
+    function optimisticPull() {
+        return { state: 'pulling', status: 'starting…', completed: 0, total: 0, percent: 0, since: Date.now() };
+    }
+
+    function withOptimistic(reported) {
+        const merged = { ...reported };
+        Object.keys(pullProgress).forEach(name => {
+            const p = pullProgress[name];
+            if (p.since && !merged[name] && Date.now() - p.since < 10000) merged[name] = p;
+        });
+        return merged;
+    }
+
+    function activeDownloads() {
+        return Object.keys(pullProgress).filter(name => pullProgress[name].state === 'pulling');
+    }
+
+    function installedNow(name) {
+        const installed = (lastHealth && lastHealth.local_models) || [];
+        return installed.includes(name) || installed.includes(name + ':latest');
+    }
+
+    function renderDownloads() {
+        const el = document.getElementById('downloads');
+        if (!el) return;
+        const rows = [];
+        Object.keys(pullProgress).forEach(name => {
+            const p = pullProgress[name];
+            if (p.state === 'pulling') {
+                const known = p.total > 0;
+                const pct = known ? Math.min(100, p.percent || 0) : 0;
+                const detail = known ? pct.toFixed(0) + '% · ' + fmtBytes(p.completed) + ' / ' + fmtBytes(p.total) : '';
+                rows.push('<div class="download"><div class="download-head"><span>⬇ <code>' + esc(name) + '</code></span>' +
+                    '<button class="secondary" data-model-action="cancel" data-model="' + esc(name) + '">Cancel</button></div>' +
+                    '<div class="progress' + (known ? '' : ' indeterminate') + '"><div style="width:' + pct + '%"></div></div>' +
+                    '<div class="muted">' + esc(detail) + (detail && p.status ? ' · ' : '') + esc(p.status || 'starting…') + '</div></div>');
+            } else if (p.state && p.state.startsWith('error') && !installedNow(name)) {
+                rows.push('<div class="download failed"><div class="download-head"><span>✗ <code>' + esc(name) + '</code> failed</span>' +
+                    '<button class="secondary" data-model-action="download" data-model="' + esc(name) + '">Retry</button></div>' +
+                    '<div class="muted">' + esc(p.state.slice(6).trim()) + '</div></div>');
+            }
+        });
+        el.innerHTML = rows.join('');
+    }
+
+    // No model on disk yet: ask before downloading several GB.
+    function renderSetup() {
+        const el = document.getElementById('setupCard');
+        if (!el) return;
+        const h = lastHealth;
+        const show = h && h.ollama && !(h.local_models || []).length && !activeDownloads().length && !setupDismissed;
+        el.hidden = !show;
+        if (!show) return;
+        const recs = h.local_recommended || [];
+        if (!recs.length) {
+            el.innerHTML = '<p><b>No local model installed.</b> None of the recommended models fit this machine\'s memory. ' +
+                'You can still pull one with <code>ollama pull &lt;model&gt;</code>; cloud answers work without it.</p>' +
+                '<div class="choices"><button class="secondary" data-model-action="setup-dismiss">Dismiss</button></div>';
+            return;
+        }
+        const options = recs.map((m, i) => '<option value="' + esc(m.name) + '"' + (i === 0 ? ' selected' : '') + '>' +
+            esc(m.name) + ' — ~' + esc(m.size_gb) + ' GB' + (m.comfortable === false ? ' (may use swap)' : '') + '</option>').join('');
+        el.innerHTML = '<p><b>No local model installed.</b> TokenGuard answers simple questions with a local model so your code ' +
+            'stays on your machine. Download one now?</p>' +
+            '<select id="setupModel">' + options + '</select>' +
+            '<div class="muted" id="setupNote">' + esc(recs[0].description || recs[0].note || '') + '</div>' +
+            '<div class="choices"><button data-model-action="setup-download">Download</button>' +
+            '<button class="secondary" data-model-action="setup-dismiss">Not now</button></div>';
+    }
+
+    function renderModelsList() {
+        const el = document.getElementById('modelsList');
+        if (!el) return;
+        const h = lastHealth;
+        if (!h) {
+            el.innerHTML = '<div class="muted">Waiting for the backend…</div>';
+            return;
+        }
+        if (!h.ollama) {
+            el.innerHTML = '<div class="muted">Ollama is not reachable.</div>';
+            return;
+        }
+        const sizes = h.local_sizes || {};
+        const installed = h.local_models || [];
+        const pulling = activeDownloads();
+        const total = installed.reduce((sum, m) => sum + (sizes[m] || 0), 0);
+        const rows = ['<div class="model-group">Installed' + (installed.length ? ' · ' + fmtBytes(total) + ' on disk' : '') + '</div>'];
+        if (!installed.length) rows.push('<div class="muted">No models downloaded yet.</div>');
+        installed.forEach(m => {
+            const tag = m === h.local_loaded ? ' <span class="muted">(loaded)</span>' : '';
+            rows.push('<div class="model-item"><span class="name" title="' + esc(m) + '"><code>' + esc(m) + '</code>' + tag + '</span>' +
+                '<span class="size">' + esc(fmtBytes(sizes[m])) + '</span>' +
+                '<button class="secondary danger" title="Delete from disk" data-model-action="delete" data-model="' + esc(m) +
+                '" data-size="' + (sizes[m] || 0) + '">Delete</button></div>');
+        });
+        const recs = (h.local_recommended || []);
+        if (recs.length) {
+            rows.push('<div class="model-group">Available to download</div>');
+            recs.forEach(m => {
+                const busy = pulling.includes(m.name);
+                rows.push('<div class="model-item"><span class="name" title="' + esc(m.description || m.name) + '"><code>' + esc(m.name) + '</code></span>' +
+                    '<span class="size">~' + esc(m.size_gb) + ' GB</span>' +
+                    '<button class="secondary" data-model-action="download" data-model="' + esc(m.name) + '"' +
+                    (busy ? ' disabled>Downloading…' : '>Download') + '</button></div>');
+            });
+        }
+        el.innerHTML = rows.join('');
+    }
+
+    function onModelAction(target) {
+        const action = target.dataset.modelAction;
+        const model = target.dataset.model || '';
+        switch (action) {
+            case 'start-ollama':
+                ollamaState = { state: 'checking' };
+                renderOllama();
+                vscode.postMessage({ type: 'startOllama' });
+                break;
+            case 'install-ollama':
+                vscode.postMessage({ type: 'installOllama' });
+                break;
+            case 'ollama-log':
+                vscode.postMessage({ type: 'showOllamaLog' });
+                break;
+            case 'setup-download': {
+                const sel = document.getElementById('setupModel');
+                const name = sel ? sel.value : '';
+                if (!name) return;
+                // Permission given here: download, then make it the active local model.
+                pullProgress[name] = optimisticPull();
+                renderDownloads();
+                renderSetup();
+                vscode.postMessage({ type: 'selectLocalModel', model: name, installed: false, confirmed: true });
+                break;
+            }
+            case 'setup-dismiss':
+                setupDismissed = true;
+                try { vscode.setState({ ...(vscode.getState() || {}), setupDismissed: true }); } catch { /* ignore */ }
+                renderSetup();
+                break;
+            case 'download':
+                pullProgress[model] = optimisticPull();
+                renderDownloads();
+                renderModelsList();
+                vscode.postMessage({ type: 'downloadModel', model });
+                break;
+            case 'cancel':
+                target.disabled = true;
+                target.textContent = 'Cancelling…';
+                vscode.postMessage({ type: 'cancelDownload', model });
+                break;
+            case 'delete':
+                vscode.postMessage({ type: 'deleteModel', model, size: Number(target.dataset.size) || 0 });
+                break;
+        }
+    }
+
     // ---- Turns ----------------------------------------------------------------------------
 
     function setBusy(value, id) {
@@ -928,6 +1138,12 @@
             size_gb: rec ? rec.size_gb : null
         });
     });
+    document.addEventListener('change', e => {
+        if (e.target.id !== 'setupModel') return;
+        const rec = (lastHealth && lastHealth.local_recommended || []).find(m => m.name === e.target.value);
+        const note = document.getElementById('setupNote');
+        if (note) note.textContent = rec ? (rec.description || rec.note || '') : '';
+    });
     input.addEventListener('keydown', e => {
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
     });
@@ -967,6 +1183,7 @@
         }
         const target = e.target.closest('button');
         if (!target) return;
+        if (target.dataset.modelAction) { onModelAction(target); return; }
         if (target.id === 'retryStatus') { vscode.postMessage({ type: 'refreshStatus' }); return; }
         if (target.id === 'setApiKey') { vscode.postMessage({ type: 'setApiKey' }); return; }
         if (target.id === 'saveCloudKey') {
@@ -1031,7 +1248,24 @@
                 }
                 break;
             }
+            case 'ollama':
+                ollamaState = { state: m.state, error: m.error };
+                renderOllama();
+                break;
+            case 'pullProgress':
+                pullProgress = withOptimistic(m.progress || {});
+                renderDownloads();
+                renderModelsList();
+                renderSetup();
+                break;
             case 'status':
+                lastHealth = m.online ? m.health : null;
+                if (m.health) {
+                    pullProgress = withOptimistic(m.health.local_pull_progress || {});
+                }
+                renderDownloads();
+                renderModelsList();
+                renderSetup();
                 if (m.health) {
                     renderModelSelect(
                         m.health.local_models,
