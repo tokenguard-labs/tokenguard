@@ -392,6 +392,96 @@ def delete_file(ws: Workspace, path: str) -> str:
     return f"Staged deletion of {rel}"
 
 
+def read_multiple_files(ws: Workspace, paths: List[str]) -> str:
+    """Read several files in one call (line-numbered), so the model needs fewer round trips."""
+    if not isinstance(paths, list) or not paths:
+        raise ToolError("paths must be a non-empty list of file paths")
+    out: List[str] = []
+    used = 0
+    for raw in paths[:12]:
+        rel = ws.rel(str(raw))
+        text = ws.read(rel)
+        if text is None:
+            out.append(f"{rel}: does not exist")
+            continue
+        lines = text.splitlines()
+        numbered = "\n".join(f"{i:>5}  {line}" for i, line in enumerate(lines, 1))
+        block = f"{rel} ({len(lines)} lines)\n{numbered}"
+        used += len(block)
+        out.append(block)
+        if used > 30_000:
+            out.append("[stopped: output limit reached; read the remaining files separately]")
+            break
+    return _clip("\n\n".join(out))
+
+
+def append_file(ws: Workspace, path: str, content: str) -> str:
+    """Append text to the end of an existing file."""
+    rel = ws.rel(path)
+    text = ws.read(rel)
+    if text is None:
+        raise ToolError(f"{rel} does not exist; use write_file to create it")
+    separator = "" if (not text or text.endswith("\n")) else "\n"
+    new = text + separator + content
+    ws.stage(rel, new)
+    return f"Staged append to {rel}:\n{_diff_preview(rel, text, new)}"
+
+
+def move_file(ws: Workspace, path: str, new_path: str) -> str:
+    """Rename or move a file (staged as a delete + create; the editor applies both)."""
+    rel = ws.rel(path)
+    dest = ws.rel(new_path)
+    if rel == dest:
+        raise ToolError("source and destination are the same path")
+    if ws.is_dir(rel):
+        raise ToolError(f"{rel} is a directory; move files one at a time")
+    text = ws.read(rel)
+    if text is None:
+        raise ToolError(f"{rel} does not exist")
+    if ws.read(dest) is not None:
+        raise ToolError(f"{dest} already exists; delete it first if you mean to replace it")
+    ws.stage(rel, None)
+    ws.stage(dest, text)
+    return f"Staged move: {rel} -> {dest}"
+
+
+def search_replace_all(ws: Workspace, pattern: str, replacement: str, path: str = ".",
+                       glob: Optional[str] = None, ignore_case: bool = False, max_files: int = 50) -> str:
+    """Regex replace across every matching file (bulk refactor), staged for review.
+
+    `replacement` uses Python group syntax (\\1, \\2). Stops after `max_files` changed files.
+    """
+    try:
+        rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    except re.error as e:
+        raise ToolError(f"invalid regex: {e}")
+    rel = ws.rel(path)
+    candidates = [rel] if rel != "." and not ws.is_dir(rel) else ws.files(rel)
+    changed: List[Tuple[str, int]] = []
+    total = 0
+    for f in candidates:
+        if glob and not (fnmatch.fnmatch(f, glob) or fnmatch.fnmatch(f.rsplit("/", 1)[-1], glob)):
+            continue
+        try:
+            text = ws.read(f)
+        except ToolError:
+            continue
+        if not text:
+            continue
+        new, count = rx.subn(replacement, text)
+        if count == 0 or new == text:
+            continue
+        ws.stage(f, new)
+        changed.append((f, count))
+        total += count
+        if len(changed) >= max(1, int(max_files)):
+            break
+    if not changed:
+        return "no replacements made (pattern not found)"
+    lines = "\n".join(f"  {f}: {n} replacement(s)" for f, n in changed)
+    return f"Staged {total} replacement(s) across {len(changed)} file(s):\n{lines}"
+
+
 def syntax_problems(ws: Workspace) -> List[str]:
     """Parse errors in staged Python/JSON files. Compiled, never executed, so no approval is needed."""
     import json

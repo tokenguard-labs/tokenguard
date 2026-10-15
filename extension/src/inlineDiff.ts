@@ -108,6 +108,9 @@ export class InlineDiffManager implements vscode.CodeLensProvider, vscode.Dispos
 
         const edit = new vscode.WorkspaceEdit();
         if (original === null) {
+            // A brand-new file: make its folder first — WorkspaceEdit.createFile does not create
+            // parent directories, so a file in a new folder would silently fail to appear.
+            await vscode.workspace.fs.createDirectory(parentDir(uri));
             edit.createFile(uri, { ignoreIfExists: true });
             edit.insert(uri, new vscode.Position(0, 0), lines.join('\n'));
         } else {
@@ -119,8 +122,18 @@ export class InlineDiffManager implements vscode.CodeLensProvider, vscode.Dispos
             createdFile: original === null, deletesFile: proposed === null
         });
         if (!(await this._apply(edit))) {
-            this._reviews.delete(uri.toString());
-            throw new Error('VS Code refused to show the change in the editor (is the file read-only?)');
+            if (original === null) {
+                // createFile can still be refused (read-only folder, odd provider): write it directly.
+                try {
+                    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(lines.join('\n')));
+                } catch (e) {
+                    this._reviews.delete(uri.toString());
+                    throw new Error(`VS Code could not create the file: ${(e as Error).message}`);
+                }
+            } else {
+                this._reviews.delete(uri.toString());
+                throw new Error('VS Code refused to show the change in the editor (is the file read-only?)');
+            }
         }
         await this._show(uri);
     }
@@ -308,6 +321,13 @@ function splitLines(text: string): string[] {
 
 function fullRange(doc: vscode.TextDocument): vscode.Range {
     return new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
+}
+
+/** The folder that should contain `uri`. */
+function parentDir(uri: vscode.Uri): vscode.Uri {
+    const parts = uri.path.split('/');
+    parts.pop();
+    return uri.with({ path: parts.join('/') || '/' });
 }
 
 /** The range covering `count` whole lines from `from`, including their line breaks. */
