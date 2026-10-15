@@ -1356,6 +1356,58 @@
         }
     });
 
+    // Resizable panes: drag the handles between the model panel, the conversation and the composer.
+    // Sizes persist in localStorage so the layout survives a reload.
+    function initResizers() {
+        const container = document.querySelector('.container');
+        if (!container) return;
+        const panes = {
+            topResizer: { el: document.querySelector('.top'), dir: 1, key: 'lp.pane.top' },
+            bottomResizer: { el: document.querySelector('.bottom'), dir: -1, key: 'lp.pane.bottom' }
+        };
+        const MIN = 56;
+        const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+        const maxHeight = () => Math.max(MIN, container.getBoundingClientRect().height - MIN);
+        const setHeight = (pane, h) => {
+            const height = clamp(h, MIN, maxHeight());
+            pane.el.style.height = height + 'px';
+            pane.el.style.flex = 'none';
+            try { localStorage.setItem(pane.key, String(height)); } catch { /* storage may be off */ }
+        };
+        for (const id of Object.keys(panes)) {
+            const pane = panes[id];
+            const handle = document.getElementById(id);
+            if (!handle || !pane.el) continue;
+            try {
+                const saved = Number(localStorage.getItem(pane.key));
+                if (saved) pane.el.style.height = clamp(saved, MIN, maxHeight()) + 'px';
+            } catch { /* ignore */ }
+            handle.addEventListener('mousedown', e => {
+                e.preventDefault();
+                const startY = e.clientY;
+                const startH = pane.el.getBoundingClientRect().height;
+                handle.classList.add('active');
+                document.body.classList.add('resizing');
+                const onMove = ev => setHeight(pane, startH + pane.dir * (ev.clientY - startY));
+                const onUp = () => {
+                    handle.classList.remove('active');
+                    document.body.classList.remove('resizing');
+                    window.removeEventListener('mousemove', onMove);
+                    window.removeEventListener('mouseup', onUp);
+                };
+                window.addEventListener('mousemove', onMove);
+                window.addEventListener('mouseup', onUp);
+            });
+            handle.addEventListener('keydown', e => {
+                if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+                e.preventDefault();
+                const step = (e.key === 'ArrowDown' ? 1 : -1) * pane.dir * 24;
+                setHeight(pane, pane.el.getBoundingClientRect().height + step);
+            });
+        }
+    }
+
+    initResizers();
     updateEmptyState();
     vscode.postMessage({ type: 'ready' });
 }());

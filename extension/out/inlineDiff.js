@@ -102,6 +102,9 @@ class InlineDiffManager {
         lines.push(...oldLines.slice(at));
         const edit = new vscode.WorkspaceEdit();
         if (original === null) {
+            // A brand-new file: make its folder first — WorkspaceEdit.createFile does not create
+            // parent directories, so a file in a new folder would silently fail to appear.
+            await vscode.workspace.fs.createDirectory(parentDir(uri));
             edit.createFile(uri, { ignoreIfExists: true });
             edit.insert(uri, new vscode.Position(0, 0), lines.join('\n'));
         }
@@ -114,8 +117,20 @@ class InlineDiffManager {
             createdFile: original === null, deletesFile: proposed === null
         });
         if (!(await this._apply(edit))) {
-            this._reviews.delete(uri.toString());
-            throw new Error('VS Code refused to show the change in the editor (is the file read-only?)');
+            if (original === null) {
+                // createFile can still be refused (read-only folder, odd provider): write it directly.
+                try {
+                    await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(lines.join('\n')));
+                }
+                catch (e) {
+                    this._reviews.delete(uri.toString());
+                    throw new Error(`VS Code could not create the file: ${e.message}`);
+                }
+            }
+            else {
+                this._reviews.delete(uri.toString());
+                throw new Error('VS Code refused to show the change in the editor (is the file read-only?)');
+            }
         }
         await this._show(uri);
     }
@@ -292,6 +307,12 @@ function splitLines(text) {
 }
 function fullRange(doc) {
     return new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length));
+}
+/** The folder that should contain `uri`. */
+function parentDir(uri) {
+    const parts = uri.path.split('/');
+    parts.pop();
+    return uri.with({ path: parts.join('/') || '/' });
 }
 /** The range covering `count` whole lines from `from`, including their line breaks. */
 function lineSpan(doc, from, count) {

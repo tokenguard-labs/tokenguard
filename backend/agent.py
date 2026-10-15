@@ -25,8 +25,9 @@ from compression.context_engine.redact import RULES as SECRET_RULES
 
 from . import agent_llm, config, llm
 from .agent_llm import ToolCall
-from .agent_tools import (ShadowWorkspace, ToolError, Workspace, _loose_match, delete_file, edit_file,
-                          list_files, read_file, replace_lines, search, syntax_problems, write_file)
+from .agent_tools import (ShadowWorkspace, ToolError, Workspace, _loose_match, append_file, delete_file,
+                          edit_file, list_files, move_file, read_file, read_multiple_files, replace_lines,
+                          search, search_replace_all, syntax_problems, write_file)
 from .tokens import count_tokens
 
 log = logging.getLogger("localpilot.agent")
@@ -93,9 +94,44 @@ TOOLS: List[Dict[str, Any]] = [
         }, "required": ["path", "content"]},
     },
     {
+        "name": "append_file",
+        "description": "Append text to the end of an existing file (keeps the current content).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "content": {"type": "string"},
+        }, "required": ["path", "content"]},
+    },
+    {
         "name": "delete_file",
         "description": "Delete a file.",
         "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    },
+    {
+        "name": "move_file",
+        "description": "Rename or move a file to a new path (also used to reorganize files).",
+        "parameters": {"type": "object", "properties": {
+            "path": {"type": "string", "description": "Current file path"},
+            "new_path": {"type": "string", "description": "New file path"},
+        }, "required": ["path", "new_path"]},
+    },
+    {
+        "name": "read_multiple_files",
+        "description": "Read several files in one call (each line-numbered), instead of calling read_file repeatedly.",
+        "parameters": {"type": "object", "properties": {
+            "paths": {"type": "array", "items": {"type": "string"}},
+        }, "required": ["paths"]},
+    },
+    {
+        "name": "search_replace_all",
+        "description": ("Regex replace across every matching file in one step (bulk rename/refactor). "
+                        "replacement uses group references like \\1, \\2. Use glob to limit files, e.g. '*.py'."),
+        "parameters": {"type": "object", "properties": {
+            "pattern": {"type": "string", "description": "Python regular expression"},
+            "replacement": {"type": "string", "description": "Replacement text (supports \\1, \\2 …)"},
+            "path": {"type": "string", "description": "Directory or file to search. Default '.'"},
+            "glob": {"type": "string", "description": "Only files matching this glob, e.g. '*.ts'"},
+            "ignore_case": {"type": "boolean"},
+        }, "required": ["pattern", "replacement"]},
     },
     {
         "name": "run_command",
@@ -118,10 +154,13 @@ TOOLS: List[Dict[str, Any]] = [
 ]
 
 _FILE_TOOLS = {
-    "list_files": list_files, "read_file": read_file, "search": search,
-    "edit_file": edit_file, "replace_lines": replace_lines, "write_file": write_file, "delete_file": delete_file,
+    "list_files": list_files, "read_file": read_file, "read_multiple_files": read_multiple_files,
+    "search": search, "edit_file": edit_file, "replace_lines": replace_lines, "write_file": write_file,
+    "append_file": append_file, "delete_file": delete_file, "move_file": move_file,
+    "search_replace_all": search_replace_all,
 }
-_MUTATING = {"edit_file", "replace_lines", "write_file", "delete_file"}
+_MUTATING = {"edit_file", "replace_lines", "write_file", "append_file", "delete_file", "move_file",
+             "search_replace_all"}
 _SCHEMAS = {t["name"]: t["parameters"] for t in TOOLS}
 
 SYSTEM_PROMPT = """You are LocalPilot Agent, an autonomous coding agent working in the user's repository.
@@ -328,7 +367,7 @@ def _args_preview(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Tool arguments for the step log, with file contents summarised instead of inlined."""
     out = {}
     for k, v in args.items():
-        if k in ("content", "old_string", "new_string", "new_text") and isinstance(v, str):
+        if k in ("content", "old_string", "new_string", "new_text", "replacement") and isinstance(v, str):
             out[k] = f"{len(v.splitlines()) or 1} line(s)"
         else:
             out[k] = v

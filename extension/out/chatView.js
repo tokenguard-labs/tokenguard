@@ -464,10 +464,11 @@ class LocalPilotViewProvider {
             // The page only needs the stats; full contents stay here for the diff view and Accept.
             const summary = result.changes.map(({ original: _o, proposed: _p, ...rest }) => rest);
             this._post({ type: 'agentResult', id, result: { ...result, changes: summary } });
-            // Show modified files inline, Cursor-style. Added/deleted files wait for "Review in file",
-            // so nothing is created or removed on disk before the user decides.
+            // Show modified and new files inline, Cursor-style (new files are created so they appear
+            // in the tree; rejecting removes them again). Deleted files wait for "Review in file",
+            // so nothing is removed on disk before the user decides.
             if (vscode.workspace.getConfiguration('tokenguard').get('agentInlineReview', true)) {
-                for (const change of result.changes.filter(c => c.status === 'modified')) {
+                for (const change of result.changes.filter(c => c.status === 'modified' || c.status === 'added')) {
                     await this._agentReview(id, change.path, false);
                 }
             }
@@ -527,7 +528,9 @@ class LocalPilotViewProvider {
             return;
         }
         // With auto save on, the buffer (old and new lines together) would be written to disk mid-review.
-        if (vscode.workspace.getConfiguration('files', uri).get('autoSave', 'off') !== 'off') {
+        // A new file has no old lines, so this only applies when it already existed.
+        if (change.original !== null
+            && vscode.workspace.getConfiguration('files', uri).get('autoSave', 'off') !== 'off') {
             if (!ask) {
                 return;
             }
@@ -735,11 +738,18 @@ async function applyChange(uri, proposed, exists) {
         edit.replace(uri, new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)), proposed);
     }
     else {
+        // New file (e.g. from write_file/move_file): make sure its folder exists first, because
+        // WorkspaceEdit.createFile does not create parent directories.
+        await vscode.workspace.fs.createDirectory(vscode.Uri.file(path.dirname(uri.fsPath)));
         edit.createFile(uri, { overwrite: true });
         edit.insert(uri, new vscode.Position(0, 0), proposed);
     }
     if (!(await vscode.workspace.applyEdit(edit))) {
-        throw new Error('VS Code refused the edit (is the file read-only?)');
+        if (exists) {
+            throw new Error('VS Code refused the edit (is the file read-only?)');
+        }
+        // Fall back to writing the new file directly if the edit was refused.
+        await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(proposed));
     }
     const doc = await vscode.workspace.openTextDocument(uri);
     if (doc.isDirty && !(await doc.save())) {
