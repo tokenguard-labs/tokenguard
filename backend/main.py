@@ -151,6 +151,9 @@ async def _local_model_info() -> Dict[str, Any]:
     """Installed local models, host resources, and pullable recommendations that fit."""
     reachable, installed = await llm.ollama_models()
     resources = system.system_resources()
+    # RAM-fit info per installed model, for "this model is too big for your RAM" warnings.
+    sizes = await llm.ollama_model_sizes()
+    fit = {name: model_catalog.fit(name, sizes.get(name, 0.0), resources) for name in installed}
     recommended = [
         {k: m[k] for k in _RECOMMENDED_FIELDS}
         for m in model_catalog.recommend(resources)
@@ -161,8 +164,10 @@ async def _local_model_info() -> Dict[str, Any]:
         "local_model": llm.effective_local_model(),
         "local_loaded": llm.loaded_local_model(),
         "installed": installed,
+        "fit": fit,
         "recommended": recommended,
         "pulling": llm.pulling_models(),
+        "pulls": llm.pull_progress(),
         "system": resources,
     }
 
@@ -175,8 +180,10 @@ async def models():
         "local_model": info["local_model"],
         "local_loaded": info["local_loaded"],
         "available": info["installed"],
+        "fit": info["fit"],
         "recommended": info["recommended"],
         "pulling": info["pulling"],
+        "pulls": info["pulls"],
         "system": info["system"],
         "ollama": info["ollama"],
     }
@@ -468,8 +475,10 @@ async def health(force: bool = False):
         "local_model": local["local_model"],
         "local_loaded": local["local_loaded"],
         "local_models": local["installed"],
+        "fit": local["fit"],
         "local_recommended": local["recommended"],
         "local_pulling": local["pulling"],
+        "pulls": local["pulls"],
         "system": local["system"],
         "cloud_provider": cloud["provider"],
         "cloud_model": cloud["model"],

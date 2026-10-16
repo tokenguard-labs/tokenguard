@@ -112,6 +112,23 @@ async def ollama_models() -> tuple[bool, list[str]]:
     return True, sorted({n for n in names if n})
 
 
+async def ollama_model_sizes() -> dict[str, float]:
+    """Disk size (GB) per installed model, used for rough RAM-fit estimates on unknown models."""
+    try:
+        async with httpx.AsyncClient(timeout=3) as client:
+            resp = await client.get(f"{config.OLLAMA_URL}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        log.warning("could not list Ollama models: %s", e)
+        return {}
+    sizes = {
+        (m.get("name") or m.get("model")): round(m.get("size", 0) / (1024 * 1024 * 1024), 1)
+        for m in data.get("models", [])
+    }
+    return {name: gb for name, gb in sizes.items() if name and gb}
+
+
 async def list_local_models() -> list[str]:
     """Names of the models Ollama has pulled. Empty list when Ollama is unreachable."""
     _, names = await ollama_models()
@@ -134,6 +151,7 @@ async def ollama_reachable(force: bool = False) -> bool:
 
 # --- Model downloads (ollama pull) --------------------------------------------------------
 _pulls: dict[str, str] = {}  # model name -> "pulling" | "installed" | "error: ..."
+_pull_progress: dict[str, dict] = {}  # model name -> {"percent": 0..100, "status": last Ollama status}
 
 
 def pull_status(name: str) -> Optional[str]:
@@ -142,6 +160,24 @@ def pull_status(name: str) -> Optional[str]:
 
 def pulling_models() -> list[str]:
     return [name for name, status in _pulls.items() if status == "pulling"]
+
+
+def pull_progress() -> dict[str, dict]:
+    """Download progress for the models currently being pulled (percent + last status text)."""
+    return {name: dict(_pull_progress[name]) for name, status in _pulls.items()
+            if status == "pulling" and name in _pull_progress}
+
+
+def _absorb_pull_chunk(name: str, chunk: dict) -> None:
+    """Update `_pull_progress` from one Ollama pull-stream event (keeps percent without totals)."""
+    status = chunk.get("status")
+    if not status:
+        return
+    prog = _pull_progress.setdefault(name, {"percent": 0.0, "status": ""})
+    total, completed = chunk.get("total"), chunk.get("completed")
+    if total and completed is not None:
+        prog["percent"] = int(100 * completed / total)
+    prog["status"] = status
 
 
 async def _run_pull(name: str) -> None:
@@ -161,11 +197,14 @@ async def _run_pull(name: str) -> None:
                         continue
                     if chunk.get("error"):
                         raise RuntimeError(chunk["error"])  # Ollama streams errors with HTTP 200
+                    _absorb_pull_chunk(name, chunk)
         _pulls[name] = "installed"
         log.info("pulled local model %s", name)
     except Exception as e:
         _pulls[name] = f"error: {_describe_error(e)}"
         log.warning("pull failed for %s: %s", name, _describe_error(e))
+    finally:
+        _pull_progress.pop(name, None)
 
 
 def start_pull(name: str) -> str:

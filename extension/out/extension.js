@@ -75,6 +75,8 @@ function activate(context) {
         downloadLocalModel
     });
     context.subscriptions.push(viewProvider, backend.onDidChangeState(() => viewProvider?.refreshStatus()), 
+    // Startup milestones: keep the sidebar's progress bar moving while the backend boots.
+    backend.onDidChangeProgress(() => viewProvider?.refreshStatus()), 
     // When Ollama comes up (we may have just started it), refresh so the selected model loads.
     ollama.onDidChangeState(() => viewProvider?.refreshStatus()));
     // Last-resort cleanup if VS Code exits without calling deactivate().
@@ -200,7 +202,7 @@ async function downloadLocalModel(model) {
     }
     const rec = info.recommended.find(m => m.name === model);
     const size = rec && rec.size_gb ? ` (~${rec.size_gb} GB)` : '';
-    return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `TokenGuard: downloading ${model}${size}`, cancellable: true }, async (_progress, token) => {
+    return vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `TokenGuard: downloading ${model}${size}`, cancellable: true }, async (progress, token) => {
         try {
             await api('POST', '/models/pull', { model }, 15_000);
         }
@@ -208,12 +210,23 @@ async function downloadLocalModel(model) {
             void vscode.window.showErrorMessage(`TokenGuard: could not start download. ${err.message}`);
             return false;
         }
+        let reported = 0;
         while (!token.isCancellationRequested) {
             await new Promise(r => setTimeout(r, 2_000));
             try {
-                if ((await fetchModels()).available.includes(model)) {
+                const info = await fetchModels();
+                if (info.available.includes(model)) {
                     void vscode.window.showInformationMessage(`TokenGuard: ${model} is ready.`);
                     return true;
+                }
+                // Fill the notification's progress bar from Ollama's live bytes/percent.
+                const p = info.pulls?.[model];
+                if (p && p.percent > reported) {
+                    progress.report({
+                        message: ` ${p.percent}%${p.status ? ` · ${p.status}` : ''}`,
+                        increment: p.percent - reported
+                    });
+                    reported = p.percent;
                 }
             }
             catch {

@@ -53,7 +53,10 @@ are estimates (custom endpoints show no price).
 The LocalPilot sidebar has a **Local model** dropdown with two groups (from `GET /models`,
 backed by `/health`):
 
-- **Installed** — every model Ollama has already pulled.
+- **Installed** — every model Ollama has already pulled. Models bigger than this machine is
+  checked against the detected RAM/swap/VRAM and flagged in the list ("may use swap") or marked
+  "too big for this machine"; selecting one warns before it is loaded, and a ⚠ badge stays next
+  to "loaded in memory" while a swap-bound model runs.
 - **Recommended — needs download** — models that fit this machine, chosen from the host's
   detected RAM/swap/VRAM (models that only fit by using swap are marked "may use swap").
   Selecting one asks whether to download it (`ollama pull`) and shows progress.

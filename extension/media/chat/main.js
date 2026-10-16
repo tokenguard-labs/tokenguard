@@ -150,7 +150,24 @@
     // this machine (pulled on demand). The empty value means "use LOCAL_MODEL from .env".
     let installedModels = [];
     let recommendedModels = [];
+    let fitInfo = {};          // model name -> {fits, comfortable, size_gb, min_ram_gb} (RAM-fit info)
+    let pullsInfo = {};        // model name -> {percent, status} while it is being downloaded
     let loadingModel = null;   // model currently being loaded into memory
+
+    // "45%" for a downloading model, or "" when Ollama hasn't reported progress yet.
+    function pullTag(name) {
+        const p = pullsInfo[name];
+        return p && p.percent > 0 && p.percent < 100 ? ' ' + p.percent + '%' : '';
+    }
+
+    // Label suffix for a model the sidebar should flag as bigger than this machine holds well.
+    function fitTag(name) {
+        const f = fitInfo[name];
+        if (!f) return '';
+        if (f.fits === false) return ' — ⚠ too big for this machine';
+        if (f.comfortable === false) return ' — may use swap';
+        return '';
+    }
 
     function renderModelSelect(available, recommended, pulling, current, saved, loaded) {
         const installed = available || [];
@@ -169,7 +186,7 @@
         const opts = ['<option value="">Default (' + esc(current || 'backend') + ')</option>'];
         if (installed.length) {
             opts.push('<optgroup label="Installed">');
-            installed.forEach(m => opts.push('<option value="' + esc(m) + '">' + esc(m) + '</option>'));
+            installed.forEach(m => opts.push('<option value="' + esc(m) + '">' + esc(m) + fitTag(m) + '</option>'));
             opts.push('</optgroup>');
         }
         if (recs.length) {
@@ -177,7 +194,7 @@
             recs.forEach(m => {
                 const size = m.size_gb ? ' — ' + m.size_gb + ' GB' : '';
                 const warn = m.comfortable === false ? ' (may use swap)' : '';
-                const downloading = inFlight.includes(m.name) ? ' — downloading…' : '';
+                const downloading = inFlight.includes(m.name) ? ' — downloading' + pullTag(m.name) + '…' : '';
                 opts.push('<option value="' + esc(m.name) + '">' + esc(m.name) + size + warn + downloading + '</option>');
             });
             opts.push('</optgroup>');
@@ -195,7 +212,17 @@
             } else {
                 text = loaded ? 'loaded in memory: ' + esc(loaded) : 'no model loaded';
             }
-            if (inFlight.length) text += ' · downloading: ' + esc(inFlight.join(', '));
+            const lf = loaded && fitInfo[loaded];
+            if (loadingModel === null && lf) {
+                if (lf.fits === false) {
+                    text += ' <span class="ramwarn">⚠ needs ~' + lf.min_ram_gb + ' GB RAM/VRAM — too big for this machine</span>';
+                } else if (lf.comfortable === false) {
+                    text += ' <span class="ramwarn">⚠ may use swap — answers slower</span>';
+                }
+            }
+            if (inFlight.length) {
+                text += ' · downloading: ' + esc(inFlight.map(n => n + pullTag(n)).join(', '));
+            }
             state.innerHTML = text;
         }
     }
@@ -829,7 +856,14 @@
     function renderStatus(m) {
         const el = document.getElementById('status');
         if (m.starting) {
-            el.innerHTML = '<span class="spinner">Starting LocalPilot backend…</span> (' + esc(m.apiUrl) + ')';
+            const p = m.progress;
+            const pct = p ? Math.max(0, Math.min(100, Math.round(p.percent))) : 0;
+            const bar = pct > 0
+                ? '<div class="progress"><div class="progress-fill" style="width:' + pct + '%"></div></div>'
+                : '<div class="progress indeterminate"><div class="progress-fill"></div></div>';
+            const step = p && p.step
+                ? '<div class="muted">' + (pct > 0 ? pct + '% · ' : '') + esc(p.step) + '</div>' : '';
+            el.innerHTML = '<span class="spinner">Starting LocalPilot backend…</span> (' + esc(m.apiUrl) + ')' + bar + step;
             return;
         }
         if (!m.online) {
@@ -864,10 +898,18 @@
         const sys = document.getElementById('systemInfo');
         if (sys && h.system) {
             const g = h.system;
-            sys.textContent = 'Host: ' + g.total_ram_gb + ' GB RAM' +
-                (g.swap_total_gb ? ' + ' + g.swap_total_gb + ' GB swap' : '') +
+            // "used / total" when the backend reports available/free memory, else just the total.
+            const usage = (total, free) => {
+                const t = Number(total) || 0;
+                if (free == null) return t + ' GB';
+                const used = Math.max(0, Math.round((t - Number(free)) * 10) / 10);
+                return used + ' / ' + t + ' GB';
+            };
+            sys.textContent = 'Host: ' + usage(g.total_ram_gb, g.available_ram_gb) + ' RAM' +
+                (g.swap_total_gb ? ' + ' + usage(g.swap_total_gb, g.swap_free_gb) + ' swap' : '') +
                 (g.has_gpu ? ' · ' + g.gpu_vram_gb + ' GB VRAM' : '') +
                 ' · ' + g.cpu_count + ' CPU' + (g.cpu_count === 1 ? '' : 's');
+            sys.title = 'used / total · refreshes about every 30s';
         }
     }
 
@@ -1032,6 +1074,8 @@
                 break;
             }
             case 'status':
+                fitInfo = m.health?.fit || {};
+                pullsInfo = m.health?.pulls || {};
                 if (m.health) {
                     renderModelSelect(
                         m.health.local_models,

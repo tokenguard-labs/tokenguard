@@ -37,29 +37,50 @@ CATALOG: List[Dict] = [
 ]
 
 
+def _annotate(item: Dict, resources: Dict) -> None:
+    """Fill in `fits`/`comfortable`/`note` for one annotated catalog entry."""
+    total_ram = float(resources.get("total_ram_gb") or 0)
+    swap = float(resources.get("swap_total_gb") or 0)
+    vram = float(resources.get("gpu_vram_gb") or 0)
+    budget = max(vram, total_ram + swap)
+    fast_budget = max(vram, total_ram)
+    need = float(item["min_ram_gb"])
+    item["fits"] = need <= budget
+    item["comfortable"] = need <= fast_budget
+    if not item["fits"]:
+        item["note"] = f"needs ~{item['min_ram_gb']}GB RAM/VRAM — more than this machine"
+    elif not item["comfortable"]:
+        item["note"] = "may use swap — slower; close other apps for best speed"
+    else:
+        item["note"] = ""
+
+
+def fit(name: str, size_gb: float, resources: Dict) -> Dict:
+    """RAM-fit info for one installed model, for warnings in the sidebar.
+
+    Catalog entries carry a curated min RAM; unknown models are estimated from their disk
+    size (quantized GGUF needs a little more memory than it occupies, plus KV cache).
+    """
+    entry = next((m for m in CATALOG if m["name"] == name), None)
+    if entry:
+        item = dict(entry)
+    else:
+        need = round(size_gb * 1.3 + 1)
+        item = {"name": name, "params": "?", "size_gb": size_gb, "min_ram_gb": max(1, need),
+                "tags": [], "description": ""}
+    _annotate(item, resources)
+    return {k: item[k] for k in ("size_gb", "min_ram_gb", "fits", "comfortable", "note")}
+
+
 def recommend(resources: Dict) -> List[Dict]:
     """Annotate the catalog with fit information for the given `system_resources()`.
 
     `fits` is True when the model can run using RAM + swap (or the GPU VRAM); `comfortable`
     is True when it fits in RAM/VRAM alone (no swap). Only models that fit should be offered.
     """
-    total_ram = float(resources.get("total_ram_gb") or 0)
-    swap = float(resources.get("swap_total_gb") or 0)
-    vram = float(resources.get("gpu_vram_gb") or 0)
-    budget = max(vram, total_ram + swap)
-    fast_budget = max(vram, total_ram)
-
     out = []
     for model in CATALOG:
-        need = float(model["min_ram_gb"])
         item = dict(model)
-        item["fits"] = need <= budget
-        item["comfortable"] = need <= fast_budget
-        if not item["fits"]:
-            item["note"] = f"needs ~{model['min_ram_gb']}GB RAM/VRAM — more than this machine"
-        elif not item["comfortable"]:
-            item["note"] = "may use swap — slower; close other apps for best speed"
-        else:
-            item["note"] = ""
+        _annotate(item, resources)
         out.append(item)
     return out

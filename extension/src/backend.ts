@@ -12,6 +12,20 @@ const STOP_GRACE_MS = 3_000;
 
 export type BackendState = 'stopped' | 'starting' | 'running' | 'external' | 'failed';
 
+/** How far along backend startup is, for the sidebar's progress bar. */
+export interface BackendProgress {
+    percent: number; // 0..100
+    step: string;
+}
+
+// Uvicorn logs these lines (on stderr) as it boots; each one advances the progress bar.
+const STARTUP_MILESTONES: [RegExp, number, string][] = [
+    [/Started server process/i, 55, 'Server process started'],
+    [/Waiting for application startup/i, 70, 'Loading the application'],
+    [/Application startup complete/i, 90, 'Application ready'],
+    [/Uvicorn running on/i, 95, 'Waiting for the health check'],
+];
+
 export class BackendManager implements vscode.Disposable {
     private _proc?: ChildProcess;
     private _starting?: Promise<void>;
@@ -19,8 +33,11 @@ export class BackendManager implements vscode.Disposable {
     private _lastError?: string;
     private _stderrTail: string[] = [];
     private _stopping = false;
+    private _progress: BackendProgress = { percent: 0, step: '' };
     private readonly _onDidChangeState = new vscode.EventEmitter<BackendState>();
     readonly onDidChangeState = this._onDidChangeState.event;
+    private readonly _onDidChangeProgress = new vscode.EventEmitter<BackendProgress>();
+    readonly onDidChangeProgress = this._onDidChangeProgress.event;
 
     constructor(
         private readonly _extensionPath: string,
@@ -30,6 +47,7 @@ export class BackendManager implements vscode.Disposable {
 
     get state(): BackendState { return this._state; }
     get lastError(): string | undefined { return this._lastError; }
+    get progress(): BackendProgress { return this._progress; }
 
     /** Resolves once the backend answers /health; starts it if needed. Never rejects. */
     ensureRunning(): Promise<void> {
@@ -54,6 +72,7 @@ export class BackendManager implements vscode.Disposable {
         }
         this._output.appendLine('[tokenguard] stopping backend…');
         this._stopping = true;
+        this._setProgress(0, '');
         const exited = new Promise<void>(resolve => proc.once('exit', () => resolve()));
         proc.kill('SIGTERM');
         const timer = setTimeout(() => proc.kill('SIGKILL'), STOP_GRACE_MS);
@@ -86,6 +105,7 @@ export class BackendManager implements vscode.Disposable {
     dispose(): void {
         void this.stop();
         this._onDidChangeState.dispose();
+        this._onDidChangeProgress.dispose();
     }
 
     private _setState(state: BackendState, error?: string) {
@@ -95,6 +115,27 @@ export class BackendManager implements vscode.Disposable {
             this._output.appendLine(`[tokenguard] ${error}`);
         }
         this._onDidChangeState.fire(state);
+    }
+
+    /** The bar never moves backwards (except an explicit reset to 0 on stop/launch). */
+    private _setProgress(percent: number, step: string) {
+        if (percent !== 0 && percent < this._progress.percent) {
+            return;
+        }
+        if (percent === this._progress.percent && step === this._progress.step) {
+            return;
+        }
+        this._progress = { percent, step };
+        this._onDidChangeProgress.fire(this._progress);
+    }
+
+    /** Advance the bar when a uvicorn boot milestone scrolls by on stdout/stderr. */
+    private _observeOutput(text: string) {
+        for (const [pattern, percent, step] of STARTUP_MILESTONES) {
+            if (pattern.test(text)) {
+                this._setProgress(percent, step);
+            }
+        }
     }
 
     private async _ensure(): Promise<void> {
@@ -111,6 +152,7 @@ export class BackendManager implements vscode.Disposable {
         }
 
         const cfg = vscode.workspace.getConfiguration('tokenguard');
+        this._setProgress(5, 'Checking configuration');
         if (!cfg.get<boolean>('autoStartBackend', true)) {
             this._setState('stopped', 'auto-start disabled (tokenguard.autoStartBackend)');
             return;
@@ -126,6 +168,7 @@ export class BackendManager implements vscode.Disposable {
             this._setState('failed', 'backend folder not found. Set tokenguard.backendPath to the backend/ folder.');
             return;
         }
+        this._setProgress(20, 'Backend found');
         // backend/ and compression/ are sibling packages, so uvicorn runs from the repo root
         const repoRoot = path.dirname(backendDir);
         const python = this._python(repoRoot);
@@ -134,11 +177,13 @@ export class BackendManager implements vscode.Disposable {
             void this._offerSetup(repoRoot);
             return;
         }
+        this._setProgress(30, 'Python environment found');
 
         const port = url.port || (url.protocol === 'https:' ? '443' : '80');
         const args = ['-m', 'uvicorn', `${path.basename(backendDir)}.main:app`, '--host', '127.0.0.1', '--port', port];
         this._output.appendLine(`[tokenguard] starting: ${python} ${args.join(' ')}  (cwd ${repoRoot})`);
         this._setState('starting');
+        this._setProgress(40, 'Launching the server');
         this._stderrTail = [];
 
         const proc = spawn(python, args, {
@@ -146,10 +191,15 @@ export class BackendManager implements vscode.Disposable {
             env: { ...process.env, PYTHONUNBUFFERED: '1' }
         });
         this._proc = proc;
-        proc.stdout?.on('data', d => this._output.append(d.toString()));
+        proc.stdout?.on('data', d => {
+            const text = d.toString();
+            this._output.append(text);
+            this._observeOutput(text);
+        });
         proc.stderr?.on('data', d => {
             const text = d.toString();
             this._output.append(text);
+            this._observeOutput(text);
             this._stderrTail = [...this._stderrTail, ...text.split('\n').filter(Boolean)].slice(-5);
         });
         proc.on('error', err => this._output.appendLine(`[tokenguard] spawn failed: ${err.message}`));
@@ -177,6 +227,7 @@ export class BackendManager implements vscode.Disposable {
             }
             if (await this._healthy()) {
                 this._output.appendLine(`[tokenguard] backend ready at ${this._apiUrl()}`);
+                this._setProgress(100, 'Ready');
                 this._setState('running');
                 return;
             }
