@@ -99,6 +99,10 @@ class LocalPilotViewProvider {
             this._clearRetry();
             this._view = undefined;
         });
+        // Lazy activation: nothing spawns when VS Code opens. The backend and Ollama start
+        // here instead — the first time the sidebar is actually shown — and stop on deactivate.
+        void this._host.backend()?.ensureRunning();
+        void this._host.ollama?.()?.ensureRunning();
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case 'ready':

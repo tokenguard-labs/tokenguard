@@ -20,7 +20,7 @@ _load_dotenv()
 
 # Local LLM (Ollama)
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
-LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen2.5-coder:1.5b")
+LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen2.5-coder:0.5b")
 LOCAL_TIMEOUT_S = float(os.getenv("LOCAL_TIMEOUT_S", "120"))
 LOCAL_NUM_CTX = int(os.getenv("LOCAL_NUM_CTX", "8192"))  # Ollama's default window silently truncates
 # How long to keep the active local model resident between prompts. Only one is kept loaded at a

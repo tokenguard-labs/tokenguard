@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import type { BackendManager } from './backend';
 import { InlineDiffManager, ReviewOutcome } from './inlineDiff';
+import type { OllamaManager } from './ollama';
 
 // The LocalPilot sidebar. The page itself lives in media/chat/ (index.html, main.css, main.js);
 // this class serves it and relays its messages to the backend:
@@ -62,6 +63,7 @@ const LANGUAGE_ALIASES: Record<string, string> = {
 /** What the view needs from the extension; extension.ts owns the backend and settings. */
 export interface ChatViewHost {
     backend(): BackendManager | undefined;
+    ollama?: () => OllamaManager | undefined;
     api<T>(method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<T>;
     apiStream<T>(path: string, body: unknown, onEvent: (event: string, data: any) => void, idleTimeoutMs: number, signal?: AbortSignal): Promise<T>;
     apiUrl(): string;
@@ -130,6 +132,11 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
             this._clearRetry();
             this._view = undefined;
         });
+
+        // Lazy activation: nothing spawns when VS Code opens. The backend and Ollama start
+        // here instead — the first time the sidebar is actually shown — and stop on deactivate.
+        void this._host.backend()?.ensureRunning();
+        void this._host.ollama?.()?.ensureRunning();
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {

@@ -7,9 +7,9 @@ from typing import Dict, List
 
 CATALOG: List[Dict] = [
     {"name": "qwen2.5-coder:0.5b", "params": "0.5B", "size_gb": 0.4, "min_ram_gb": 2,
-     "tags": ["coding", "fast"], "description": "Tiny coding model; runs on almost anything."},
+     "tags": ["coding", "fast"], "description": "Tiny coding model; project default; runs on almost anything."},
     {"name": "qwen2.5-coder:1.5b", "params": "1.5B", "size_gb": 1.0, "min_ram_gb": 3,
-     "tags": ["coding", "fast"], "description": "Fast small coding model (project default)."},
+     "tags": ["coding", "fast"], "description": "Fast small coding model."},
     {"name": "gemma3:1b", "params": "1B", "size_gb": 0.8, "min_ram_gb": 3,
      "tags": ["general"], "description": "Google's compact general-purpose model."},
     {"name": "llama3.2:1b", "params": "1B", "size_gb": 1.3, "min_ram_gb": 3,

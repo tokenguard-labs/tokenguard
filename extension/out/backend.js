@@ -36,11 +36,14 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.BackendManager = void 0;
 const vscode = __importStar(require("vscode"));
 const child_process_1 = require("child_process");
+const crypto = __importStar(require("crypto"));
+const net = __importStar(require("net"));
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 // Owns the LocalPilot backend process: spawns `python -m uvicorn backend.main:app` (from the repo root) with the repo's
-// .venv on activation and kills it on deactivate. A backend that is already answering on the
-// configured URL (e.g. started with `make backend`) is reused and never killed.
+// .venv when the sidebar first asks for it and kills it on deactivate. Each spawned session gets a random token
+// (TOKENGUARD_SESSION_TOKEN env var) that is sent with every request; without it `make backend` runs in loopback-only
+// mode. Auto-started backends listen on a free port so they don't clash with dev servers on 8000.
 const STARTUP_TIMEOUT_MS = 60_000;
 const STOP_GRACE_MS = 3_000;
 // Uvicorn logs these lines (on stderr) as it boots; each one advances the progress bar.
@@ -61,6 +64,10 @@ class BackendManager {
     _stderrTail = [];
     _stopping = false;
     _progress = { percent: 0, step: '' };
+    // Random token for this VS Code session, required by the spawned backend on every request.
+    _sessionToken = crypto.randomBytes(32).toString('hex');
+    // Base URL of the backend we spawned (with its auto-picked port); undefined until/unless we own one.
+    _baseUrl;
     _onDidChangeState = new vscode.EventEmitter();
     onDidChangeState = this._onDidChangeState.event;
     _onDidChangeProgress = new vscode.EventEmitter();
@@ -73,6 +80,9 @@ class BackendManager {
     get state() { return this._state; }
     get lastError() { return this._lastError; }
     get progress() { return this._progress; }
+    /** http://127.0.0.1:<free port> of the backend we spawned, once known. */
+    get baseUrl() { return this._baseUrl; }
+    get sessionToken() { return this._sessionToken; }
     /** Resolves once the backend answers /health; starts it if needed. Never rejects. */
     ensureRunning() {
         if (this._starting) {
@@ -195,7 +205,11 @@ class BackendManager {
             return;
         }
         this._setProgress(30, 'Python environment found');
-        const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+        // Auto-start always binds a free port, so it never clashes with dev servers (or the
+        // port a manual `make backend` already holds). tokenguard.apiUrl is only the fallback
+        // address for finding an externally started backend.
+        this._baseUrl = await this._pickPort();
+        const port = new URL(this._baseUrl).port;
         const args = ['-m', 'uvicorn', `${path.basename(backendDir)}.main:app`, '--host', '127.0.0.1', '--port', port];
         this._output.appendLine(`[tokenguard] starting: ${python} ${args.join(' ')}  (cwd ${repoRoot})`);
         this._setState('starting');
@@ -203,7 +217,11 @@ class BackendManager {
         this._stderrTail = [];
         const proc = (0, child_process_1.spawn)(python, args, {
             cwd: repoRoot,
-            env: { ...process.env, PYTHONUNBUFFERED: '1' }
+            env: {
+                ...process.env,
+                PYTHONUNBUFFERED: '1',
+                TOKENGUARD_SESSION_TOKEN: this._sessionToken
+            }
         });
         this._proc = proc;
         proc.stdout?.on('data', d => {
@@ -222,6 +240,7 @@ class BackendManager {
             this._output.appendLine(`[tokenguard] backend exited (code ${code}, signal ${signal})`);
             if (this._proc === proc) {
                 this._proc = undefined;
+                this._baseUrl = undefined;
                 if (this._stopping) {
                     this._setState('stopped');
                 }
@@ -239,24 +258,38 @@ class BackendManager {
             if (proc.exitCode !== null || this._proc !== proc) {
                 return; // exit handler already reported the failure
             }
-            if (await this._healthy()) {
-                this._output.appendLine(`[tokenguard] backend ready at ${this._apiUrl()}`);
+            if (await this._healthy(this._baseUrl ?? this._apiUrl())) {
+                this._output.appendLine(`[tokenguard] backend ready at ${this._baseUrl ?? this._apiUrl()}`);
                 this._setProgress(100, 'Ready');
                 this._setState('running');
                 return;
             }
             await new Promise(r => setTimeout(r, 500));
         }
-        this._setState('failed', `backend did not answer ${this._apiUrl()}/health within ${STARTUP_TIMEOUT_MS / 1000}s`);
+        this._setState('failed', `backend did not answer ${this._baseUrl ?? this._apiUrl()}/health within ${STARTUP_TIMEOUT_MS / 1000}s`);
     }
-    async _healthy() {
+    async _healthy(url = this._apiUrl()) {
         try {
-            const resp = await fetch(`${this._apiUrl()}/health`, { signal: AbortSignal.timeout(2_000) });
+            const resp = await fetch(`${url}/health`, {
+                headers: { 'X-Token-Guard-Session': this._sessionToken },
+                signal: AbortSignal.timeout(2_000)
+            });
             return resp.ok;
         }
         catch {
             return false;
         }
+    }
+    /** Ask the OS for a free TCP port (bind port 0, then release it). */
+    _pickPort() {
+        return new Promise((resolve, reject) => {
+            const server = net.createServer();
+            server.listen(0, '127.0.0.1', () => {
+                const port = server.address().port;
+                server.close(() => resolve(`http://127.0.0.1:${port}`));
+            });
+            server.on('error', reject);
+        });
     }
     /** tokenguard.backendPath, else the backend/ folder next to this extension (repo layout). */
     _backendDir() {

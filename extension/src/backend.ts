@@ -1,11 +1,14 @@
 import * as vscode from 'vscode';
 import { ChildProcess, spawn } from 'child_process';
+import * as crypto from 'crypto';
+import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 
 // Owns the LocalPilot backend process: spawns `python -m uvicorn backend.main:app` (from the repo root) with the repo's
-// .venv on activation and kills it on deactivate. A backend that is already answering on the
-// configured URL (e.g. started with `make backend`) is reused and never killed.
+// .venv when the sidebar first asks for it and kills it on deactivate. Each spawned session gets a random token
+// (TOKENGUARD_SESSION_TOKEN env var) that is sent with every request; without it `make backend` runs in loopback-only
+// mode. Auto-started backends listen on a free port so they don't clash with dev servers on 8000.
 
 const STARTUP_TIMEOUT_MS = 60_000;
 const STOP_GRACE_MS = 3_000;
@@ -34,6 +37,10 @@ export class BackendManager implements vscode.Disposable {
     private _stderrTail: string[] = [];
     private _stopping = false;
     private _progress: BackendProgress = { percent: 0, step: '' };
+    // Random token for this VS Code session, required by the spawned backend on every request.
+    private readonly _sessionToken = crypto.randomBytes(32).toString('hex');
+    // Base URL of the backend we spawned (with its auto-picked port); undefined until/unless we own one.
+    private _baseUrl?: string;
     private readonly _onDidChangeState = new vscode.EventEmitter<BackendState>();
     readonly onDidChangeState = this._onDidChangeState.event;
     private readonly _onDidChangeProgress = new vscode.EventEmitter<BackendProgress>();
@@ -48,6 +55,9 @@ export class BackendManager implements vscode.Disposable {
     get state(): BackendState { return this._state; }
     get lastError(): string | undefined { return this._lastError; }
     get progress(): BackendProgress { return this._progress; }
+    /** http://127.0.0.1:<free port> of the backend we spawned, once known. */
+    get baseUrl(): string | undefined { return this._baseUrl; }
+    get sessionToken(): string { return this._sessionToken; }
 
     /** Resolves once the backend answers /health; starts it if needed. Never rejects. */
     ensureRunning(): Promise<void> {
@@ -179,7 +189,11 @@ export class BackendManager implements vscode.Disposable {
         }
         this._setProgress(30, 'Python environment found');
 
-        const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+        // Auto-start always binds a free port, so it never clashes with dev servers (or the
+        // port a manual `make backend` already holds). tokenguard.apiUrl is only the fallback
+        // address for finding an externally started backend.
+        this._baseUrl = await this._pickPort();
+        const port = new URL(this._baseUrl).port;
         const args = ['-m', 'uvicorn', `${path.basename(backendDir)}.main:app`, '--host', '127.0.0.1', '--port', port];
         this._output.appendLine(`[tokenguard] starting: ${python} ${args.join(' ')}  (cwd ${repoRoot})`);
         this._setState('starting');
@@ -188,7 +202,11 @@ export class BackendManager implements vscode.Disposable {
 
         const proc = spawn(python, args, {
             cwd: repoRoot,
-            env: { ...process.env, PYTHONUNBUFFERED: '1' }
+            env: {
+                ...process.env,
+                PYTHONUNBUFFERED: '1',
+                TOKENGUARD_SESSION_TOKEN: this._sessionToken
+            }
         });
         this._proc = proc;
         proc.stdout?.on('data', d => {
@@ -207,6 +225,7 @@ export class BackendManager implements vscode.Disposable {
             this._output.appendLine(`[tokenguard] backend exited (code ${code}, signal ${signal})`);
             if (this._proc === proc) {
                 this._proc = undefined;
+                this._baseUrl = undefined;
                 if (this._stopping) {
                     this._setState('stopped');
                 } else {
@@ -225,24 +244,39 @@ export class BackendManager implements vscode.Disposable {
             if (proc.exitCode !== null || this._proc !== proc) {
                 return; // exit handler already reported the failure
             }
-            if (await this._healthy()) {
-                this._output.appendLine(`[tokenguard] backend ready at ${this._apiUrl()}`);
+            if (await this._healthy(this._baseUrl ?? this._apiUrl())) {
+                this._output.appendLine(`[tokenguard] backend ready at ${this._baseUrl ?? this._apiUrl()}`);
                 this._setProgress(100, 'Ready');
                 this._setState('running');
                 return;
             }
             await new Promise(r => setTimeout(r, 500));
         }
-        this._setState('failed', `backend did not answer ${this._apiUrl()}/health within ${STARTUP_TIMEOUT_MS / 1000}s`);
+        this._setState('failed', `backend did not answer ${this._baseUrl ?? this._apiUrl()}/health within ${STARTUP_TIMEOUT_MS / 1000}s`);
     }
 
-    private async _healthy(): Promise<boolean> {
+    private async _healthy(url = this._apiUrl()): Promise<boolean> {
         try {
-            const resp = await fetch(`${this._apiUrl()}/health`, { signal: AbortSignal.timeout(2_000) });
+            const resp = await fetch(`${url}/health`, {
+                headers: { 'X-Token-Guard-Session': this._sessionToken },
+                signal: AbortSignal.timeout(2_000)
+            });
             return resp.ok;
         } catch {
             return false;
         }
+    }
+
+    /** Ask the OS for a free TCP port (bind port 0, then release it). */
+    private _pickPort(): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const server = net.createServer();
+            server.listen(0, '127.0.0.1', () => {
+                const port = (server.address() as net.AddressInfo).port;
+                server.close(() => resolve(`http://127.0.0.1:${port}`));
+            });
+            server.on('error', reject);
+        });
     }
 
     /** tokenguard.backendPath, else the backend/ folder next to this extension (repo layout). */

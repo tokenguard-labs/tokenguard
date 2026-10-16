@@ -9,10 +9,13 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [
-    "onStartupFinished",
-    "onView:localpilot.chatView"
-  ],
+  "capabilities": {
+    "virtualWorkspaces": false,
+    "untrustedWorkspaces": {
+      "supported": "limited",
+      "description": "Reads workspace files for routing context, indexes the repo, and runs the agent loop that stages edits and commands in the workspace."
+    }
+  },
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -93,12 +96,12 @@
         "tokenguard.apiUrl": {
           "type": "string",
           "default": "http://localhost:8000",
-          "description": "URL of the LocalPilot backend (backend/main.py)."
+          "description": "Address of an already-running LocalPilot backend to reuse (e.g. one started with `make backend`). When the extension starts its own backend it binds a free port instead of using this."
         },
         "tokenguard.autoStartBackend": {
           "type": "boolean",
           "default": true,
-          "description": "Start the LocalPilot backend as a child process when VS Code opens (and stop it on exit). Ignored if a backend already answers on tokenguard.apiUrl."
+          "description": "Start the LocalPilot backend as a child process on a free port when the sidebar is first opened (and stop it on exit). Ignored if a backend already answers on tokenguard.apiUrl."
         },
         "tokenguard.backendPath": {
           "type": "string",
@@ -147,7 +150,7 @@
         "tokenguard.localModel": {
           "type": "string",
           "default": "",
-          "description": "Ollama model used for local inference (e.g. qwen2.5-coder:1.5b). Empty: LOCAL_MODEL from backend/.env. Pick one from the LocalPilot sidebar dropdown."
+          "description": "Ollama model used for local inference (e.g. qwen2.5-coder:0.5b). Empty: LOCAL_MODEL from backend/.env. Pick one from the LocalPilot sidebar dropdown."
         },
         "tokenguard.ollamaUrl": {
           "type": "string",
@@ -157,12 +160,12 @@
         "tokenguard.preloadLocalModel": {
           "type": "boolean",
           "default": true,
-          "description": "Load the selected local model when VS Code opens so the first local prompt is warm (it stays loaded until exit)."
+          "description": "Load the selected local model when the sidebar opens so the first local prompt is warm (it stays loaded until exit)."
         },
         "tokenguard.autoStartOllama": {
           "type": "boolean",
           "default": true,
-          "description": "Start `ollama serve` with the extension when it isn't already running. Ollama is stopped again when VS Code closes."
+          "description": "Start `ollama serve` with the backend the first time the sidebar opens (when it isn't already running). Ollama is stopped again when VS Code closes."
         },
         "tokenguard.stopOllamaOnExit": {
           "type": "boolean",
