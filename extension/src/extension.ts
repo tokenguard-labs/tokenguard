@@ -21,7 +21,7 @@ export function activate(context: vscode.ExtensionContext) {
     extensionContext = context;
 
     const output = vscode.window.createOutputChannel('LocalPilot Backend');
-    backend = new BackendManager(context.extensionPath, output, apiUrl);
+    backend = new BackendManager(context.extensionPath, context.globalStorageUri.fsPath, output, apiUrl);
     ollama = new OllamaManager(context.extensionPath, output, ollamaUrl);
     context.subscriptions.push(output, backend, ollama);
 

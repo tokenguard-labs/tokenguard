@@ -52,7 +52,7 @@ function activate(context) {
     console.log('⚡ LocalPilot extension activated successfully!');
     extensionContext = context;
     const output = vscode.window.createOutputChannel('LocalPilot Backend');
-    backend = new backend_1.BackendManager(context.extensionPath, output, apiUrl);
+    backend = new backend_1.BackendManager(context.extensionPath, context.globalStorageUri.fsPath, output, apiUrl);
     ollama = new ollama_1.OllamaManager(context.extensionPath, output, ollamaUrl);
     context.subscriptions.push(output, backend, ollama);
     viewProvider = new chatView_1.LocalPilotViewProvider(context.extensionUri, {

@@ -10,3 +10,7 @@ vsc-extension-quickstart.md
 **/*.ts
 **/.vscode-test.*
 scripts/**
+node_modules/**
+requirements.runtime.txt
+python/**/__pycache__/**
+out/test/**
