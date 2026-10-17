@@ -34,6 +34,8 @@ var __importStar = (this && this.__importStar) || (function () {
 })();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.LocalPilotViewProvider = void 0;
+exports.currentText = currentText;
+exports.applyChange = applyChange;
 const fs = __importStar(require("fs"));
 const path = __importStar(require("path"));
 const vscode = __importStar(require("vscode"));
@@ -216,6 +218,11 @@ class LocalPilotViewProvider {
                         break;
                     }
                 }
+                // RAM check: warn before loading a model bigger than this machine holds comfortably.
+                if (model && !(await this._warnOnFit(model))) {
+                    await this._postStatus(); // declined: reset the dropdown to the saved value
+                    break;
+                }
                 await vscode.workspace.getConfiguration('tokenguard')
                     .update('localModel', model, vscode.ConfigurationTarget.Global);
                 this._preloadSuppressed = false;
@@ -313,7 +320,7 @@ class LocalPilotViewProvider {
         // Backend still booting (or not started yet): show the spinner and keep polling instead
         // of flashing "offline" — the first /health can fail before uvicorn finishes importing.
         if (state === 'starting' || state === 'stopped' || state === undefined) {
-            this._post({ type: 'status', online: false, starting: true, apiUrl, localModel });
+            this._post({ type: 'status', online: false, starting: true, apiUrl, localModel, progress: backend?.progress });
             void backend?.ensureRunning();
             this._scheduleRetry();
             return;
@@ -402,6 +409,29 @@ class LocalPilotViewProvider {
         await this._host.switchLocalModel(selected);
         this._post({ type: 'modelLoading', model: null }); // clear the spinner either way
         void this._postStatus(); // reflect "loaded in memory" in the sidebar
+    }
+    /** RAM check for a local model: resolve true when loading may proceed (after any warning). */
+    async _warnOnFit(model) {
+        let info;
+        try {
+            info = await this._host.api('GET', '/models', undefined, 10_000);
+        }
+        catch {
+            return true; // backend unreachable: don't block the switch
+        }
+        const f = info?.fit?.[model];
+        if (!f || f.comfortable !== false) {
+            return true;
+        }
+        const host = `this machine (${info.system?.total_ram_gb ?? '?'} GB RAM` +
+            (info.system?.swap_total_gb ? ` + ${info.system.swap_total_gb} GB swap` : '') +
+            (info.system?.has_gpu ? ` + ${info.system.gpu_vram_gb} GB VRAM` : '') + ')';
+        if (f.fits === false) {
+            const choice = await vscode.window.showWarningMessage(`"${model}" wants ~${f.min_ram_gb} GB RAM/VRAM — more than ${host}. Ollama will likely swap heavily or fail.`, { modal: true }, 'Load anyway');
+            return choice === 'Load anyway';
+        }
+        await vscode.window.showWarningMessage(`"${model}" (~${f.size_gb} GB) doesn't fit in ${host} comfortably — it will use swap, so answers get slower.`);
+        return true;
     }
     /** Track a turn's request so the Stop button can abort it. */
     _track(id) {
@@ -624,7 +654,10 @@ class LocalPilotViewProvider {
             }
             try {
                 const current = await currentText(uri);
-                if (current !== (change.original ?? undefined)) {
+                // For a modified/deleted file, a different current text means concurrent edits:
+                // ask. A new file has nothing to compare against (cancelled inline reviews leave an
+                // empty shell), and accepting it means writing the proposal, so no prompt.
+                if (change.status !== 'added' && current !== (change.original ?? undefined)) {
                     const choice = await vscode.window.showWarningMessage(`${file} has changed since the agent read it. Replace it with the agent's version anyway?`, { modal: true }, 'Replace');
                     if (choice !== 'Replace') {
                         results.push({ path: file, state: 'pending', reason: 'changed since the agent read it' });

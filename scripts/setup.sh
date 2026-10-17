@@ -60,7 +60,7 @@ env_get() { sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$BACKEND/.en
 # --- 3. Ollama --------------------------------------------------------------------------------
 step "Ollama (local LLM)"
 OLLAMA_URL="${OLLAMA_URL:-$(env_get OLLAMA_URL)}"; OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
-LOCAL_MODEL="${LOCAL_MODEL:-$(env_get LOCAL_MODEL)}"; LOCAL_MODEL="${LOCAL_MODEL:-qwen2.5-coder:1.5b}"
+LOCAL_MODEL="${LOCAL_MODEL:-$(env_get LOCAL_MODEL)}"; LOCAL_MODEL="${LOCAL_MODEL:-qwen2.5-coder:0.5b}"
 
 ollama_up() { curl -sf --max-time 3 "$OLLAMA_URL/api/tags" >/dev/null 2>&1; }
 

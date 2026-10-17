@@ -114,6 +114,7 @@ button.secondary:hover { background: var(--vscode-button-secondaryHoverBackgroun
     background: var(--vscode-editor-inactiveSelectionBackground);
 }
 .status .offline { color: var(--vscode-errorForeground); }
+/* Backend startup progress reuses the .progress bar defined with the download styles. */
 .stats { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; opacity: 0.85; }
 .chat-history { margin-top: 10px; display: flex; flex-direction: column; gap: 10px; }
 .chat-history:empty { display: none; }
@@ -146,6 +147,7 @@ button.secondary:hover { background: var(--vscode-button-secondaryHoverBackgroun
 .warn { color: var(--vscode-editorWarning-foreground); margin: 6px 0; }
 .error { color: var(--vscode-errorForeground); white-space: pre-wrap; }
 .muted { opacity: 0.75; font-size: 11px; }
+.ramwarn { color: var(--vscode-editorWarning-foreground, #e9c46a); }
 .spinner { opacity: 0.8; font-style: italic; }
 .cancelled { opacity: 0.85; font-style: italic; }
 ul { margin: 4px 0; padding-left: 16px; }

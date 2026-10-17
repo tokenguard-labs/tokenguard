@@ -2,11 +2,16 @@ import * as vscode from 'vscode';
 import { ChildProcess, execFile, spawn } from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as net from 'net';
 import * as path from 'path';
 
-// Owns the LocalPilot backend process: spawns `python -m uvicorn backend.main:app` on activation
-// and kills it on deactivate. A backend that is already answering on the configured URL
-// (e.g. started with `make backend`) is reused and never killed.
+// Owns the LocalPilot backend process: spawns `python -m uvicorn backend.main:app` the first time
+// the chat asks for it and kills it on deactivate. A backend that is already answering on the
+// configured URL (e.g. started with `make backend`) is reused and never killed.
+//
+// Each spawned session gets a random token (TOKENGUARD_SESSION_TOKEN env var) that is sent with
+// every request; without it `make backend` runs in loopback-only mode. Auto-started backends listen
+// on a free port so they don't clash with dev servers on 8000.
 //
 // Where the backend comes from, first match wins:
 //   1. tokenguard.backendPath (+ tokenguard.pythonPath or <repo>/.venv): development override.
@@ -42,9 +47,25 @@ interface Runtime {
     /** Folder containing the backend/ and compression/ packages; uvicorn runs from here. */
     root: string;
     python: string;
+    /** The backend package's folder name under `root` (normally "backend"). */
+    module: string;
 }
 
 export type BackendState = 'stopped' | 'starting' | 'running' | 'external' | 'failed';
+
+/** How far along backend startup is, for the sidebar's progress bar. */
+export interface BackendProgress {
+    percent: number; // 0..100
+    step: string;
+}
+
+// Uvicorn logs these lines (on stderr) as it boots; each one advances the progress bar.
+const STARTUP_MILESTONES: [RegExp, number, string][] = [
+    [/Started server process/i, 55, 'Server process started'],
+    [/Waiting for application startup/i, 70, 'Loading the application'],
+    [/Application startup complete/i, 90, 'Application ready'],
+    [/Uvicorn running on/i, 95, 'Waiting for the health check'],
+];
 
 export class BackendManager implements vscode.Disposable {
     private _proc?: ChildProcess;
@@ -53,8 +74,15 @@ export class BackendManager implements vscode.Disposable {
     private _lastError?: string;
     private _stderrTail: string[] = [];
     private _stopping = false;
+    private _progress: BackendProgress = { percent: 0, step: '' };
+    // Random token for this VS Code session, required by the spawned backend on every request.
+    private readonly _sessionToken = crypto.randomBytes(32).toString('hex');
+    // Base URL of the backend we spawned (with its auto-picked port); undefined until/unless we own one.
+    private _baseUrl?: string;
     private readonly _onDidChangeState = new vscode.EventEmitter<BackendState>();
     readonly onDidChangeState = this._onDidChangeState.event;
+    private readonly _onDidChangeProgress = new vscode.EventEmitter<BackendProgress>();
+    readonly onDidChangeProgress = this._onDidChangeProgress.event;
 
     constructor(
         private readonly _extensionPath: string,
@@ -65,6 +93,10 @@ export class BackendManager implements vscode.Disposable {
 
     get state(): BackendState { return this._state; }
     get lastError(): string | undefined { return this._lastError; }
+    get progress(): BackendProgress { return this._progress; }
+    /** http://127.0.0.1:<free port> of the backend we spawned, once known. */
+    get baseUrl(): string | undefined { return this._baseUrl; }
+    get sessionToken(): string { return this._sessionToken; }
 
     /** Resolves once the backend answers /health; starts it if needed. Never rejects. */
     ensureRunning(): Promise<void> {
@@ -89,6 +121,7 @@ export class BackendManager implements vscode.Disposable {
         }
         this._output.appendLine('[tokenguard] stopping backend…');
         this._stopping = true;
+        this._setProgress(0, '');
         const exited = new Promise<void>(resolve => proc.once('exit', () => resolve()));
         proc.kill('SIGTERM');
         const timer = setTimeout(() => proc.kill('SIGKILL'), STOP_GRACE_MS);
@@ -121,6 +154,7 @@ export class BackendManager implements vscode.Disposable {
     dispose(): void {
         void this.stop();
         this._onDidChangeState.dispose();
+        this._onDidChangeProgress.dispose();
     }
 
     private _setState(state: BackendState, error?: string) {
@@ -130,6 +164,27 @@ export class BackendManager implements vscode.Disposable {
             this._output.appendLine(`[tokenguard] ${error}`);
         }
         this._onDidChangeState.fire(state);
+    }
+
+    /** The bar never moves backwards (except an explicit reset to 0 on stop/launch). */
+    private _setProgress(percent: number, step: string) {
+        if (percent !== 0 && percent < this._progress.percent) {
+            return;
+        }
+        if (percent === this._progress.percent && step === this._progress.step) {
+            return;
+        }
+        this._progress = { percent, step };
+        this._onDidChangeProgress.fire(this._progress);
+    }
+
+    /** Advance the bar when a uvicorn boot milestone scrolls by on stdout/stderr. */
+    private _observeOutput(text: string) {
+        for (const [pattern, percent, step] of STARTUP_MILESTONES) {
+            if (pattern.test(text)) {
+                this._setProgress(percent, step);
+            }
+        }
     }
 
     private async _ensure(): Promise<void> {
@@ -146,6 +201,7 @@ export class BackendManager implements vscode.Disposable {
         }
 
         const cfg = vscode.workspace.getConfiguration('tokenguard');
+        this._setProgress(5, 'Checking configuration');
         if (!cfg.get<boolean>('autoStartBackend', true)) {
             this._setState('stopped', 'auto-start disabled (tokenguard.autoStartBackend)');
             return;
@@ -160,23 +216,38 @@ export class BackendManager implements vscode.Disposable {
         if (!runtime) {
             return; // _runtime() already reported why
         }
+        this._setProgress(30, 'Python environment found');
 
-        const port = url.port || (url.protocol === 'https:' ? '443' : '80');
-        const { root, python } = runtime;
-        const args = ['-m', 'uvicorn', 'backend.main:app', '--host', '127.0.0.1', '--port', port];
+        // Auto-start always binds a free port, so it never clashes with dev servers (or the
+        // port a manual `make backend` already holds). tokenguard.apiUrl is only the fallback
+        // address for finding an externally started backend.
+        this._baseUrl = await this._pickPort();
+        const port = new URL(this._baseUrl).port;
+        const { root, python, module } = runtime;
+        const args = ['-m', 'uvicorn', `${module}.main:app`, '--host', '127.0.0.1', '--port', port];
         this._output.appendLine(`[tokenguard] starting: ${python} ${args.join(' ')}  (cwd ${root})`);
         this._setState('starting');
+        this._setProgress(40, 'Launching the server');
         this._stderrTail = [];
 
         const proc = spawn(python, args, {
             cwd: root,
-            env: { ...process.env, PYTHONUNBUFFERED: '1' }
+            env: {
+                ...process.env,
+                PYTHONUNBUFFERED: '1',
+                TOKENGUARD_SESSION_TOKEN: this._sessionToken
+            }
         });
         this._proc = proc;
-        proc.stdout?.on('data', d => this._output.append(d.toString()));
+        proc.stdout?.on('data', d => {
+            const text = d.toString();
+            this._output.append(text);
+            this._observeOutput(text);
+        });
         proc.stderr?.on('data', d => {
             const text = d.toString();
             this._output.append(text);
+            this._observeOutput(text);
             this._stderrTail = [...this._stderrTail, ...text.split('\n').filter(Boolean)].slice(-5);
         });
         proc.on('error', err => this._output.appendLine(`[tokenguard] spawn failed: ${err.message}`));
@@ -184,6 +255,7 @@ export class BackendManager implements vscode.Disposable {
             this._output.appendLine(`[tokenguard] backend exited (code ${code}, signal ${signal})`);
             if (this._proc === proc) {
                 this._proc = undefined;
+                this._baseUrl = undefined;
                 if (this._stopping) {
                     this._setState('stopped');
                 } else {
@@ -202,19 +274,23 @@ export class BackendManager implements vscode.Disposable {
             if (proc.exitCode !== null || this._proc !== proc) {
                 return; // exit handler already reported the failure
             }
-            if (await this._healthy()) {
-                this._output.appendLine(`[tokenguard] backend ready at ${this._apiUrl()}`);
+            if (await this._healthy(this._baseUrl ?? this._apiUrl())) {
+                this._output.appendLine(`[tokenguard] backend ready at ${this._baseUrl ?? this._apiUrl()}`);
+                this._setProgress(100, 'Ready');
                 this._setState('running');
                 return;
             }
             await new Promise(r => setTimeout(r, 500));
         }
-        this._setState('failed', `backend did not answer ${this._apiUrl()}/health within ${STARTUP_TIMEOUT_MS / 1000}s`);
+        this._setState('failed', `backend did not answer ${this._baseUrl ?? this._apiUrl()}/health within ${STARTUP_TIMEOUT_MS / 1000}s`);
     }
 
-    private async _healthy(): Promise<boolean> {
+    private async _healthy(url = this._apiUrl()): Promise<boolean> {
         try {
-            const resp = await fetch(`${this._apiUrl()}/health`, { signal: AbortSignal.timeout(2_000) });
+            const resp = await fetch(`${url}/health`, {
+                headers: { 'X-Token-Guard-Session': this._sessionToken },
+                signal: AbortSignal.timeout(2_000)
+            });
             return resp.ok;
         } catch {
             return false;
@@ -243,7 +319,8 @@ export class BackendManager implements vscode.Disposable {
                 void this._offerSetup(root);
                 return undefined;
             }
-            return { root, python };
+            this._setProgress(20, 'Backend found');
+            return { root, python, module: path.basename(devDir) };
         }
 
         // 3: the copy bundled into the VSIX, with the extension's own venv.
@@ -253,8 +330,21 @@ export class BackendManager implements vscode.Disposable {
                 'or set tokenguard.backendPath to a backend/ folder.');
             return undefined;
         }
+        this._setProgress(20, 'Backend found');
         const python = configuredPython ?? await this._ensureVenv(path.join(root, 'requirements.txt'));
-        return python ? { root, python } : undefined;
+        return python ? { root, python, module: 'backend' } : undefined;
+    }
+
+    /** Ask the OS for a free TCP port (bind port 0, then release it). */
+    private _pickPort(): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const server = net.createServer();
+            server.listen(0, '127.0.0.1', () => {
+                const port = (server.address() as net.AddressInfo).port;
+                server.close(() => resolve(`http://127.0.0.1:${port}`));
+            });
+            server.on('error', reject);
+        });
     }
 
     /** <repo>/.venv's interpreter, if it exists. */

@@ -204,6 +204,7 @@ export class InlineDiffManager implements vscode.CodeLensProvider, vscode.Dispos
         }
         const doc = await vscode.workspace.openTextDocument(review.uri);
         const edit = new vscode.WorkspaceEdit();
+        let hadOps = false; // an empty edit: accept of a brand-new file has no red lines to drop
         for (const hunk of chosen) {
             // Accept drops the old (red) lines; reject drops the new (green) ones.
             const [from, count] = accept
@@ -211,9 +212,12 @@ export class InlineDiffManager implements vscode.CodeLensProvider, vscode.Dispos
                 : [hunk.start + hunk.removed.length, hunk.added.length];
             if (count) {
                 edit.delete(review.uri, lineSpan(doc, from, count));
+                hadOps = true;
             }
         }
-        if (!(await this._apply(edit))) {
+        // Recent VS Code versions report `false` and a warning for an empty edit, which read as an
+        // error for new-file accepts; skip the call when there is nothing to remove.
+        if (hadOps && !(await this._apply(edit))) {
             void vscode.window.showWarningMessage('TokenGuard: could not apply that choice to the file.');
             return;
         }

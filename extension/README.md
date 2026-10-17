@@ -29,7 +29,7 @@ Marketplace READMEs must not use SVG images. -->
 1. Install the extension and click the **LocalPilot** icon in the Activity Bar (or run **TokenGuard: Open LocalPilot**) to open the chat in the right side bar. You can drag it to the left side bar if you prefer. The backend and Ollama start the first time the chat opens.
 2. Wait for the backend to start. The first run shows a progress notification while dependencies install.
 3. Pick a cloud provider and model in the model panel, then set an API key with **TokenGuard: Set Cloud API Key**.
-4. Optional: pick a local model. If it isn't downloaded yet, the extension offers to download it.
+4. Optional: pick a local model. The list recommends models that fit this machine's RAM/VRAM. If the one you pick isn't downloaded yet, the extension offers to download it, and it warns before loading a model that would need swap or is too big for this machine.
 5. Ask a question. Selected code and the active workspace are used as context.
 
 ## Commands
@@ -60,7 +60,7 @@ Marketplace READMEs must not use SVG images. -->
 | `tokenguard.stopOllamaOnExit` | `true` | Stop the Ollama process that TokenGuard started when VS Code closes |
 | `tokenguard.preloadLocalModel` | `true` | Load the local model at startup so the first answer is fast |
 | `tokenguard.agentInlineReview` | `true` | Open changed files with in-place Accept / Reject after an agent run |
-| `tokenguard.apiUrl` | `http://localhost:8000` | Backend URL |
+| `tokenguard.apiUrl` | `http://localhost:8000` | An already-running backend to reuse. A backend the extension starts itself uses a free port |
 | `tokenguard.autoStartBackend` | `true` | Start the bundled backend with VS Code |
 | `tokenguard.backendPath` | *(empty)* | Development override: a `backend/` folder from a source checkout |
 | `tokenguard.pythonPath` | *(empty)* | Use this interpreter instead of the managed virtual environment. It must already have the backend dependencies installed |
@@ -82,7 +82,6 @@ Marketplace READMEs must not use SVG images. -->
 ## Troubleshooting
 
 - **The backend doesn't start.** Open **TokenGuard: Show Backend Log**. First-run setup needs internet access (PyPI, plus GitHub if a Python has to be downloaded). Behind a proxy or offline, set `tokenguard.pythonPath` to a Python that already has the backend dependencies installed. Then run **TokenGuard: Restart Backend**.
-- **Port 8000 is in use.** Change `tokenguard.apiUrl`, for example to `http://localhost:8765`.
 - **Local answers are slow.** Large contexts on CPU-only machines can take a while. Use a smaller model or ask with less code selected.
 
 ## License

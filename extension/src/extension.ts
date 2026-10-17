@@ -51,6 +51,8 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(
         viewProvider,
         backend.onDidChangeState(() => viewProvider?.refreshStatus()),
+        // Startup milestones: keep the chat's progress bar moving while the backend boots.
+        backend.onDidChangeProgress(() => viewProvider?.refreshStatus()),
         // Tell the sidebar what Ollama is doing; once it is up, refresh so the selected model loads.
         ollama.onDidChangeState(() => {
             viewProvider?.postOllamaState();
@@ -294,6 +296,12 @@ async function promptForModelIfNone(): Promise<void> {
 }
 
 function apiUrl(): string {
+    // The backend we spawned binds a free port and reports it via baseUrl; the configured
+    // address is only the default/fallback for finding an externally started backend.
+    const spawned = backend?.baseUrl;
+    if (spawned) {
+        return spawned;
+    }
     const url = vscode.workspace.getConfiguration('tokenguard').get<string>('apiUrl') || 'http://localhost:8000';
     return url.replace(/\/+$/, '');
 }
@@ -330,7 +338,12 @@ async function getApiKey(provider: string): Promise<string | undefined> {
 /** LLM settings forwarded to the backend on every request. The key never touches disk. */
 async function llmHeaders(): Promise<Record<string, string>> {
     const provider = cloudProvider();
-    const headers: Record<string, string> = { 'X-LLM-Provider': provider };
+    const headers: Record<string, string> = {
+        'X-LLM-Provider': provider,
+        // The spawned backend requires this session token (see backend/main.py); a manually
+        // started `make backend` runs in loopback-only mode and ignores it.
+        'X-Token-Guard-Session': backend?.sessionToken ?? ''
+    };
     const model = cloudModel();
     if (model) {
         headers['X-LLM-Model'] = model;
@@ -357,7 +370,7 @@ async function switchLocalModel(model: string): Promise<void> {
     try {
         await fetch(`${apiUrl()}/local-model`, {
             method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
+            headers: { 'Content-Type': 'application/json', 'X-Token-Guard-Session': backend?.sessionToken ?? '' },
             body: JSON.stringify({ model: model || null, preload: true }),
             signal: AbortSignal.timeout(60_000)
         });
