@@ -1,5 +1,5 @@
 {
-  "name": "tokenguard",
+  "name": "tokenguard-localpilot",
   "displayName": "TokenGuard — LocalPilot",
   "description": "Local-first AI coding assistant: answers simple questions with a local Ollama model and sends hard ones to a cloud LLM with only the relevant, secret-redacted code.",
   "version": "0.1.1",

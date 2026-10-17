@@ -58,9 +58,9 @@ jobs:
       - name: Publish
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
-        run: npx vsce publish $CHANNEL_FLAG --packagePath tokenguard-*.vsix
+        run: npx vsce publish $CHANNEL_FLAG --packagePath tokenguard-localpilot-*.vsix
 
       - uses: actions/upload-artifact@v4
         with:
           name: vsix
-          path: extension/tokenguard-*.vsix
+          path: extension/tokenguard-localpilot-*.vsix
