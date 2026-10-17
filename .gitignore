@@ -26,6 +26,7 @@ examples/frozen_repo/
 node_modules/
 .vscode-test/
 *.vsix
+extension/python/
 npm-debug.log*
 
 # OS / editor

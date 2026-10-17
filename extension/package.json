@@ -1,13 +1,45 @@
 {
   "name": "tokenguard",
-  "displayName": "TokenGuard",
-  "description": "AI Router and token optimizer",
-  "version": "0.0.1",
+  "displayName": "TokenGuard — LocalPilot",
+  "description": "Local-first AI coding assistant: answers simple questions with a local Ollama model and sends hard ones to a cloud LLM with only the relevant, secret-redacted code.",
+  "version": "0.1.0",
+  "publisher": "tokenguard-labs",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "preview": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tokenguard-labs/tokenguard.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tokenguard-labs/tokenguard/issues"
+  },
+  "homepage": "https://github.com/tokenguard-labs/tokenguard#readme",
+  "keywords": [
+    "ai",
+    "llm",
+    "ollama",
+    "local llm",
+    "chat",
+    "agent",
+    "privacy",
+    "token",
+    "router",
+    "deepseek",
+    "claude",
+    "openai"
+  ],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
   "engines": {
     "vscode": "^1.82.0"
   },
   "categories": [
-    "Other"
+    "AI",
+    "Chat",
+    "Programming Languages"
   ],
   "capabilities": {
     "virtualWorkspaces": false,
@@ -52,8 +84,23 @@
         "category": "TokenGuard"
       },
       {
+        "command": "tokenguard.startOllama",
+        "title": "Start Ollama Server",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.installOllama",
+        "title": "Install Ollama",
+        "category": "TokenGuard"
+      },
+      {
         "command": "tokenguard.pullLocalModel",
         "title": "Download Local Model",
+        "category": "TokenGuard"
+      },
+      {
+        "command": "tokenguard.deleteLocalModel",
+        "title": "Delete Local Model",
         "category": "TokenGuard"
       },
       {
@@ -106,12 +153,12 @@
         "tokenguard.backendPath": {
           "type": "string",
           "default": "",
-          "description": "Path to the backend/ folder. Empty: the backend/ folder next to this extension in the TokenGuard repo."
+          "description": "Development override: path to a backend/ folder (e.g. in a TokenGuard checkout). Empty: the backend bundled with the extension."
         },
         "tokenguard.pythonPath": {
           "type": "string",
           "default": "",
-          "description": "Python interpreter for the backend. Empty: <repo>/.venv (created by `make setup`)."
+          "description": "Python interpreter for the backend; it must already have the backend dependencies installed. Empty: a venv the extension creates in its storage folder on first run (from an installed Python 3.9+, or a downloaded standalone Python if none is found), or <repo>/.venv for a source checkout."
         },
         "tokenguard.cloudProvider": {
           "type": "string",
@@ -181,13 +228,14 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run compile && node scripts/copy-backend.mjs",
     "vendor": "node scripts/copy-vendor.mjs",
     "compile": "npm run vendor && tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "package": "vsce package"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -195,6 +243,7 @@
     "@types/vscode": "^1.80.0",
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.0.0",
+    "@vscode/vsce": "^3.9.2",
     "eslint": "^10.5.0",
     "typescript": "^6.0.3",
     "typescript-eslint": "^8.61.1"

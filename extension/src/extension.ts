@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { BackendManager } from './backend';
 import { LocalPilotViewProvider } from './chatView';
-import { OllamaManager } from './ollama';
+import { OLLAMA_DOWNLOAD_PAGE, OllamaManager } from './ollama';
 
 // Activation, commands, settings and the HTTP client for the LocalPilot backend
 // (backend/main.py). The sidebar chat lives in chatView.ts + media/chat/.
@@ -21,13 +21,12 @@ export function activate(context: vscode.ExtensionContext) {
     extensionContext = context;
 
     const output = vscode.window.createOutputChannel('LocalPilot Backend');
-    backend = new BackendManager(context.extensionPath, output, apiUrl);
+    backend = new BackendManager(context.extensionPath, context.globalStorageUri.fsPath, output, apiUrl);
     ollama = new OllamaManager(context.extensionPath, output, ollamaUrl);
     context.subscriptions.push(output, backend, ollama);
 
     viewProvider = new LocalPilotViewProvider(context.extensionUri, {
         backend: () => backend,
-        ollama: () => ollama,
         api,
         apiStream,
         apiUrl,
@@ -42,15 +41,21 @@ export function activate(context: vscode.ExtensionContext) {
             }
         },
         switchLocalModel,
-        downloadLocalModel
+        downloadLocalModel,
+        cancelDownload,
+        deleteLocalModel,
+        ollama: () => ollama
     });
     context.subscriptions.push(
         viewProvider,
         backend.onDidChangeState(() => viewProvider?.refreshStatus()),
         // Startup milestones: keep the sidebar's progress bar moving while the backend boots.
         backend.onDidChangeProgress(() => viewProvider?.refreshStatus()),
-        // When Ollama comes up (we may have just started it), refresh so the selected model loads.
-        ollama.onDidChangeState(() => viewProvider?.refreshStatus())
+        // Tell the sidebar what Ollama is doing; once it is up, refresh so the selected model loads.
+        ollama.onDidChangeState(() => {
+            viewProvider?.postOllamaState();
+            viewProvider?.refreshStatus();
+        })
     );
 
     // Last-resort cleanup if VS Code exits without calling deactivate().
@@ -90,7 +95,10 @@ export function activate(context: vscode.ExtensionContext) {
         vscode.commands.registerCommand('tokenguard.clearChat', () => viewProvider?.clearChat()),
         vscode.commands.registerCommand('tokenguard.setApiKey', () => setApiKey()),
         vscode.commands.registerCommand('tokenguard.clearApiKey', () => clearApiKey()),
+        vscode.commands.registerCommand('tokenguard.startOllama', () => startOllamaFlow(true)),
+        vscode.commands.registerCommand('tokenguard.installOllama', () => installOllamaFlow()),
         vscode.commands.registerCommand('tokenguard.pullLocalModel', () => pullLocalModelCommand()),
+        vscode.commands.registerCommand('tokenguard.deleteLocalModel', () => deleteLocalModelCommand()),
         vscode.commands.registerCommand('tokenguard.stopLocalModels', async () => {
             const freed = await ollama?.unloadModels();
             viewProvider?.suppressPreload();
@@ -99,11 +107,124 @@ export function activate(context: vscode.ExtensionContext) {
             await viewProvider?.refreshStatus();
         })
     );
+
 }
 
 export function deactivate(): Promise<void> | undefined {
     // Stop everything this extension started: backend, local model memory, and our Ollama.
     return Promise.all([backend?.stop(), ollama?.stop()]).then(() => undefined);
+}
+
+/**
+ * Make sure the Ollama server is up, with feedback as needed: a status-bar note when it is already
+ * running, a progress notification while it starts, an install offer when it is missing, and a
+ * "please download a model" prompt when no model is pulled yet.
+ */
+async function startOllamaFlow(force: boolean): Promise<void> {
+    const om = ollama;
+    if (!om) {
+        return;
+    }
+    if (await om.isHealthy()) {
+        await om.ensureRunning(); // records the state for the sidebar
+        vscode.window.setStatusBarMessage('$(check) TokenGuard: Ollama server is running', 5_000);
+    } else {
+        await vscode.window.withProgress(
+            { location: vscode.ProgressLocation.Notification, title: 'TokenGuard' },
+            async progress => {
+                progress.report({ message: 'checking Ollama server…' });
+                const sub = om.onDidChangeState(state => {
+                    if (state === 'starting') {
+                        progress.report({ message: 'Ollama server is not running — starting it…' });
+                    }
+                });
+                try {
+                    await om.ensureRunning(force);
+                } finally {
+                    sub.dispose();
+                }
+            }
+        );
+    }
+
+    switch (om.state) {
+        case 'running':
+        case 'external':
+            if (om.state === 'running') {
+                vscode.window.setStatusBarMessage('$(check) TokenGuard: Ollama server started', 5_000);
+            }
+            await promptForModelIfNone();
+            return;
+        case 'missing': {
+            const install = om.canInstall() ? 'Install Ollama' : 'Open Download Page';
+            const choice = await vscode.window.showWarningMessage(
+                'TokenGuard: Ollama is not installed. It is needed to run local models.', install, 'Not now');
+            if (choice === install) {
+                await installOllamaFlow();
+            }
+            return;
+        }
+        case 'failed': {
+            const choice = await vscode.window.showErrorMessage(
+                `TokenGuard: could not start the Ollama server. ${om.lastError ?? ''}`, 'Try Again', 'Show Log');
+            if (choice === 'Try Again') {
+                await startOllamaFlow(true);
+            } else if (choice === 'Show Log') {
+                await vscode.commands.executeCommand('tokenguard.showBackendLog');
+            }
+            return;
+        }
+        case 'stopped': {
+            if (force) {
+                return;
+            }
+            const choice = await vscode.window.showInformationMessage(
+                'TokenGuard: the Ollama server is not running (tokenguard.autoStartOllama is off).', 'Start Ollama');
+            if (choice === 'Start Ollama') {
+                await startOllamaFlow(true);
+            }
+            return;
+        }
+    }
+}
+
+/** "TokenGuard: Install Ollama" — run the official installer, then start the server. */
+async function installOllamaFlow(): Promise<void> {
+    const om = ollama;
+    if (!om) {
+        return;
+    }
+    if (!om.canInstall()) {
+        void vscode.env.openExternal(vscode.Uri.parse(OLLAMA_DOWNLOAD_PAGE));
+        return;
+    }
+    if (await om.install()) {
+        void vscode.window.showInformationMessage('TokenGuard: Ollama installed.');
+        await startOllamaFlow(true);
+    } else {
+        const choice = await vscode.window.showErrorMessage(
+            `TokenGuard: Ollama was not installed. ${om.lastError ?? ''}`, 'Try Again', 'Open Download Page');
+        if (choice === 'Try Again') {
+            await installOllamaFlow();
+        } else if (choice === 'Open Download Page') {
+            void vscode.env.openExternal(vscode.Uri.parse(OLLAMA_DOWNLOAD_PAGE));
+        }
+    }
+}
+
+/** Ollama is up but has no model pulled: ask the user to download one. */
+async function promptForModelIfNone(): Promise<void> {
+    const models = await ollama?.listModels();
+    if (!models || models.length) {
+        return;
+    }
+    const choice = await vscode.window.showWarningMessage(
+        'TokenGuard: no local model is downloaded. Please download a model to get local answers.',
+        'Download a Model', 'Later');
+    if (choice === 'Download a Model') {
+        void vscode.commands.executeCommand('localpilot.chatView.focus');
+        await pullLocalModelCommand();
+    }
 }
 
 function apiUrl(): string {
@@ -201,13 +322,22 @@ interface RecommendedModel {
     description: string;
 }
 
+interface PullProgress {
+    state: string;       // pulling | installed | cancelled | error: ...
+    status?: string;     // Ollama's status line ("pulling manifest", "verifying sha256 digest", …)
+    completed?: number;  // bytes
+    total?: number;      // bytes
+    percent?: number;
+}
+
 interface ModelsInfo {
     local_model: string;
     local_loaded: string | null;
     available: string[];
+    installed_sizes: Record<string, number>;
     recommended: RecommendedModel[];
     pulling: string[];
-    pulls?: Record<string, { percent: number; status?: string }>;
+    pull_progress: Record<string, PullProgress>;
     system: Record<string, number | boolean>;
     ollama: boolean;
 }
@@ -216,8 +346,28 @@ async function fetchModels(): Promise<ModelsInfo> {
     return api<ModelsInfo>('GET', '/models', undefined, 10_000);
 }
 
-/** Download a model with `ollama pull` (via the backend), polling until it is installed. */
-async function downloadLocalModel(model: string): Promise<boolean> {
+function formatBytes(bytes: number | undefined): string {
+    if (!bytes) {
+        return '0 B';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(bytes) / Math.log(1024)));
+    return `${(bytes / 1024 ** i).toFixed(i >= 3 ? 2 : 0)} ${units[i]}`;
+}
+
+const downloads = new Map<string, Promise<boolean>>(); // model -> in-flight download
+
+/** Download a model with `ollama pull` (via the backend), showing progress until it is installed. */
+function downloadLocalModel(model: string): Promise<boolean> {
+    let pending = downloads.get(model);
+    if (!pending) {
+        pending = runDownload(model).finally(() => downloads.delete(model));
+        downloads.set(model, pending);
+    }
+    return pending;
+}
+
+async function runDownload(model: string): Promise<boolean> {
     let info: ModelsInfo;
     try {
         info = await fetchModels();
@@ -239,31 +389,104 @@ async function downloadLocalModel(model: string): Promise<boolean> {
                 void vscode.window.showErrorMessage(`TokenGuard: could not start download. ${(err as Error).message}`);
                 return false;
             }
+            token.onCancellationRequested(() => void cancelDownload(model));
             let reported = 0;
-            while (!token.isCancellationRequested) {
-                await new Promise(r => setTimeout(r, 2_000));
+            let misses = 0;
+            for (;;) {
+                await new Promise(r => setTimeout(r, 1_000));
+                let all: Record<string, PullProgress>;
                 try {
-                    const info = await fetchModels();
-                    if (info.available.includes(model)) {
-                        void vscode.window.showInformationMessage(`TokenGuard: ${model} is ready.`);
-                        return true;
-                    }
-                    // Fill the notification's progress bar from Ollama's live bytes/percent.
-                    const p = info.pulls?.[model];
-                    if (p && p.percent > reported) {
-                        progress.report({
-                            message: ` ${p.percent}%${p.status ? ` · ${p.status}` : ''}`,
-                            increment: p.percent - reported
-                        });
-                        reported = p.percent;
-                    }
+                    all = await api<Record<string, PullProgress>>('GET', '/models/pull', undefined, 5_000);
                 } catch {
-                    // keep polling; the pull continues on the backend
+                    continue; // keep polling; the pull continues on the backend
                 }
+                viewProvider?.postPullProgress(all);
+                const p = all[model];
+                if (!p) {
+                    // The backend restarted and lost track of it: finished, or gone.
+                    if (++misses >= 3) {
+                        return (await fetchModels().catch(() => undefined))?.available.includes(model) ?? false;
+                    }
+                    continue;
+                }
+                if (p.state === 'installed') {
+                    progress.report({ increment: 100 - reported, message: 'done' });
+                    void vscode.window.showInformationMessage(`TokenGuard: ${model} is ready.`);
+                    return true;
+                }
+                if (p.state === 'cancelled') {
+                    void vscode.window.showInformationMessage(
+                        `TokenGuard: download of ${model} cancelled. Downloading it again resumes where it stopped.`);
+                    return false;
+                }
+                if (p.state.startsWith('error')) {
+                    void vscode.window.showErrorMessage(`TokenGuard: downloading ${model} failed. ${p.state.slice(6).trim()}`);
+                    return false;
+                }
+                const percent = p.percent ?? 0;
+                const bytes = p.total ? ` · ${formatBytes(p.completed)} / ${formatBytes(p.total)}` : '';
+                // A new layer can lower the overall percentage; the bar only moves forward.
+                progress.report({ increment: Math.max(0, percent - reported), message: `${percent.toFixed(0)}%${bytes} · ${p.status || ''}` });
+                reported = Math.max(reported, percent);
             }
-            return false; // cancelled: the backend pull keeps running in the background
         }
     );
+}
+
+async function cancelDownload(model: string): Promise<void> {
+    try {
+        await api('POST', '/models/pull/cancel', { model }, 5_000);
+    } catch (err) {
+        void vscode.window.showErrorMessage(`TokenGuard: could not cancel the download. ${(err as Error).message}`);
+    }
+}
+
+/** Ask, then delete a pulled model from disk. Returns true when it was deleted. */
+async function deleteLocalModel(model: string, sizeBytes?: number): Promise<boolean> {
+    const size = sizeBytes ? ` and free ${formatBytes(sizeBytes)}` : '';
+    const choice = await vscode.window.showWarningMessage(
+        `Delete the local model "${model}"${size}? You can download it again later.`, { modal: true }, 'Delete');
+    if (choice !== 'Delete') {
+        return false;
+    }
+    try {
+        await api('DELETE', `/models/${encodeURIComponent(model)}`, undefined, 60_000);
+    } catch (err) {
+        void vscode.window.showErrorMessage(`TokenGuard: could not delete ${model}. ${(err as Error).message}`);
+        return false;
+    }
+    if (localModel() === model) {
+        // Don't keep pointing at a model that no longer exists.
+        await vscode.workspace.getConfiguration('tokenguard').update('localModel', '', vscode.ConfigurationTarget.Global);
+    }
+    void vscode.window.showInformationMessage(`TokenGuard: deleted ${model}${sizeBytes ? ` (${formatBytes(sizeBytes)} freed)` : ''}.`);
+    return true;
+}
+
+/** "TokenGuard: Delete Local Model" — pick an installed model and remove it from disk. */
+async function deleteLocalModelCommand(): Promise<void> {
+    let info: ModelsInfo;
+    try {
+        info = await fetchModels();
+    } catch (err) {
+        void vscode.window.showErrorMessage(`TokenGuard: backend unreachable. ${(err as Error).message}`);
+        return;
+    }
+    if (!info.available.length) {
+        void vscode.window.showInformationMessage('TokenGuard: no local models are installed.');
+        return;
+    }
+    const picked = await vscode.window.showQuickPick(
+        info.available.map(name => ({
+            label: name,
+            description: [formatBytes(info.installed_sizes?.[name]), name === info.local_loaded ? 'loaded' : '']
+                .filter(Boolean).join(' · ')
+        })),
+        { title: 'TokenGuard: Delete Local Model', placeHolder: 'Pick a model to remove from disk' }
+    );
+    if (picked && await deleteLocalModel(picked.label, info.installed_sizes?.[picked.label])) {
+        await viewProvider?.refreshStatus();
+    }
 }
 
 /** "TokenGuard: Download Local Model" — pick a recommended model and pull it. */
@@ -362,7 +585,7 @@ async function clearApiKey(): Promise<void> {
 }
 
 async function api<T>(
-    method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number, signal?: AbortSignal
+    method: 'GET' | 'POST' | 'DELETE', path: string, body: unknown, timeoutMs: number, signal?: AbortSignal
 ): Promise<T> {
     // One controller for both the timeout and the caller's cancel (the sidebar's Stop button).
     const controller = new AbortController();
@@ -486,7 +709,7 @@ async function apiStream<T>(
 
 /** fetch() against the backend with LLM headers; turns network and HTTP failures into readable errors. */
 async function backendFetch(
-    method: 'GET' | 'POST', path: string, body: unknown, signal: AbortSignal,
+    method: 'GET' | 'POST' | 'DELETE', path: string, body: unknown, signal: AbortSignal,
     callerSignal: AbortSignal | undefined, timedOut: () => boolean, accept?: string
 ): Promise<Response> {
     if (backend?.state === 'starting') {

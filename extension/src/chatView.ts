@@ -2,8 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import type { BackendManager } from './backend';
-import { InlineDiffManager, ReviewOutcome } from './inlineDiff';
 import type { OllamaManager } from './ollama';
+import { InlineDiffManager, ReviewOutcome } from './inlineDiff';
 
 // The LocalPilot sidebar. The page itself lives in media/chat/ (index.html, main.css, main.js);
 // this class serves it and relays its messages to the backend:
@@ -63,8 +63,7 @@ const LANGUAGE_ALIASES: Record<string, string> = {
 /** What the view needs from the extension; extension.ts owns the backend and settings. */
 export interface ChatViewHost {
     backend(): BackendManager | undefined;
-    ollama?: () => OllamaManager | undefined;
-    api<T>(method: 'GET' | 'POST', path: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<T>;
+    api<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<T>;
     apiStream<T>(path: string, body: unknown, onEvent: (event: string, data: any) => void, idleTimeoutMs: number, signal?: AbortSignal): Promise<T>;
     apiUrl(): string;
     localModel(): string;
@@ -74,6 +73,10 @@ export interface ChatViewHost {
     storeApiKey(provider: string, key: string): Promise<void>;
     switchLocalModel(model: string): Promise<void>;
     downloadLocalModel(model: string): Promise<boolean>;
+    cancelDownload(model: string): Promise<void>;
+    /** Confirm with the user, then delete the model from disk. */
+    deleteLocalModel(model: string, sizeBytes?: number): Promise<boolean>;
+    ollama(): OllamaManager | undefined;
 }
 
 export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -136,17 +139,46 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
         // Lazy activation: nothing spawns when VS Code opens. The backend and Ollama start
         // here instead — the first time the sidebar is actually shown — and stop on deactivate.
         void this._host.backend()?.ensureRunning();
-        void this._host.ollama?.()?.ensureRunning();
+        void this._host.ollama()?.ensureRunning();
 
         webviewView.webview.onDidReceiveMessage(async (data) => {
             switch (data.type) {
                 case 'ready':
                     this._postContext();
+                    // Opening the sidebar checks Ollama right away (and starts it if it is down).
+                    this.postOllamaState();
+                    void this._host.ollama()?.ensureRunning();
                     await this._postStatus();
                     void this._postCloudModels();
                     break;
                 case 'refreshStatus':
                     await this._host.backend()?.ensureRunning();
+                    await this._postStatus();
+                    break;
+                case 'startOllama':
+                    await vscode.commands.executeCommand('tokenguard.startOllama');
+                    await this._postStatus();
+                    break;
+                case 'installOllama':
+                    await vscode.commands.executeCommand('tokenguard.installOllama');
+                    await this._postStatus();
+                    break;
+                case 'showOllamaLog':
+                    await vscode.commands.executeCommand('tokenguard.showBackendLog');
+                    break;
+                case 'downloadModel':
+                    await this._host.downloadLocalModel(String(data.model ?? ''));
+                    await this._postStatus();
+                    break;
+                case 'cancelDownload':
+                    await this._host.cancelDownload(String(data.model ?? ''));
+                    break;
+                case 'deleteModel':
+                    if (await this._host.deleteLocalModel(String(data.model ?? ''), Number(data.size) || undefined)) {
+                        if (this._preloadedFor === data.model) {
+                            this._preloadedFor = undefined;
+                        }
+                    }
                     await this._postStatus();
                     break;
                 case 'sendPrompt':
@@ -195,13 +227,17 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
                 case 'selectLocalModel': {
                     const model = (data.model || '') as string;
                     if (model && data.installed === false) {
-                        const size = data.size_gb ? ` (~${data.size_gb} GB)` : '';
-                        const choice = await vscode.window.showInformationMessage(
-                            `"${model}" isn't downloaded yet${size}. Download it now?`, { modal: false }, 'Download');
-                        if (choice !== 'Download') {
-                            await this._postStatus(); // reset the dropdown to the saved value
-                            break;
+                        // `confirmed`: the user already agreed in the sidebar (first-run / Download button).
+                        if (!data.confirmed) {
+                            const size = data.size_gb ? ` (~${data.size_gb} GB)` : '';
+                            const choice = await vscode.window.showInformationMessage(
+                                `"${model}" isn't downloaded yet${size}. Download it now?`, { modal: false }, 'Download');
+                            if (choice !== 'Download') {
+                                await this._postStatus(); // reset the dropdown to the saved value
+                                break;
+                            }
                         }
+                        void this._postStatus(); // show the progress bar straight away
                         if (!(await this._host.downloadLocalModel(model))) {
                             await this._postStatus();
                             break;
@@ -273,6 +309,19 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
 
     public refreshStatus() {
         void this._postStatus();
+    }
+
+    /** Tell the sidebar whether Ollama is being checked, started, running or failed. */
+    public postOllamaState() {
+        const ollama = this._host.ollama();
+        if (ollama) {
+            this._post({ type: 'ollama', state: ollama.state, error: ollama.lastError });
+        }
+    }
+
+    /** Live download progress (model -> state/bytes/percent) for the sidebar's progress bars. */
+    public postPullProgress(progress: unknown) {
+        this._post({ type: 'pullProgress', progress });
     }
 
     /** "TokenGuard: Clear Chat": stop any request and show the empty state again. */

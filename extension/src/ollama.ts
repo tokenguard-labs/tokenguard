@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { ChildProcess, spawn, spawnSync } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 // Owns the Ollama lifecycle for the extension:
@@ -12,8 +13,17 @@ import * as path from 'path';
 
 const STARTUP_TIMEOUT_MS = 30_000;
 const STOP_GRACE_MS = 3_000;
+const INSTALL_TIMEOUT_MS = 30 * 60_000;
 
-export type OllamaState = 'stopped' | 'starting' | 'running' | 'external' | 'failed';
+// Official install commands, run in a terminal so the user sees the output and can enter a password.
+const INSTALL_COMMANDS: Partial<Record<NodeJS.Platform, string>> = {
+    linux: 'curl -fsSL https://ollama.com/install.sh | sh',
+    darwin: 'brew install ollama',
+    win32: 'winget install --id Ollama.Ollama -e --accept-source-agreements --accept-package-agreements'
+};
+export const OLLAMA_DOWNLOAD_PAGE = 'https://ollama.com/download';
+
+export type OllamaState = 'checking' | 'missing' | 'installing' | 'stopped' | 'starting' | 'running' | 'external' | 'failed';
 
 export class OllamaManager implements vscode.Disposable {
     private _proc?: ChildProcess;
@@ -21,6 +31,7 @@ export class OllamaManager implements vscode.Disposable {
     private _state: OllamaState = 'stopped';
     private _lastError?: string;
     private _stopping = false;
+    private _installing?: Promise<boolean>;
     private readonly _markerPath: string;
     private readonly _onDidChangeState = new vscode.EventEmitter<OllamaState>();
     readonly onDidChangeState = this._onDidChangeState.event;
@@ -36,13 +47,130 @@ export class OllamaManager implements vscode.Disposable {
     get state(): OllamaState { return this._state; }
     get lastError(): string | undefined { return this._lastError; }
 
-    /** Resolves once Ollama answers /api/tags; starts it if needed. Never rejects. */
-    ensureRunning(): Promise<void> {
+    /**
+     * Resolves once Ollama answers /api/tags; starts it if needed. Never rejects.
+     * `force` starts it even when tokenguard.autoStartOllama is off (the user clicked "Start").
+     */
+    ensureRunning(force = false): Promise<void> {
         if (this._starting) {
             return this._starting;
         }
-        this._starting = this._ensure().finally(() => { this._starting = undefined; });
+        this._starting = this._ensure(force).finally(() => { this._starting = undefined; });
         return this._starting;
+    }
+
+    /** True when the Ollama server answers right now (no state change, no auto-start). */
+    isHealthy(): Promise<boolean> {
+        return this._healthy();
+    }
+
+    /** Names of the models pulled into Ollama, or undefined when it isn't reachable. */
+    async listModels(): Promise<string[] | undefined> {
+        try {
+            const resp = await fetch(`${this._url().replace(/\/+$/, '')}/api/tags`, { signal: AbortSignal.timeout(3_000) });
+            if (!resp.ok) {
+                return undefined;
+            }
+            const data = await resp.json() as { models?: Array<{ name?: string; model?: string }> };
+            return (data.models || []).map(m => m.name || m.model).filter((n): n is string => !!n);
+        } catch {
+            return undefined;
+        }
+    }
+
+    /** Whether this platform has an install command we can run (else: send the user to the download page). */
+    canInstall(): boolean {
+        if (process.platform === 'darwin') {
+            return this._which('brew');
+        }
+        return !!INSTALL_COMMANDS[process.platform];
+    }
+
+    /**
+     * Install Ollama with the official installer in a terminal (it may ask for a password), showing a
+     * progress notification until the installer finishes. Resolves true when the CLI is available.
+     */
+    install(): Promise<boolean> {
+        if (!this._installing) {
+            this._installing = this._install().finally(() => { this._installing = undefined; });
+        }
+        return this._installing;
+    }
+
+    private async _install(): Promise<boolean> {
+        const command = INSTALL_COMMANDS[process.platform];
+        if (!command || !this.canInstall()) {
+            void vscode.env.openExternal(vscode.Uri.parse(OLLAMA_DOWNLOAD_PAGE));
+            return false;
+        }
+        const marker = path.join(os.tmpdir(), `tokenguard-ollama-install-${process.pid}-${Date.now()}`);
+        const terminal = process.platform === 'win32'
+            ? vscode.window.createTerminal({
+                name: 'Install Ollama',
+                shellPath: 'powershell.exe',
+                shellArgs: ['-NoProfile', '-Command',
+                    `${command}; Set-Content -Path '${marker}' -Value $LASTEXITCODE; Read-Host 'Press Enter to close'`]
+            })
+            : vscode.window.createTerminal({
+                name: 'Install Ollama',
+                shellPath: '/bin/bash',
+                // $1 = marker file: the installer's exit code is written there when it finishes.
+                shellArgs: ['-c', `set -o pipefail; ${command}; echo $? > "$1"; echo; read -rp "Press Enter to close this terminal"`,
+                    'tokenguard', marker]
+            });
+        terminal.show();
+        this._output.appendLine(`[tokenguard] installing Ollama: ${command}`);
+        this._setState('installing');
+
+        const exitCode = await vscode.window.withProgress(
+            {
+                location: vscode.ProgressLocation.Notification,
+                title: 'TokenGuard: installing Ollama',
+                cancellable: true
+            },
+            async (progress, token) => {
+                progress.report({ message: 'follow the "Install Ollama" terminal (it may ask for your password)…' });
+                let closed = false;
+                const sub = vscode.window.onDidCloseTerminal(t => { closed = closed || t === terminal; });
+                const deadline = Date.now() + INSTALL_TIMEOUT_MS;
+                try {
+                    while (!token.isCancellationRequested && Date.now() < deadline) {
+                        const code = this._readInstallMarker(marker);
+                        if (code !== undefined) {
+                            return code;
+                        }
+                        if (closed) {
+                            return undefined;
+                        }
+                        await new Promise(r => setTimeout(r, 1_000));
+                    }
+                    return undefined;
+                } finally {
+                    sub.dispose();
+                    fs.rmSync(marker, { force: true });
+                }
+            }
+        );
+
+        const ok = !!this._cliPath();
+        if (ok) {
+            this._output.appendLine('[tokenguard] Ollama installed.');
+            this._setState('stopped');
+        } else {
+            this._setState('missing', exitCode !== undefined && exitCode !== 0
+                ? `the installer failed (exit code ${exitCode}); see the "Install Ollama" terminal`
+                : 'Ollama is not installed');
+        }
+        return ok;
+    }
+
+    private _readInstallMarker(marker: string): number | undefined {
+        try {
+            const text = fs.readFileSync(marker, 'utf8').replace(/^\uFEFF/, '').trim();
+            return text ? Number(text) || 0 : undefined;
+        } catch {
+            return undefined;
+        }
     }
 
     /** Unload every running model now (frees RAM/VRAM). Returns the model names. */
@@ -111,13 +239,22 @@ export class OllamaManager implements vscode.Disposable {
     }
 
     private _setState(state: OllamaState, error?: string) {
+        if (state === this._state && error === this._lastError) {
+            return;
+        }
         this._state = state;
         this._lastError = error;
         this._onDidChangeState.fire(state);
     }
 
-    private async _ensure(): Promise<void> {
+    private async _ensure(force: boolean): Promise<void> {
+        if (this._state !== 'running' && this._state !== 'external' && this._state !== 'installing') {
+            this._setState('checking'); // so the sidebar can say "checking Ollama…" right away
+        }
         if (await this._healthy()) {
+            if (this._state === 'running' && this._proc && this._proc.exitCode === null) {
+                return; // the one we started is still answering
+            }
             this._setState('external'); // started elsewhere (e.g. systemd): leave it alone
             return;
         }
@@ -125,18 +262,21 @@ export class OllamaManager implements vscode.Disposable {
             await this._waitHealthy();
             return;
         }
-        if (!vscode.workspace.getConfiguration('tokenguard').get<boolean>('autoStartOllama', true)) {
-            this._setState('stopped', 'auto-start disabled (tokenguard.autoStartOllama)');
+        const cli = this._cliPath();
+        if (!cli) {
+            if (!this._installing) {
+                this._setState('missing', 'Ollama is not installed (the `ollama` CLI was not found)');
+            }
             return;
         }
-        if (!this._hasCli()) {
-            this._setState('failed', 'the `ollama` CLI was not found on PATH');
+        if (!force && !vscode.workspace.getConfiguration('tokenguard').get<boolean>('autoStartOllama', true)) {
+            this._setState('stopped', 'auto-start disabled (tokenguard.autoStartOllama)');
             return;
         }
 
         this._output.appendLine('[tokenguard] starting ollama serve…');
         this._setState('starting');
-        const proc = spawn('ollama', ['serve'], {
+        const proc = spawn(cli, ['serve'], {
             detached: process.platform !== 'win32', // own process group so we can kill the tree
             windowsHide: true,
             stdio: ['ignore', 'pipe', 'pipe']
@@ -179,10 +319,22 @@ export class OllamaManager implements vscode.Disposable {
         }
     }
 
-    private _hasCli(): boolean {
+    /** The `ollama` executable: on PATH, else a standard install location (a fresh install isn't on our PATH yet). */
+    private _cliPath(): string | undefined {
+        if (this._which('ollama')) {
+            return 'ollama';
+        }
+        const candidates = process.platform === 'win32'
+            ? [path.join(process.env.LOCALAPPDATA || '', 'Programs', 'Ollama', 'ollama.exe')]
+            : ['/usr/local/bin/ollama', '/usr/bin/ollama', '/opt/homebrew/bin/ollama',
+                '/Applications/Ollama.app/Contents/Resources/ollama'];
+        return candidates.find(p => fs.existsSync(p));
+    }
+
+    private _which(name: string): boolean {
         const cmd = process.platform === 'win32' ? 'where' : 'which';
         try {
-            return spawnSync(cmd, ['ollama'], { windowsHide: true }).status === 0;
+            return spawnSync(cmd, [name], { windowsHide: true }).status === 0;
         } catch {
             return false;
         }
