@@ -4,10 +4,7 @@
 
 TokenGuard is not another coding model. It sits in front of the models and decides **where** each question is answered and **how much** of your code goes with it.
 
-<!-- Screenshots: add PNG/GIF files under extension/images/ and reference them here, e.g.
 ![LocalPilot sidebar](images/sidebar.png)
-![In-file agent review](images/agent-review.gif)
-Marketplace READMEs must not use SVG images. -->
 
 ## Features
 
