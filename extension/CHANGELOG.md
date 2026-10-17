@@ -3,6 +3,10 @@
 All notable changes to this extension are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.1.1] - 2026-10-17
+
+beta-release of LocalPilot agent
+
 ## [0.1.0] - 2026-10-16
 
 First Marketplace release (preview).

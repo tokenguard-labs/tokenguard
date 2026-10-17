@@ -2,7 +2,7 @@
   "name": "tokenguard",
   "displayName": "TokenGuard — LocalPilot",
   "description": "Local-first AI coding assistant: answers simple questions with a local Ollama model and sends hard ones to a cloud LLM with only the relevant, secret-redacted code.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "tokenguard-labs",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -265,7 +265,7 @@
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
-    "package": "vsce package"
+    "package": "vsce package --baseContentUrl https://github.com/tokenguard-labs/tokenguard/blob/main/extension --baseImagesUrl https://github.com/tokenguard-labs/tokenguard/raw/main/extension"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
