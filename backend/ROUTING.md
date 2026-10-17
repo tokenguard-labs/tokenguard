@@ -117,7 +117,7 @@ How much *relevant* code comes with the request — the optimized context, not t
 context_size = optimized_context_tokens / 8000      (capped at 1)
 ```
 
-Small local models (the default is `qwen2.5-coder:1.5b`) get noticeably worse, and on CPU much slower, with large contexts, so at 8k+ tokens this factor is maxed out.
+Small local models (the default is `qwen2.5-coder:0.5b`) get noticeably worse, and on CPU much slower, with large contexts, so at 8k+ tokens this factor is maxed out.
 
 ### Factor 4: Files (20%)
 

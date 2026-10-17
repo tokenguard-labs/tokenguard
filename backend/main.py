@@ -8,8 +8,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import agent, cloud_catalog, config, context, llm, model_catalog, router, system
@@ -60,7 +59,51 @@ class LLMOverridesMiddleware:
 
 app = FastAPI(title="LocalPilot", version="0.1.0", lifespan=lifespan)
 app.add_middleware(LLMOverridesMiddleware)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Per-session auth: the VS Code extension generates a random token and passes it to the backend
+# (TOKENGUARD_SESSION_TOKEN env var) when it spawns the process; every request must then echo it
+# in the X-Token-Guard-Session header. This keeps any web page open in the browser (which can
+# always POST to localhost) and DNS-rebinding pages from calling this API and reading the
+# workspace. A backend started by hand (`make backend`) has no token, so it falls back to
+# loopback-Host-only protection.
+SESSION_TOKEN = os.getenv("TOKENGUARD_SESSION_TOKEN", "")
+if not SESSION_TOKEN:
+    logging.warning("TOKENGUARD_SESSION_TOKEN is not set: the API is restricted to loopback "
+                    "Host requests instead of token auth (fine for a manually started dev backend).")
+
+_SWAGGER_PATHS = ("/openapi.json", "/docs", "/docs/oauth2-redirect", "/redoc")
+
+
+class SessionAuthMiddleware:
+    """Require the session token (or, without one, a loopback Host) on every API request."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        if scope.get("path") not in _SWAGGER_PATHS:
+            headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
+            if SESSION_TOKEN:
+                if headers.get("x-token-guard-session") != SESSION_TOKEN:
+                    return await _reject(scope, receive, send, "missing or invalid session token")
+            else:
+                # Against DNS rebinding: a page that rebinds a public name to 127.0.0.1 arrives
+                # with that name in Host. Real clients always use localhost/127.0.0.1.
+                host = headers.get("host", "").rsplit(":", 1)[0].strip("[]").lower()
+                if host not in ("localhost", "127.0.0.1", "::1"):
+                    return await _reject(scope, receive, send,
+                                         f"rejected Host {host or '<none>'} (loopback only)")
+        return await self.app(scope, receive, send)
+
+
+async def _reject(scope, receive, send, detail: str) -> None:
+    response = JSONResponse({"detail": detail}, status_code=403)
+    await response(scope, receive, send)
+
+
+app.add_middleware(SessionAuthMiddleware)
 
 
 class ChatRequest(BaseModel):
@@ -149,7 +192,8 @@ _RECOMMENDED_FIELDS = ("name", "params", "size_gb", "min_ram_gb", "comfortable",
 
 async def _local_model_info() -> Dict[str, Any]:
     """Installed local models, host resources, and pullable recommendations that fit."""
-    reachable, installed = await llm.ollama_models()
+    reachable, installed_list = await llm.ollama_model_list()
+    installed = [m["name"] for m in installed_list]
     resources = system.system_resources()
     # RAM-fit info per installed model, for "this model is too big for your RAM" warnings.
     sizes = await llm.ollama_model_sizes()
@@ -168,6 +212,8 @@ async def _local_model_info() -> Dict[str, Any]:
         "recommended": recommended,
         "pulling": llm.pulling_models(),
         "pulls": llm.pull_progress(),
+        "installed_sizes": {m["name"]: m["size"] for m in installed_list},
+        "pull_progress": llm.pull_progress(),
         "system": resources,
     }
 
@@ -184,6 +230,8 @@ async def models():
         "recommended": info["recommended"],
         "pulling": info["pulling"],
         "pulls": info["pulls"],
+        "installed_sizes": info["installed_sizes"],
+        "pull_progress": info["pull_progress"],
         "system": info["system"],
         "ollama": info["ollama"],
     }
@@ -229,6 +277,33 @@ async def pull_model(req: PullRequest):
     if name in installed:
         return {"model": name, "status": "installed"}
     return {"model": name, "status": llm.start_pull(name)}
+
+
+@app.get("/models/pull")
+async def pull_progress():
+    """Download progress per model: state, Ollama's status line, bytes completed/total, percent."""
+    return llm.pull_progress()
+
+
+@app.post("/models/pull/cancel")
+async def cancel_pull(req: PullRequest):
+    """Stop an in-flight download. Ollama keeps finished layers, so pulling again resumes."""
+    return {"model": req.model, "cancelled": llm.cancel_pull(req.model.strip())}
+
+
+@app.delete("/models/{name:path}")
+async def delete_model(name: str):
+    """Delete a pulled model from disk to free space (unloads it first if it is in memory)."""
+    name = name.strip()
+    if not name:
+        raise HTTPException(400, "model name is required")
+    try:
+        await llm.delete_local_model(name)
+    except LookupError as e:
+        raise HTTPException(404, str(e))
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Ollama could not delete {name!r}: {e}")
+    return {"model": name, "deleted": True}
 
 
 class LocalModelRequest(BaseModel):
@@ -479,6 +554,8 @@ async def health(force: bool = False):
         "local_recommended": local["recommended"],
         "local_pulling": local["pulling"],
         "pulls": local["pulls"],
+        "local_pull_progress": local["pull_progress"],
+        "local_sizes": local["installed_sizes"],
         "system": local["system"],
         "cloud_provider": cloud["provider"],
         "cloud_model": cloud["model"],
