@@ -238,9 +238,80 @@ or GIF; the Marketplace does not allow SVG images in READMEs.
 
 ## Release checklist
 
-1. Bump `version` in `extension/package.json` and add a `CHANGELOG.md` entry.
+1. Bump `version` in `extension/package.json` (semver; the extension publishes with
+   `--pre-release` for now, which pairs with `preview: true` in the manifest) and add a
+   `CHANGELOG.md` entry.
 2. If backend dependencies changed, update `extension/requirements.runtime.txt`.
-3. `cd extension && npm ci && npm run package`.
+3. `cd extension && npm ci && npm run package` (or `npx @vscode/vsce package --target <target>
+   --pre-release --no-dependencies` for a specific platform; see the table below for targets).
 4. Check the file list with `npx vsce ls`, and install the VSIX in a clean VS Code profile
    (`code --install-extension tokenguard-<version>.vsix`) to test first-run setup.
 5. `npx vsce publish`.
+
+## Publishing (the accounts and tokens)
+
+Everything in the checklist above is artifact work; publishing needs tokens from two stores.
+
+### One-time setup: Visual Studio Marketplace
+
+1. Create an [Azure DevOps](https://dev.azure.com) organization (any name; the Marketplace and
+   Azure DevOps share one identity).
+2. Create a **personal access token** (user icon → Personal access tokens): Organization
+   **All accessible organizations**, Scopes = custom → **Marketplace → Manage** only. Short
+   expiry is fine — you can mint a new one per release. This `VSCE_PAT` is the only credential
+   publishing needs; `vsce login` merely caches it.
+3. Create the publisher on the
+   [Marketplace manage page](https://marketplace.visualstudio.com/manage) and make its **ID**
+   match `publisher` in `package.json` (`tokenguard-labs`).
+4. Confirm rights any time with `npx @vscode/vsce verify-pat tokenguard-labs -p $VSCE_PAT`
+   (run from `extension/`).
+
+### One-time setup: Open VSX (optional, second store)
+
+1. Create an [Eclipse Foundation](https://accounts.eclipse.org) account and sign the publisher
+   agreement at [open-vsx.org](https://open-vsx.org) (profile → Consent/Agreement).
+2. Generate an access token (open-vsx.org → user settings → tokens). This is `OVSX_PAT`.
+3. Claim the namespace once (the same publisher ID as on the Marketplace):
+   `npx ovsx create-namespace tokenguard-labs -p $OVSX_PAT`.
+
+### One-time setup: tooling
+
+`@vscode/vsce` and `ovsx` are already devDependencies (extension/package.json): run
+`npm ci` inside `extension/` and use `npx @vscode/vsce …` / `npx ovsx …` from that folder.
+
+### The missing checks people reject you for
+
+- `extension/icon.png` (128×128) and the marketplace `README.md` are present — a missing icon
+  or README is the most common rejection.
+- `publisher` must match an existing publisher; a *reserved name* (e.g. any name already
+  listed on the Marketplace) is rejected at publish time.
+- `repository`, `bugs`, `license`, `galleryBanner` fields reduce review friction but are not
+  strictly required.
+- For `--pre-release` publishes the `engines.vscode` must be ≥ 1.63. Pre-release in both
+  stores means: on the Marketplace via the flag, on Open VSX via its flag; users must enable
+  pre-release install explicitly.
+
+## Automated publishing
+
+`.github/workflows/release.yml` publishes to both stores when a `v*` tag is pushed (or
+manually via workflow_dispatch). Before the first automated run, add two repository secrets:
+`VSCE_PAT` and `OVSX_PAT` (values from the one-time setup above). The workflow:
+
+- verifies the tag matches the extension version (pre-releases keep version `1.0.x` / `0.x`
+  conventions),
+- compiles, lints and packages one VSIX per platform target (linux/windows/macOS on x64 and
+  arm64),
+- publishes each target with `--pre-release` to the Marketplace and Open VSX,
+- uploads the per-target VSIX as build artifacts.
+
+To release manually instead (from `extension/`):
+
+```bash
+npm ci
+npx @vscode/vsce package --target linux-x64 --pre-release --no-dependencies
+npx @vscode/vsce publish --target linux-x64 --pre-release          # uses VSCE_PAT / cached login
+npx ovsx publish --pre-release -p $OVSX_PAT tokenguard-linux-x64-0.1.0.vsix
+```
+
+Marketplace gearing takes a few minutes; a rejection is nearly always one of: missing icon or
+README, a reserved publisher/extension name, or a PAT with the wrong scope.
