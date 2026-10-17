@@ -61,6 +61,12 @@
         "icon": "$(clear-all)"
       },
       {
+        "command": "tokenguard.moveChatRight",
+        "title": "Move LocalPilot to Right Side Bar",
+        "category": "TokenGuard",
+        "icon": "$(layout-sidebar-right)"
+      },
+      {
         "command": "tokenguard.restartBackend",
         "title": "Restart Backend",
         "category": "TokenGuard"
@@ -109,14 +115,28 @@
     "viewsContainers": {
       "activitybar": [
         {
-          "id": "localpilot-sidebar",
+          "id": "localpilot-launcher",
+          "title": "LocalPilot",
+          "icon": "./media/circuit-board.svg"
+        }
+      ],
+      "panel": [
+        {
+          "id": "localpilot-chat",
           "title": "LocalPilot",
           "icon": "./media/circuit-board.svg"
         }
       ]
     },
     "views": {
-      "localpilot-sidebar": [
+      "localpilot-launcher": [
+        {
+          "id": "localpilot.launcher",
+          "name": "LocalPilot",
+          "icon": "./media/circuit-board.svg"
+        }
+      ],
+      "localpilot-chat": [
         {
           "type": "webview",
           "id": "localpilot.chatView",
@@ -125,12 +145,22 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "localpilot.launcher",
+        "contents": "The LocalPilot chat opens in the right side bar.\n[Open LocalPilot Chat](command:localpilot.chatView.focus)"
+      }
+    ],
     "menus": {
       "view/title": [
         {
           "command": "tokenguard.clearChat",
           "when": "view == localpilot.chatView",
           "group": "navigation"
+        },
+        {
+          "command": "tokenguard.moveChatRight",
+          "when": "view == localpilot.chatView"
         }
       ]
     },
@@ -145,7 +175,7 @@
         "tokenguard.autoStartBackend": {
           "type": "boolean",
           "default": true,
-          "description": "Start the LocalPilot backend as a child process when VS Code opens (and stop it on exit). Ignored if a backend already answers on tokenguard.apiUrl."
+          "description": "Start the LocalPilot backend as a child process when the chat is first opened (and stop it on exit). Ignored if a backend already answers on tokenguard.apiUrl."
         },
         "tokenguard.backendPath": {
           "type": "string",
@@ -204,12 +234,12 @@
         "tokenguard.preloadLocalModel": {
           "type": "boolean",
           "default": true,
-          "description": "Load the selected local model when VS Code opens so the first local prompt is warm (it stays loaded until exit)."
+          "description": "Load the selected local model when the chat opens so the first local prompt is warm (it stays loaded until exit)."
         },
         "tokenguard.autoStartOllama": {
           "type": "boolean",
           "default": true,
-          "description": "Start `ollama serve` with the extension when it isn't already running. Ollama is stopped again when VS Code closes."
+          "description": "Start `ollama serve` when the chat is first opened, if it isn't already running. Ollama is stopped again when VS Code closes."
         },
         "tokenguard.stopOllamaOnExit": {
           "type": "boolean",

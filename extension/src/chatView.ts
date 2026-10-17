@@ -77,10 +77,13 @@ export interface ChatViewHost {
     /** Confirm with the user, then delete the model from disk. */
     deleteLocalModel(model: string, sizeBytes?: number): Promise<boolean>;
     ollama(): OllamaManager | undefined;
+    /** The chat was opened: start the backend and the Ollama checks (first call only). */
+    startServices(): void;
 }
 
 export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
-    private _view?: vscode.WebviewView;
+    // The webview currently holding the chat (VS Code re-resolves the view when it is moved).
+    private _webview?: vscode.Webview;
     private _retryTimer?: NodeJS.Timeout;
     private _retryDelayMs = 1_000;
     private _preloadedFor?: string;      // model we've already asked the backend to load
@@ -124,177 +127,196 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
         _context: vscode.WebviewViewResolveContext,
         _token: vscode.CancellationToken
     ) {
-        this._view = webviewView;
-        webviewView.webview.options = {
+        webviewView.webview.onDidReceiveMessage(data => {
+            if (webviewView.webview === this._webview) {
+                void this._onMessage(data);
+            }
+        });
+        webviewView.onDidDispose(() => this._detach(webviewView.webview));
+        this._attach(webviewView.webview);
+    }
+
+    /** Load the chat into `webview`; a previous view (e.g. before a move) stops being served. */
+    private _attach(webview: vscode.Webview) {
+        if (this._webview && this._webview !== webview) {
+            this._cancelAll();
+            this._clearRetry();
+        }
+        this._webview = webview;
+        webview.options = {
             enableScripts: true,
             localResourceRoots: [vscode.Uri.joinPath(this._extensionUri, 'media')]
         };
-        webviewView.webview.html = this._getHtmlForWebview(webviewView.webview);
-        webviewView.onDidDispose(() => {
+        webview.html = this._getHtmlForWebview(webview);
+        this._host.startServices();
+    }
+
+    private _detach(webview: vscode.Webview) {
+        if (this._webview === webview) {
             this._cancelAll();
             this._clearRetry();
-            this._view = undefined;
-        });
+            this._webview = undefined;
+        }
+    }
 
-        webviewView.webview.onDidReceiveMessage(async (data) => {
-            switch (data.type) {
-                case 'ready':
-                    this._postContext();
-                    // Opening the sidebar checks Ollama right away (and starts it if it is down).
-                    this.postOllamaState();
-                    void this._host.ollama()?.ensureRunning();
-                    await this._postStatus();
-                    void this._postCloudModels();
-                    break;
-                case 'refreshStatus':
-                    await this._host.backend()?.ensureRunning();
-                    await this._postStatus();
-                    break;
-                case 'startOllama':
-                    await vscode.commands.executeCommand('tokenguard.startOllama');
-                    await this._postStatus();
-                    break;
-                case 'installOllama':
-                    await vscode.commands.executeCommand('tokenguard.installOllama');
-                    await this._postStatus();
-                    break;
-                case 'showOllamaLog':
-                    await vscode.commands.executeCommand('tokenguard.showBackendLog');
-                    break;
-                case 'downloadModel':
-                    await this._host.downloadLocalModel(String(data.model ?? ''));
-                    await this._postStatus();
-                    break;
-                case 'cancelDownload':
-                    await this._host.cancelDownload(String(data.model ?? ''));
-                    break;
-                case 'deleteModel':
-                    if (await this._host.deleteLocalModel(String(data.model ?? ''), Number(data.size) || undefined)) {
-                        if (this._preloadedFor === data.model) {
-                            this._preloadedFor = undefined;
-                        }
+    private async _onMessage(data: any) {
+        switch (data.type) {
+            case 'ready':
+                this._postContext();
+                // Opening the sidebar checks Ollama right away (and starts it if it is down).
+                this.postOllamaState();
+                void this._host.ollama()?.ensureRunning();
+                await this._postStatus();
+                void this._postCloudModels();
+                break;
+            case 'refreshStatus':
+                await this._host.backend()?.ensureRunning();
+                await this._postStatus();
+                break;
+            case 'startOllama':
+                await vscode.commands.executeCommand('tokenguard.startOllama');
+                await this._postStatus();
+                break;
+            case 'installOllama':
+                await vscode.commands.executeCommand('tokenguard.installOllama');
+                await this._postStatus();
+                break;
+            case 'showOllamaLog':
+                await vscode.commands.executeCommand('tokenguard.showBackendLog');
+                break;
+            case 'downloadModel':
+                await this._host.downloadLocalModel(String(data.model ?? ''));
+                await this._postStatus();
+                break;
+            case 'cancelDownload':
+                await this._host.cancelDownload(String(data.model ?? ''));
+                break;
+            case 'deleteModel':
+                if (await this._host.deleteLocalModel(String(data.model ?? ''), Number(data.size) || undefined)) {
+                    if (this._preloadedFor === data.model) {
+                        this._preloadedFor = undefined;
                     }
-                    await this._postStatus();
-                    break;
-                case 'sendPrompt':
-                    await this._analyze(data.id, data.prompt);
-                    break;
-                case 'run':
-                    await this._run(data.id, data.req, data.route);
-                    break;
-                case 'cancel':
-                    this._inFlight.get(data.id)?.abort();
-                    break;
-                case 'agentRun':
-                    await this._runAgent(data.id, String(data.prompt ?? ''), data.route === 'local' ? 'local' : 'cloud',
-                        Array.isArray(data.history) ? data.history : []);
-                    break;
-                case 'agentApprove':
-                    await this._agentApprove(data);
-                    break;
-                case 'agentDiff':
-                    await this._agentDiff(data.id, String(data.path ?? ''));
-                    break;
-                case 'agentAccept':
-                    await this._agentAccept(data.id, (data.paths ?? []) as string[]);
-                    break;
-                case 'agentReject':
-                    await this._agentReject(data.id, (data.paths ?? []) as string[]);
-                    break;
-                case 'agentReview':
-                    await this._agentReview(data.id, String(data.path ?? ''), true);
-                    break;
-                case 'agentOpen':
-                    await this._agentOpen(data.id, String(data.path ?? ''));
-                    break;
-                case 'copy':
-                    await vscode.env.clipboard.writeText(String(data.text ?? ''));
-                    break;
-                case 'insert':
-                    await this._insertAtCursor(String(data.code ?? ''), String(data.language ?? ''));
-                    break;
-                case 'openLink':
-                    await this._openLink(String(data.href ?? ''));
-                    break;
-                case 'setApiKey':
-                    await vscode.commands.executeCommand('tokenguard.setApiKey');
-                    break;
-                case 'selectLocalModel': {
-                    const model = (data.model || '') as string;
-                    if (model && data.installed === false) {
-                        // `confirmed`: the user already agreed in the sidebar (first-run / Download button).
-                        if (!data.confirmed) {
-                            const size = data.size_gb ? ` (~${data.size_gb} GB)` : '';
-                            const choice = await vscode.window.showInformationMessage(
-                                `"${model}" isn't downloaded yet${size}. Download it now?`, { modal: false }, 'Download');
-                            if (choice !== 'Download') {
-                                await this._postStatus(); // reset the dropdown to the saved value
-                                break;
-                            }
-                        }
-                        void this._postStatus(); // show the progress bar straight away
-                        if (!(await this._host.downloadLocalModel(model))) {
-                            await this._postStatus();
+                }
+                await this._postStatus();
+                break;
+            case 'sendPrompt':
+                await this._analyze(data.id, data.prompt);
+                break;
+            case 'run':
+                await this._run(data.id, data.req, data.route);
+                break;
+            case 'cancel':
+                this._inFlight.get(data.id)?.abort();
+                break;
+            case 'agentRun':
+                await this._runAgent(data.id, String(data.prompt ?? ''), data.route === 'local' ? 'local' : 'cloud',
+                    Array.isArray(data.history) ? data.history : []);
+                break;
+            case 'agentApprove':
+                await this._agentApprove(data);
+                break;
+            case 'agentDiff':
+                await this._agentDiff(data.id, String(data.path ?? ''));
+                break;
+            case 'agentAccept':
+                await this._agentAccept(data.id, (data.paths ?? []) as string[]);
+                break;
+            case 'agentReject':
+                await this._agentReject(data.id, (data.paths ?? []) as string[]);
+                break;
+            case 'agentReview':
+                await this._agentReview(data.id, String(data.path ?? ''), true);
+                break;
+            case 'agentOpen':
+                await this._agentOpen(data.id, String(data.path ?? ''));
+                break;
+            case 'copy':
+                await vscode.env.clipboard.writeText(String(data.text ?? ''));
+                break;
+            case 'insert':
+                await this._insertAtCursor(String(data.code ?? ''), String(data.language ?? ''));
+                break;
+            case 'openLink':
+                await this._openLink(String(data.href ?? ''));
+                break;
+            case 'setApiKey':
+                await vscode.commands.executeCommand('tokenguard.setApiKey');
+                break;
+            case 'selectLocalModel': {
+                const model = (data.model || '') as string;
+                if (model && data.installed === false) {
+                    // `confirmed`: the user already agreed in the sidebar (first-run / Download button).
+                    if (!data.confirmed) {
+                        const size = data.size_gb ? ` (~${data.size_gb} GB)` : '';
+                        const choice = await vscode.window.showInformationMessage(
+                            `"${model}" isn't downloaded yet${size}. Download it now?`, { modal: false }, 'Download');
+                        if (choice !== 'Download') {
+                            await this._postStatus(); // reset the dropdown to the saved value
                             break;
                         }
                     }
-                    await vscode.workspace.getConfiguration('tokenguard')
-                        .update('localModel', model, vscode.ConfigurationTarget.Global);
-                    this._preloadSuppressed = false;
-                    this._preloadedFor = model || undefined;
-                    // Unload the old local model and warm up the new one so only one is resident.
-                    await this._host.switchLocalModel(model);
-                    this._post({ type: 'modelLoading', model: null });
-                    await this._postStatus();
-                    break;
-                }
-                case 'selectCloudProvider': {
-                    const config = vscode.workspace.getConfiguration('tokenguard');
-                    await config.update('cloudProvider', (data.provider || 'deepseek') as string, vscode.ConfigurationTarget.Global);
-                    // A model belongs to one provider; clear it so the backend uses this provider's default.
-                    await config.update('cloudModel', '', vscode.ConfigurationTarget.Global);
-                    await this._refreshCloud();
-                    break;
-                }
-                case 'selectCloudModel':
-                    await vscode.workspace.getConfiguration('tokenguard')
-                        .update('cloudModel', (data.model || '') as string, vscode.ConfigurationTarget.Global);
-                    await this._postStatus();
-                    void this._postCloudModels(); // refresh the price/current line from the cache
-                    break;
-                case 'saveCloudKey': {
-                    const provider = (data.provider || this._host.cloudProvider()) as string;
-                    const key = String(data.key || '').trim();
-                    await this._host.storeApiKey(provider, key);
-                    if (key) {
-                        void vscode.window.showInformationMessage(`TokenGuard: ${provider} API key saved to SecretStorage.`);
+                    void this._postStatus(); // show the progress bar straight away
+                    if (!(await this._host.downloadLocalModel(model))) {
+                        await this._postStatus();
+                        break;
                     }
-                    await this._refreshCloud();
-                    break;
                 }
-                case 'clearCloudKey': {
-                    const provider = (data.provider || this._host.cloudProvider()) as string;
-                    await this._host.storeApiKey(provider, '');
-                    void vscode.window.showInformationMessage(`TokenGuard: cleared the ${provider} API key.`);
-                    await this._refreshCloud();
-                    break;
-                }
-                case 'saveCloudBaseUrl':
-                    await vscode.workspace.getConfiguration('tokenguard')
-                        .update('customBaseUrl', String(data.baseUrl || '').trim(), vscode.ConfigurationTarget.Global);
-                    await this._refreshCloud();
-                    break;
-                case 'testCloud':
-                    await this._host.api('GET', '/health?force=true', undefined, 15_000).catch(() => undefined);
-                    await this._postCloudModels(true);
-                    await this._postStatus();
-                    break;
+                await vscode.workspace.getConfiguration('tokenguard')
+                    .update('localModel', model, vscode.ConfigurationTarget.Global);
+                this._preloadSuppressed = false;
+                this._preloadedFor = model || undefined;
+                // Unload the old local model and warm up the new one so only one is resident.
+                await this._host.switchLocalModel(model);
+                this._post({ type: 'modelLoading', model: null });
+                await this._postStatus();
+                break;
             }
-        });
+            case 'selectCloudProvider': {
+                const config = vscode.workspace.getConfiguration('tokenguard');
+                await config.update('cloudProvider', (data.provider || 'deepseek') as string, vscode.ConfigurationTarget.Global);
+                // A model belongs to one provider; clear it so the backend uses this provider's default.
+                await config.update('cloudModel', '', vscode.ConfigurationTarget.Global);
+                await this._refreshCloud();
+                break;
+            }
+            case 'selectCloudModel':
+                await vscode.workspace.getConfiguration('tokenguard')
+                    .update('cloudModel', (data.model || '') as string, vscode.ConfigurationTarget.Global);
+                await this._postStatus();
+                void this._postCloudModels(); // refresh the price/current line from the cache
+                break;
+            case 'saveCloudKey': {
+                const provider = (data.provider || this._host.cloudProvider()) as string;
+                const key = String(data.key || '').trim();
+                await this._host.storeApiKey(provider, key);
+                if (key) {
+                    void vscode.window.showInformationMessage(`TokenGuard: ${provider} API key saved to SecretStorage.`);
+                }
+                await this._refreshCloud();
+                break;
+            }
+            case 'clearCloudKey': {
+                const provider = (data.provider || this._host.cloudProvider()) as string;
+                await this._host.storeApiKey(provider, '');
+                void vscode.window.showInformationMessage(`TokenGuard: cleared the ${provider} API key.`);
+                await this._refreshCloud();
+                break;
+            }
+            case 'saveCloudBaseUrl':
+                await vscode.workspace.getConfiguration('tokenguard')
+                    .update('customBaseUrl', String(data.baseUrl || '').trim(), vscode.ConfigurationTarget.Global);
+                await this._refreshCloud();
+                break;
+            case 'testCloud':
+                await this._host.api('GET', '/health?force=true', undefined, 15_000).catch(() => undefined);
+                await this._postCloudModels(true);
+                await this._postStatus();
+                break;
+        }
     }
 
     private _post(message: unknown) {
-        void this._view?.webview.postMessage(message);
+        void this._webview?.postMessage(message);
     }
 
     public refreshStatus() {
@@ -373,7 +395,7 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
 
     /** Poll again shortly (with a small backoff) until the backend answers. */
     private _scheduleRetry(fixedDelayMs?: number) {
-        if (this._retryTimer || !this._view) {
+        if (this._retryTimer || !this._webview) {
             return; // no view (sidebar closed) or a retry is already queued
         }
         const delay = fixedDelayMs ?? this._retryDelayMs;

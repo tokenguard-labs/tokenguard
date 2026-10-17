@@ -1164,6 +1164,29 @@
     cloudKeyInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); document.getElementById('saveCloudKey').click(); }
     });
+    // Model manager popover: position it under its summary, and close it on Escape / outside click.
+    const modelsSection = document.getElementById('modelsSection');
+    const modelsList = document.getElementById('modelsList');
+    function placeModelsList() {
+        if (!modelsSection.open) return;
+        const box = modelsSection.getBoundingClientRect();
+        const top = modelsSection.querySelector('summary').getBoundingClientRect().bottom + 4;
+        modelsList.style.top = top + 'px';
+        modelsList.style.left = box.left + 'px';
+        modelsList.style.width = box.width + 'px';
+        modelsList.style.maxHeight = Math.max(120, window.innerHeight - top - 8) + 'px';
+    }
+    modelsSection.addEventListener('toggle', placeModelsList);
+    window.addEventListener('resize', placeModelsList);
+    document.querySelector('.top').addEventListener('scroll', placeModelsList);
+    new ResizeObserver(placeModelsList).observe(document.querySelector('.top'));
+    document.addEventListener('mousedown', e => {
+        if (modelsSection.open && !modelsSection.contains(e.target)) modelsSection.open = false;
+    });
+    document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && modelsSection.open) { modelsSection.open = false; e.stopPropagation(); }
+    }, true);
+
     document.addEventListener('keydown', e => {
         if (e.key === 'Escape' && busy) { e.preventDefault(); stop(); }
     });

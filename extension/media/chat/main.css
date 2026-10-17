@@ -376,3 +376,13 @@ button.icon-btn.reject { color: var(--vscode-gitDecoration-deletedResourceForegr
 .model-item .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .model-item .size { opacity: 0.75; font-size: 11px; white-space: nowrap; }
 .model-item button.danger:hover { background: var(--vscode-inputValidation-errorBackground, #5a1d1d); }
+/* "Manage local models" opens as a popover over the chat instead of inside the (scrolling,
+   clipped) header; main.js sets its top/left/width/max-height from the summary's position. */
+#modelsSection[open] > #modelsList {
+    position: fixed; z-index: 100; margin-top: 0; gap: 8px;
+    padding: 8px 10px; overflow-y: auto; box-sizing: border-box;
+    border: 1px solid var(--vscode-editorWidget-border, var(--vscode-widget-border));
+    border-radius: 4px;
+    background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+    box-shadow: 0 4px 16px var(--vscode-widget-shadow, rgba(0, 0, 0, 0.36));
+}

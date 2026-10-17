@@ -48,6 +48,7 @@ let backend;
 let ollama;
 let viewProvider;
 let extensionContext;
+let servicesStarted = false;
 function activate(context) {
     console.log('⚡ LocalPilot extension activated successfully!');
     extensionContext = context;
@@ -75,7 +76,8 @@ function activate(context) {
         downloadLocalModel,
         cancelDownload,
         deleteLocalModel,
-        ollama: () => ollama
+        ollama: () => ollama,
+        startServices
     });
     context.subscriptions.push(viewProvider, backend.onDidChangeState(() => viewProvider?.refreshStatus()), 
     // Tell the sidebar what Ollama is doing; once it is up, refresh so the selected model loads.
@@ -99,10 +101,24 @@ function activate(context) {
     context.subscriptions.push(vscode.window.registerWebviewViewProvider('localpilot.chatView', viewProvider, {
         webviewOptions: { retainContextWhenHidden: true }
     }));
+    // The activity bar icon is only a launcher: clicking it opens the chat in the Secondary Side Bar.
+    const launcher = vscode.window.createTreeView('localpilot.launcher', {
+        treeDataProvider: { getChildren: () => [], getTreeItem: (item) => item }
+    });
+    context.subscriptions.push(launcher, launcher.onDidChangeVisibility(async (e) => {
+        if (!e.visible) {
+            return;
+        }
+        await vscode.commands.executeCommand('localpilot.chatView.focus');
+        // Still visible means the chat opened elsewhere (right side bar / panel), not in this
+        // side bar: collapse it so the click behaves like a button. If the user dragged the chat
+        // to the left, focusing it switched the side bar away from the launcher instead.
+        if (launcher.visible) {
+            await vscode.commands.executeCommand('workbench.action.closeSidebar');
+        }
+    }));
     // Register a Command to force-open the view via Command Palette (Ctrl+Shift+P)
-    context.subscriptions.push(vscode.commands.registerCommand('tokenguard.openChat', () => {
-        vscode.commands.executeCommand('localpilot.chatView.focus');
-    }), vscode.commands.registerCommand('tokenguard.restartBackend', async () => {
+    context.subscriptions.push(vscode.commands.registerCommand('tokenguard.openChat', () => vscode.commands.executeCommand('localpilot.chatView.focus')), vscode.commands.registerCommand('tokenguard.restartBackend', async () => {
         await backend?.restart();
         if (backend?.state === 'external') {
             void vscode.window.showInformationMessage(`LocalPilot backend at ${apiUrl()} was started outside VS Code; restart it there.`);
@@ -112,14 +128,22 @@ function activate(context) {
         viewProvider?.suppressPreload();
         void vscode.window.showInformationMessage(freed && freed.length ? `TokenGuard: unloaded ${freed.join(', ')}.` : 'TokenGuard: no local models were loaded.');
         await viewProvider?.refreshStatus();
-    }));
-    // Spawn the backend now so it is warm by the time the sidebar asks for status.
-    void backend.ensureRunning();
-    // Check Ollama: running already, start it, or offer to install it; then make sure a model is pulled.
-    // (It is stopped again on exit when we started it.)
+    }), vscode.commands.registerCommand('tokenguard.moveChatRight', () => moveChatToSecondarySidebar()));
+    void dockChatRightOnFirstRun(context);
+    // Startup stays light: the backend and Ollama start when the chat is first opened
+    // (startServices) or when a command needs them.
+}
+/**
+ * First time the chat opens: spawn the backend, then check Ollama — running already, start it, or
+ * offer to install it; then make sure a model is pulled. (Both are stopped again on exit.)
+ */
+function startServices() {
+    if (servicesStarted) {
+        return;
+    }
+    servicesStarted = true;
+    void backend?.ensureRunning();
     void startOllamaFlow(false);
-    // Open the container so the activity bar entry is selected on launch.
-    void vscode.commands.executeCommand('workbench.view.extension.localpilot-sidebar');
 }
 function deactivate() {
     // Stop everything this extension started: backend, local model memory, and our Ollama.
@@ -215,6 +239,38 @@ async function installOllamaFlow() {
         else if (choice === 'Open Download Page') {
             void vscode.env.openExternal(vscode.Uri.parse(ollama_1.OLLAMA_DOWNLOAD_PAGE));
         }
+    }
+}
+/**
+ * Older VS Code / Cursor builds (< 1.106) can't contribute a view straight to the Secondary
+ * Side Bar, so the chat is registered in the bottom panel and moved once on first run. There is
+ * no API for the move, so this drives VS Code's own "Move View" picker: after resetting the view
+ * to its default panel container (where it's alone), the picker's items are always
+ * [New Side Bar Entry, New Secondary Side Bar Entry, ...], so "next" + accept picks the right side.
+ * VS Code remembers the location, and the user can still drag it back to the left.
+ */
+async function moveChatToSecondarySidebar() {
+    const viewId = 'localpilot.chatView';
+    await vscode.commands.executeCommand(`${viewId}.focus`);
+    await vscode.commands.executeCommand('workbench.action.resetFocusedViewLocation');
+    await vscode.commands.executeCommand(`${viewId}.focus`);
+    await vscode.commands.executeCommand('workbench.action.moveFocusedView', viewId);
+    await new Promise(resolve => setTimeout(resolve, 150));
+    await vscode.commands.executeCommand('workbench.action.quickOpenSelectNext');
+    await vscode.commands.executeCommand('workbench.action.acceptSelectedQuickOpenItem');
+}
+/** First run only: dock the chat on the right, like Cursor / Claude. */
+async function dockChatRightOnFirstRun(context) {
+    const key = 'localpilot.dockedRight.v2';
+    if (context.globalState.get(key)) {
+        return;
+    }
+    await context.globalState.update(key, true);
+    try {
+        await moveChatToSecondarySidebar();
+    }
+    catch {
+        // Leave it on the left; the user can drag it or run "Move LocalPilot to Right Side Bar".
     }
 }
 /** Ollama is up but has no model pulled: ask the user to download one. */

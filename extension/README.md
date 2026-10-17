@@ -26,7 +26,7 @@ Marketplace READMEs must not use SVG images. -->
 
 ## Getting started
 
-1. Install the extension and open the **LocalPilot** view in the Activity Bar.
+1. Install the extension and click the **LocalPilot** icon in the Activity Bar (or run **TokenGuard: Open LocalPilot**) to open the chat in the right side bar. You can drag it to the left side bar if you prefer. The backend and Ollama start the first time the chat opens.
 2. Wait for the backend to start. The first run shows a progress notification while dependencies install.
 3. Pick a cloud provider and model in the model panel, then set an API key with **TokenGuard: Set Cloud API Key**.
 4. Optional: pick a local model. If it isn't downloaded yet, the extension offers to download it.
@@ -36,7 +36,8 @@ Marketplace READMEs must not use SVG images. -->
 
 | Command | What it does |
 |---|---|
-| TokenGuard: Open LocalPilot | Focus the chat sidebar |
+| TokenGuard: Open LocalPilot | Open the chat in the right side bar (same as the Activity Bar icon) |
+| TokenGuard: Move LocalPilot to Right Side Bar | Dock the chat back in the right side bar after moving it |
 | TokenGuard: Clear Chat | Clear the conversation |
 | TokenGuard: Set / Clear Cloud API Key | Store or remove the key for the current provider (VS Code Secret Storage) |
 | TokenGuard: Restart Backend | Restart the Python backend |
