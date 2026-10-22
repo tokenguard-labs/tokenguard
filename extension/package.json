@@ -49,6 +49,14 @@
     }
   },
   "main": "./out/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:localpilot.launcher",
+    "onView:localpilot.chatView",
+    "onCommand:tokenguard.openChat",
+    "onCommand:tokenguard.clearChat",
+    "onCommand:tokenguard.moveChatRight"
+  ],
   "contributes": {
     "commands": [
       {

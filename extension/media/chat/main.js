@@ -8,6 +8,7 @@
     const sendBtn = document.getElementById('send');
     const modelSelect = document.getElementById('localModel');
     const emptyState = document.getElementById('empty');
+    const tutEl = document.getElementById('tut');
     const scroller = document.getElementById('scroller');
     const cloudProviderSel = document.getElementById('cloudProvider');
     const cloudModelSel = document.getElementById('cloudModel');
@@ -21,6 +22,8 @@
     let nextId = 1;
     let busy = false;               // one request at a time, like the Streamlit UI
     let activeId = null;            // turn whose request is in flight (what Stop cancels)
+    let stopGuard = null;           // Stop's safety timer: force-unblock if 'cancelled' is lost
+    const STOP_GUARD_MS = 15000;
     const turns = new Map();        // id -> { prompt, req, analysis, el, pendingEl, stream } (agent: { agent, runId, ... })
     let agentHistory = [];          // finished agent tasks { prompt, summary }, sent along for follow-ups
 
@@ -37,9 +40,6 @@
 
     const EXAMPLES = [
         'Explain what the selected code does',
-        'Write unit tests for the selected function',
-        'Find possible bugs in the selected code',
-        'Refactor the selected code to be easier to read',
         'Where is the configuration loaded in this repo?',
         'Summarize the architecture of this project'
     ];
@@ -276,6 +276,7 @@
                     (err ? '<div class="muted">' + err + '</div>' : '') +
                     '<div class="choices"><button class="secondary" data-model-action="start-ollama">Start Ollama</button></div>';
         }
+        renderTopBar(); // the top row's dot and attention strip reflect Ollama problems
     }
 
     // A download the user just asked for shows its bar immediately, before the backend reports it.
@@ -418,6 +419,7 @@
                 setupDismissed = true;
                 try { vscode.setState({ ...(vscode.getState() || {}), setupDismissed: true }); } catch { /* ignore */ }
                 renderSetup();
+                renderTopBar();
                 break;
             case 'download':
                 pullProgress[model] = optimisticPull();
@@ -441,6 +443,9 @@
     function setBusy(value, id) {
         busy = value;
         activeId = value ? id : null;
+        if (!value) {
+            clearTimeout(stopGuard); // the turn finished normally: the Stop safety net can rest
+        }
         sendBtn.disabled = false;
         sendBtn.classList.toggle('stop', value);
         sendBtn.textContent = value ? '■ Stop' : 'Send Request';
@@ -448,6 +453,12 @@
         document.querySelectorAll('button[data-route], button[data-retry]').forEach(b => {
             b.disabled = value || b.dataset.used === '1';
         });
+    }
+
+    // What a turn is doing: 'analyze' / 'run' while a request is out, 'done' once its card is
+    // finalized. Stop and 'cancelled' use it to avoid replacing an already-finished card.
+    function turnPhase(turn, phase) {
+        if (turn) turn.phase = phase;
     }
 
     function updateEmptyState() {
@@ -495,6 +506,7 @@
         const turn = turns.get(id);
         turn.el.innerHTML = '<span class="spinner">Analyzing prompt (local vs global)…</span>';
         turn.stopped = false;
+        turnPhase(turn, 'analyze');
         setBusy(true, id);
         vscode.postMessage({ type: 'sendPrompt', id, prompt: turn.prompt });
     }
@@ -512,6 +524,7 @@
         turn.route = route;
         turn.detail = detail;
         turn.stopped = false;
+        turnPhase(turn, 'run');
         endStream(turn);
         setBusy(true, id);
         vscode.postMessage({ type: 'run', id, req: { ...turn.req, detail }, route });
@@ -519,11 +532,18 @@
 
     function stop() {
         if (!busy || activeId === null) return;
+        const id = activeId;
+        const turn = turns.get(id);
+        if (turn && turn.phase === 'done') {
+            // The card already rendered its final state; only the busy flag got stuck.
+            // Just unblock: never stop on, or replace, a finished answer.
+            setBusy(false);
+            return;
+        }
         sendBtn.disabled = true;
         sendBtn.textContent = 'Stopping…';
         // Freeze the answer now: whatever is still in flight from the model is dropped,
         // rather than rendering on until the cancellation round-trip completes.
-        const turn = turns.get(activeId);
         if (turn) {
             turn.stopped = true;
             turn.stoppedText = endStream(turn);
@@ -532,7 +552,17 @@
             const spinner = turn.pendingEl && turn.pendingEl.querySelector('.metrics .spinner');
             if (spinner) spinner.textContent = 'stopping…';
         }
-        vscode.postMessage({ type: 'cancel', id: activeId });
+        vscode.postMessage({ type: 'cancel', id });
+        // Safety net: normally the extension answers with 'cancelled' immediately. If that
+        // round-trip is lost or hangs, unblock locally so the next question can still be asked.
+        clearTimeout(stopGuard);
+        stopGuard = setTimeout(() => {
+            if (busy && activeId === id) {
+                if (turn && turn.phase !== 'done') renderCancelled(id);
+                else turnPhase(turn, 'done');
+                setBusy(false);
+            }
+        }, STOP_GUARD_MS);
     }
 
     function clearChat() {
@@ -578,6 +608,9 @@
             (a.local_capable === false
                 ? '<div class="warn">Local model not capable: ' +
                   esc((a.capability_reasons || []).join('; ') || 'capability check failed') + '</div>'
+                : '') +
+            (a.repo_path && !files.length
+                ? '<div class="warn">⚠ No context files were retrieved from the repo — the answer may be generic.</div>'
                 : '') +
             (reasons || Object.keys(a.factors || {}).length
                 ? accordion('Why this route',
@@ -773,6 +806,7 @@
             (actions ? '<div class="choices">' + actions + '</div>' : '');
         fillMarkdown(el.querySelector('.answer'), r.answer);
         turn.pendingEl = null;
+        turnPhase(turn, 'done');
     }
 
     function renderCancelled(id) {
@@ -789,6 +823,7 @@
         turn.stoppedText = '';
         partialAnswer(el, text);
         turn.pendingEl = null;
+        turnPhase(turn, 'done');
     }
 
     // ---- Agent mode -----------------------------------------------------------------------
@@ -805,7 +840,7 @@
             '<details class="acc agent-log" open><summary>Steps</summary><div class="acc-body agent-steps"></div></details>' +
             '<div class="agent-live muted"></div>' +
             '<div class="agent-final"></div>', 'msg agent');
-        turns.set(id, { prompt, el, agent: true, route, stepCount: 0 });
+        turns.set(id, { prompt, el, agent: true, route, stepCount: 0, phase: 'run' });
         setBusy(true, id);
         vscode.postMessage({ type: 'agentRun', id, prompt, route, history: agentHistory.slice(-3) });
     }
@@ -992,6 +1027,7 @@
             retryButton(id, turn);
         fillMarkdown(final.querySelector('.answer'), r.summary || '(no summary)');
         turn.changePaths = changes.map(c => c.path);
+        turnPhase(turn, 'done');
         agentHistory.push({ prompt: turn.prompt, summary: String(r.summary || '').slice(0, 1500) });
     }
 
@@ -1024,6 +1060,7 @@
     function renderAgentStopped(id, message) {
         const turn = turns.get(id);
         turn.stopped = false;
+        turnPhase(turn, 'done');
         turn.el.querySelectorAll('.agent-steps .step-icon.spinner').forEach(i => { i.className = 'step-icon fail'; i.textContent = '■'; });
         turn.el.querySelectorAll('.agent-approval .choices').forEach(c => { c.outerHTML = '<div class="muted">not answered</div>'; });
         setAgentStatus(turn, '<b>Model:</b> ' + esc(turn.model || '?'));
@@ -1061,52 +1098,118 @@
     }
 
     // ---- Status ---------------------------------------------------------------------------
+    // One compact row: a colored dot, a short status line and a gear button that opens the
+    // settings popover. Anything that needs action (offline backend, Ollama problems, missing
+    // API key, startup progress) is rendered into the #attention strip below it, so the calm
+    // case leaves just the dot + model names.
 
-    function renderStatus(m) {
-        const el = document.getElementById('status');
-        if (m.starting) {
+    let lastStatusMsg = null;   // last 'status' message; renderTopBar re-renders from it
+
+    function ollamaProblem() {
+        // The Ollama states that keep the user from running a local model at all; null = fine/busy.
+        const s = ollamaState && ollamaState.state;
+        return s === 'missing' || s === 'failed' || s === 'stopped' ? s : null;
+    }
+
+    /** The gear's red dot: show it whenever the settings panel holds something to fix. */
+    function settingsNeedsAttention(m) {
+        if (m && (m.starting || !m.online)) return true;
+        if (ollamaProblem() || (ollamaState && ollamaState.state === 'installing')) return true;
+        const h = m && m.health;
+        if (h && !h.cloud_valid && h.cloud_provider !== 'mock') return true;
+        if (!activeDownloads().length) {
+            const show = !!lastHealth && lastHealth.ollama && !(lastHealth.local_models || []).length;
+            if (show && !setupDismissed) return true;
+        }
+        return false;
+    }
+
+    function dotClass(m) {
+        if (m && m.starting) return 'pulse';
+        if (!m || !m.online || ollamaProblem()) return 'bad';
+        if (loadingModel) return 'pulse';
+        return 'ok';
+    }
+
+    function renderTopBar() {
+        const m = lastStatusMsg;
+        const dot = document.getElementById('statusDot');
+        const text = document.getElementById('statusText');
+        const panel = document.getElementById('settingsPanel');
+        const attention = document.getElementById('attention');
+        const badge = document.getElementById('settingsBadge');
+        if (!dot || !text || !attention) return;
+
+        const at = [];  // attention rows (HTML strings)
+        if (!m) {
+            dot.className = 'status-dot pulse';
+            text.innerHTML = '<span class="spinner">Connecting to LocalPilot backend…</span>';
+        } else if (m.starting) {
+            dot.className = 'status-dot pulse';
+            text.innerHTML = '<span class="spinner">Starting LocalPilot backend…</span>';
             const p = m.progress;
             const pct = p ? Math.max(0, Math.min(100, Math.round(p.percent))) : 0;
             const bar = pct > 0
                 ? '<div class="progress"><div class="progress-fill" style="width:' + pct + '%"></div></div>'
                 : '<div class="progress indeterminate"><div class="progress-fill"></div></div>';
-            const step = p && p.step
-                ? '<div class="muted">' + (pct > 0 ? pct + '% · ' : '') + esc(p.step) + '</div>' : '';
-            el.innerHTML = '<span class="spinner">Starting LocalPilot backend…</span> (' + esc(m.apiUrl) + ')' + bar + step;
-            return;
-        }
-        if (!m.online) {
-            const retrying = m.retrying ? ' <span class="spinner">retrying…</span>' : '';
-            el.innerHTML = '<span class="offline">● Backend offline</span> (' + esc(m.apiUrl) + ')' + retrying +
-                '<div class="muted">' + esc(m.error || '') + '</div>' +
-                '<div class="choices"><button id="retryStatus" class="secondary">Retry now</button></div>';
-            return;
-        }
-        const h = m.health, s = m.stats;
-        const provider = esc(h.cloud_provider);
-        const model = h.cloud_model ? ' <code>' + esc(h.cloud_model) + '</code>' : '';
-        let cloudState;
-        if (h.cloud_valid) {
-            cloudState = '<code>' + provider + '</code>' + model + ' ✓';
-        } else if (h.cloud_provider === 'mock') {
-            cloudState = '<code>mock</code>';
+            at.push(bar + (p && p.step ? '<div class="muted">' + (pct > 0 ? pct + '% · ' : '') + esc(p.step) + '</div>' : ''));
+        } else if (!m.online) {
+            dot.className = 'status-dot bad';
+            text.textContent = 'Backend offline' + (m.retrying ? ' — retrying…' : '');
+            at.push('<div class="muted">' + esc(m.error || '') + '</div>' +
+                '<div class="choices"><button id="retryStatus" class="secondary">Retry now</button></div>');
         } else {
-            cloudState = '<code>' + provider + '</code>' + model + ' <span class="warn">⚠ ' +
-                esc(h.cloud_detail || 'not configured') + '</span>';
+            const h = m.health;
+            dot.className = 'status-dot ' + dotClass(m);
+            let bits = ['local: <code>' + esc(h.local_model || '—') + '</code>'];
+            if (loadingModel) bits.push('<span class="spinner">loading ' + esc(loadingModel) + '…</span>');
+            bits.push('cloud: <code>' + esc(h.cloud_provider) + '</code>' +
+                (h.cloud_valid ? ' ✓' : ' <span class="warn">⚠</span>'));
+            text.innerHTML = bits.join(' · ');
+            const problem = ollamaProblem();
+            if (problem) {
+                const err = ollamaState.error ? '<div class="muted">' + esc(ollamaState.error) + '</div>' : '';
+                if (problem === 'missing') {
+                    at.push('<div><span class="offline">● Ollama is not installed</span></div>' + err +
+                        '<div class="choices"><button data-model-action="install-ollama">Install Ollama</button>' +
+                        '<button class="secondary" data-model-action="start-ollama">Check again</button></div>');
+                } else if (problem === 'failed') {
+                    at.push('<div><span class="offline">● Could not start Ollama</span></div>' + err +
+                        '<div class="choices"><button class="secondary" data-model-action="start-ollama">Try again</button>' +
+                        '<button class="secondary" data-model-action="ollama-log">Show log</button></div>');
+                } else {
+                    at.push('<div><span class="offline">● Ollama server is not running</span></div>' + err +
+                        '<div class="choices"><button class="secondary" data-model-action="start-ollama">Start Ollama</button></div>');
+                }
+            } else if (ollamaState && ollamaState.state === 'installing') {
+                at.push('<div><span class="spinner">Installing Ollama… follow the "Install Ollama" terminal</span></div>');
+            }
+            if (!h.cloud_valid && h.cloud_provider !== 'mock') {
+                at.push('<div><span class="warn">⚠ Cloud key not set for <code>' + esc(h.cloud_provider) + '</code></span>' +
+                    '<div class="muted">' + esc(h.cloud_detail || 'not configured') + '</div>' +
+                    '<div class="choices"><button id="setApiKey" class="secondary">🔑 Set API key</button></div></div>');
+            }
+            const stats = m.stats;
+            const spend = (stats.total_cost_usd != null && stats.total_cost_usd > 0)
+                ? '<span>Spend: <b>$' + Number(stats.total_cost_usd).toFixed(4) + '</b></span>' : '';
+            const statsBar = document.getElementById('statsBar');
+            if (statsBar) statsBar.innerHTML = '<span>🖥️ Local: <b>' + esc(stats.local_requests) + '</b></span>' +
+                '<span>☁️ Cloud: <b>' + esc(stats.cloud_requests) + '</b></span>' +
+                '<span>Tokens saved: <b>' + fmt(stats.total_tokens_saved) + '</b> (' +
+                esc(stats.cloud_token_reduction_pct) + '%)</span>' + spend;
         }
-        const keyBtn = (!h.cloud_valid && h.cloud_provider !== 'mock')
-            ? '<div class="choices"><button id="setApiKey" class="secondary">🔑 Set API key</button></div>'
-            : '';
-        const spend = (s.total_cost_usd != null && s.total_cost_usd > 0)
-            ? '<span>Spend: <b>$' + Number(s.total_cost_usd).toFixed(4) + '</b></span>' : '';
-        el.innerHTML = '● API online · cloud: ' + cloudState + ' · local: <code>' +
-            esc(h.local_model) + '</code> · Ollama ' + (h.ollama ? '✅' : '❌') + keyBtn +
-            '<div class="stats"><span>🖥️ Local: <b>' + esc(s.local_requests) + '</b></span><span>☁️ Cloud: <b>' +
-            esc(s.cloud_requests) + '</b></span><span>Tokens saved: <b>' + fmt(s.total_tokens_saved) + '</b> (' +
-            esc(s.cloud_token_reduction_pct) + '%)</span>' + spend + '</div>';
+        attention.innerHTML = at.join('');
+        attention.hidden = !at.length;
+        if (badge) badge.hidden = !settingsNeedsAttention(m);
+        if (panel && !panel.hidden) placePanel();
+    }
+
+    function renderStatus(m) {
+        lastStatusMsg = m;
+        renderTopBar();
         const sys = document.getElementById('systemInfo');
-        if (sys && h.system) {
-            const g = h.system;
+        if (sys && m.health && m.health.system) {
+            const g = m.health.system;
             // "used / total" when the backend reports available/free memory, else just the total.
             const usage = (total, free) => {
                 const t = Number(total) || 0;
@@ -1163,6 +1266,43 @@
     document.getElementById('examples').innerHTML = EXAMPLES
         .map(p => '<button class="example" data-example="' + esc(p) + '">' + esc(p) + '</button>').join('');
 
+    // First-run tutorial: a 3-step walkthrough (Next/Back/Skip), dismissed permanently on either
+    // path — the flag persists in the webview state, like setupDismissed.
+    if (savedState.tutorialDone) {
+        tutEl.remove();
+    } else {
+        const tutLast = tutEl.querySelectorAll('.tut-step').length - 1;
+        let tutStep = 0;
+        const tutBack = document.getElementById('tutBack');
+        const tutNext = document.getElementById('tutNext');
+        const tutNum = document.getElementById('tutNum');
+
+        function tutShow() {
+            tutEl.querySelectorAll('.tut-step').forEach((el, i) => { el.hidden = i !== tutStep; });
+            if (tutNum) tutNum.textContent = String(tutStep + 1);
+            if (tutBack) tutBack.disabled = tutStep === 0;
+            if (tutNext) tutNext.textContent = tutStep === tutLast ? 'Finish' : 'Next';
+        }
+        const tutEnd = () => {
+            tutEl.remove();
+            try {
+                vscode.setState({ ...(vscode.getState() || {}), tutorialDone: true });
+            } catch { /* ignore */ }
+        };
+
+        tutEl.hidden = false;
+        tutShow();
+        if (tutNext) tutNext.addEventListener('click', () => {
+            if (tutStep >= tutLast) tutEnd();
+            else { tutStep++; tutShow(); }
+        });
+        if (tutBack) tutBack.addEventListener('click', () => {
+            if (tutStep > 0) { tutStep--; tutShow(); }
+        });
+        const tutSkip = document.getElementById('tutSkip');
+        if (tutSkip) tutSkip.addEventListener('click', tutEnd);
+    }
+
     sendBtn.addEventListener('click', () => (busy ? stop() : send()));
     modelSelect.addEventListener('change', () => {
         const value = modelSelect.value;
@@ -1171,6 +1311,7 @@
         const state = document.getElementById('modelState');
         loadingModel = installed && value ? value : null;
         if (state) state.textContent = installed || !value ? 'switching…' : 'checking download…';
+        renderTopBar();
         modelSelect.disabled = true;
         vscode.postMessage({
             type: 'selectLocalModel',
@@ -1205,27 +1346,37 @@
     cloudKeyInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); document.getElementById('saveCloudKey').click(); }
     });
-    // Model manager popover: position it under its summary, and close it on Escape / outside click.
-    const modelsSection = document.getElementById('modelsSection');
-    const modelsList = document.getElementById('modelsList');
-    function placeModelsList() {
-        if (!modelsSection.open) return;
-        const box = modelsSection.getBoundingClientRect();
-        const top = modelsSection.querySelector('summary').getBoundingClientRect().bottom + 4;
-        modelsList.style.top = top + 'px';
-        modelsList.style.left = box.left + 'px';
-        modelsList.style.width = box.width + 'px';
-        modelsList.style.maxHeight = Math.max(120, window.innerHeight - top - 8) + 'px';
+    // Settings popover: opens from the gear button, floats over the chat, and closes on
+    // Escape / outside click. Holds cloud config, the local model picker and the model manager.
+    const settingsBtn = document.getElementById('settingsBtn');
+    const settingsPanel = document.getElementById('settingsPanel');
+    function placePanel() {
+        if (settingsPanel.hidden) return;
+        const bar = settingsBtn.getBoundingClientRect();
+        const top = bar.bottom + 4;
+        settingsPanel.style.top = top + 'px';
+        settingsPanel.style.right = window.innerWidth - bar.right + 'px';
+        settingsPanel.style.maxHeight = Math.max(160, window.innerHeight - top - 8) + 'px';
     }
-    modelsSection.addEventListener('toggle', placeModelsList);
-    window.addEventListener('resize', placeModelsList);
-    document.querySelector('.top').addEventListener('scroll', placeModelsList);
-    new ResizeObserver(placeModelsList).observe(document.querySelector('.top'));
+    settingsBtn.addEventListener('click', () => {
+        settingsPanel.hidden = !settingsPanel.hidden;
+        if (!settingsPanel.hidden) {
+            placePanel();
+            renderModelsList(); // fresh list every time the panel opens
+        }
+    });
+    window.addEventListener('resize', placePanel);
     document.addEventListener('mousedown', e => {
-        if (modelsSection.open && !modelsSection.contains(e.target)) modelsSection.open = false;
+        if (!settingsPanel.hidden && !settingsPanel.contains(e.target) &&
+            e.target !== settingsBtn && !settingsBtn.contains(e.target)) {
+            settingsPanel.hidden = true;
+        }
     });
     document.addEventListener('keydown', e => {
-        if (e.key === 'Escape' && modelsSection.open) { modelsSection.open = false; e.stopPropagation(); }
+        if (e.key === 'Escape' && !settingsPanel.hidden) {
+            settingsPanel.hidden = true;
+            e.stopPropagation();
+        }
     }, true);
 
     document.addEventListener('keydown', e => {
@@ -1300,16 +1451,18 @@
             if (m.id === activeId && m.type !== 'stream') setBusy(false);
             return;
         }
-        switch (m.type) {
-            case 'cloudModels':
-                renderCloud(m.info);
-                break;
-            case 'modelLoading': {
+        try {
+            switch (m.type) {
+                case 'cloudModels':
+                    renderCloud(m.info);
+                    break;
+                case 'modelLoading': {
                 loadingModel = m.model || null;
                 const state = document.getElementById('modelState');
                 if (state && m.model) {
                     state.innerHTML = '<span class="spinner">loading ' + esc(m.model) + '…</span>';
                 }
+                renderTopBar();
                 break;
             }
             case 'ollama':
@@ -1321,6 +1474,7 @@
                 renderDownloads();
                 renderModelsList();
                 renderSetup();
+                renderTopBar();
                 break;
             case 'status':
                 lastHealth = m.online ? m.health : null;
@@ -1394,11 +1548,14 @@
                 break;
             }
             case 'cancelled':
-                if (turn.agent) renderAgentStopped(m.id);
-                else renderCancelled(m.id);
+                // A 'done' turn only had its busy flag stuck: keep the finished card.
+                if (turn.phase !== 'done') {
+                    if (turn.agent) renderAgentStopped(m.id);
+                    else renderCancelled(m.id);
+                }
                 setBusy(false);
                 break;
-            case 'error': {
+             case 'error': {
                 if (turn && turn.agent) {
                     renderAgentStopped(m.id, turn.stopped ? '' : m.message);
                     setBusy(false);
@@ -1414,62 +1571,63 @@
                 if (turn) {
                     partialAnswer(el, endStream(turn));
                     turn.pendingEl = null;
+                    turnPhase(turn, 'done');
                 }
                 setBusy(false);
                 break;
             }
+            }
+        } catch (err) {
+            // A broken response must never leave the UI busy (or half-rendered) forever.
+            addCard('<div class="error">⚠️ Could not render the response: ' + esc(err && err.message || err) +
+                '</div>');
+            setBusy(false);
         }
     });
 
-    // Resizable panes: drag the handles between the model panel, the conversation and the composer.
-    // Sizes persist in localStorage so the layout survives a reload.
+    // Resizable composer: drag the handle between the conversation and the composer.
+    // Size persists in localStorage so the layout survives a reload.
     function initResizers() {
         const container = document.querySelector('.container');
         if (!container) return;
-        const panes = {
-            topResizer: { el: document.querySelector('.top'), dir: 1, key: 'lp.pane.top' },
-            bottomResizer: { el: document.querySelector('.bottom'), dir: -1, key: 'lp.pane.bottom' }
-        };
+        const pane = { el: document.querySelector('.bottom'), dir: -1, key: 'lp.pane.bottom' };
         const MIN = 56;
         const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
         const maxHeight = () => Math.max(MIN, container.getBoundingClientRect().height - MIN);
-        const setHeight = (pane, h) => {
+        const setHeight = h => {
             const height = clamp(h, MIN, maxHeight());
             pane.el.style.height = height + 'px';
             pane.el.style.flex = 'none';
             try { localStorage.setItem(pane.key, String(height)); } catch { /* storage may be off */ }
         };
-        for (const id of Object.keys(panes)) {
-            const pane = panes[id];
-            const handle = document.getElementById(id);
-            if (!handle || !pane.el) continue;
-            try {
-                const saved = Number(localStorage.getItem(pane.key));
-                if (saved) pane.el.style.height = clamp(saved, MIN, maxHeight()) + 'px';
-            } catch { /* ignore */ }
-            handle.addEventListener('mousedown', e => {
-                e.preventDefault();
-                const startY = e.clientY;
-                const startH = pane.el.getBoundingClientRect().height;
-                handle.classList.add('active');
-                document.body.classList.add('resizing');
-                const onMove = ev => setHeight(pane, startH + pane.dir * (ev.clientY - startY));
-                const onUp = () => {
-                    handle.classList.remove('active');
-                    document.body.classList.remove('resizing');
-                    window.removeEventListener('mousemove', onMove);
-                    window.removeEventListener('mouseup', onUp);
-                };
-                window.addEventListener('mousemove', onMove);
-                window.addEventListener('mouseup', onUp);
-            });
-            handle.addEventListener('keydown', e => {
-                if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
-                e.preventDefault();
-                const step = (e.key === 'ArrowDown' ? 1 : -1) * pane.dir * 24;
-                setHeight(pane, pane.el.getBoundingClientRect().height + step);
-            });
-        }
+        const handle = document.getElementById('bottomResizer');
+        if (!handle || !pane.el) return;
+        try {
+            const saved = Number(localStorage.getItem(pane.key));
+            if (saved) pane.el.style.height = clamp(saved, MIN, maxHeight()) + 'px';
+        } catch { /* ignore */ }
+        handle.addEventListener('mousedown', e => {
+            e.preventDefault();
+            const startY = e.clientY;
+            const startH = pane.el.getBoundingClientRect().height;
+            handle.classList.add('active');
+            document.body.classList.add('resizing');
+            const onMove = ev => setHeight(startH + pane.dir * (ev.clientY - startY));
+            const onUp = () => {
+                handle.classList.remove('active');
+                document.body.classList.remove('resizing');
+                window.removeEventListener('mousemove', onMove);
+                window.removeEventListener('mouseup', onUp);
+            };
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+        });
+        handle.addEventListener('keydown', e => {
+            if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+            e.preventDefault();
+            const step = (e.key === 'ArrowDown' ? 1 : -1) * pane.dir * 24;
+            setHeight(pane.el.getBoundingClientRect().height + step);
+        });
     }
 
     initResizers();

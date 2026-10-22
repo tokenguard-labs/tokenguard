@@ -13,59 +13,91 @@
 <body>
     <div class="container">
         <header class="top">
-            <div id="status" class="status">Connecting to LocalPilot backend…</div>
-            <div id="ollamaState" class="ollama-state"><span class="spinner">Checking Ollama server…</span></div>
-            <details id="cloudSection" class="section">
-                <summary>Cloud model</summary>
-                <div class="section-body">
-                    <div class="model-row">
-                        <label for="cloudProvider">Provider</label>
-                        <select id="cloudProvider"></select>
-                    </div>
-                    <div class="model-row" id="cloudBaseUrlRow" hidden>
-                        <label for="cloudBaseUrl">Base URL</label>
-                        <input id="cloudBaseUrl" type="text" placeholder="https://api.groq.com/openai/v1" />
-                    </div>
-                    <div class="model-row">
-                        <label for="cloudModel">Model</label>
-                        <select id="cloudModel"></select>
-                    </div>
-                    <div class="model-row">
-                        <label for="cloudKey">API key</label>
-                        <input id="cloudKey" type="password" placeholder="paste key" />
-                    </div>
-                    <div class="choices">
-                        <button id="saveCloudKey" class="secondary">Save key</button>
-                        <button id="clearCloudKey" class="secondary">Clear</button>
-                        <button id="testCloud" class="secondary">Test</button>
-                    </div>
-                    <div id="cloudState" class="muted"></div>
-                </div>
-            </details>
-            <div class="model-row">
-                <label for="localModel">Local model</label>
-                <select id="localModel" title="Ollama model used for local inference"></select>
+            <div class="statusbar">
+                <span id="statusDot" class="status-dot" aria-hidden="true"></span>
+                <span id="statusText" class="status-text">Connecting to LocalPilot backend…</span>
+                <button id="settingsBtn" class="gear-btn" title="Model settings" aria-haspopup="true">⚙<span
+                        id="settingsBadge" class="badge-dot" hidden></span></button>
             </div>
-            <div id="modelState" class="muted"></div>
+            <div id="attention" class="attention" hidden></div>
             <div id="setupCard" class="setup-card" hidden></div>
             <div id="downloads" class="downloads"></div>
-            <details id="modelsSection" class="section">
-                <summary>Manage local models</summary>
-                <div id="modelsList" class="section-body"></div>
-            </details>
-            <div id="systemInfo" class="muted"></div>
+
+            <div id="settingsPanel" class="settings-panel" hidden>
+                <details id="cloudSection" class="section" open>
+                    <summary>Cloud model</summary>
+                    <div class="section-body">
+                        <div class="model-row">
+                            <label for="cloudProvider">Provider</label>
+                            <select id="cloudProvider"></select>
+                        </div>
+                        <div class="model-row" id="cloudBaseUrlRow" hidden>
+                            <label for="cloudBaseUrl">Base URL</label>
+                            <input id="cloudBaseUrl" type="text" placeholder="https://api.groq.com/openai/v1" />
+                        </div>
+                        <div class="model-row">
+                            <label for="cloudModel">Model</label>
+                            <select id="cloudModel"></select>
+                        </div>
+                        <div class="model-row">
+                            <label for="cloudKey">API key</label>
+                            <input id="cloudKey" type="password" placeholder="paste key" />
+                        </div>
+                        <div class="choices">
+                            <button id="saveCloudKey" class="secondary">Save key</button>
+                            <button id="clearCloudKey" class="secondary">Clear</button>
+                            <button id="testCloud" class="secondary">Test</button>
+                        </div>
+                        <div id="cloudState" class="muted"></div>
+                    </div>
+                </details>
+                <div class="model-row">
+                    <label for="localModel">Local model</label>
+                    <select id="localModel" title="Ollama model used for local inference"></select>
+                </div>
+                <div id="modelState" class="muted"></div>
+                <details id="modelsSection" class="section">
+                    <summary>Manage local models</summary>
+                    <div id="modelsList" class="section-body"></div>
+                </details>
+                <div id="ollamaState" class="ollama-state"><span class="spinner">Checking Ollama server…</span></div>
+                <div id="systemInfo" class="muted"></div>
+                <div id="statsBar" class="stats"></div>
+            </div>
         </header>
-        <div id="topResizer" class="resizer" role="separator" aria-orientation="horizontal"
-             title="Drag to resize the model panel" tabindex="0"></div>
 
         <main id="scroller" class="middle">
             <section id="empty" class="empty">
+                <div id="tut" class="tut" hidden>
+                    <div class="tut-head"><span class="tut-title">LocalPilot · step
+                        <span id="tutNum">1</span>/3</span>
+                        <button id="tutSkip" title="Dismiss the tutorial">Skip</button>
+                    </div>
+                    <div class="tut-steps">
+                        <div class="tut-step">
+                            <p><b>Ask</b> a question — the relevant files are picked automatically and
+                                shown above each answer. Tap an example below to try it now.</p>
+                        </div>
+                        <div class="tut-step" hidden>
+                            <p><b>Agent</b> makes changes: switch the selector next to Send. It reads the
+                                code, proposes diffs you review one by one, and runs tests (each command
+                                needs your approval). Nothing is written until you accept.</p>
+                        </div>
+                        <div class="tut-step" hidden>
+                            <p><b>⚙</b> in the top bar picks the local Ollama model or a cloud key. Code
+                                stays on this machine; the cloud only receives compressed,
+                                secret-masked context.</p>
+                        </div>
+                    </div>
+                    <div class="tut-nav">
+                        <button id="tutBack" class="secondary" disabled>Back</button>
+                        <button id="tutNext">Next</button>
+                    </div>
+                </div>
                 <h2>Ask about your code</h2>
-                <p>Simple questions run on your local model and never leave your machine. Complex ones can go to a
-                    cloud LLM with only the relevant files, compressed and with secrets masked.</p>
+                <p>Local-first: code stays on your machine; the cloud only ever gets compressed, secret-masked context.</p>
                 <div class="examples" id="examples"></div>
                 <p id="contextHint" class="muted"></p>
-                <p class="muted">Enter to send · Shift+Enter for a new line · Esc to stop</p>
             </section>
 
             <div id="history" class="chat-history"></div>
@@ -74,16 +106,15 @@
              title="Drag to resize the composer" tabindex="0"></div>
 
         <footer class="bottom">
-            <div class="model-row">
-                <label for="mode">Mode</label>
-                <select id="mode" title="Ask answers questions. Agent reads your code, proposes edits you review, and runs tests (with your approval).">
-                    <option value="ask">Ask: answer questions</option>
-                    <option value="agent-cloud">Agent: edit code with the global LLM</option>
-                    <option value="agent-local">Agent: edit code with the local LLM</option>
-                </select>
-            </div>
             <textarea id="prompt" placeholder="Ask LocalPilot about your repository… (Enter to send, Shift+Enter for newline)"></textarea>
-            <button id="send" title="Send (Enter)">Send Request</button>
+            <div class="composer-row">
+                <select id="mode" title="Ask answers questions. Agent reads your code, proposes edits you review, and runs tests (with your approval).">
+                    <option value="ask">Ask</option>
+                    <option value="agent-cloud">Agent · cloud LLM</option>
+                    <option value="agent-local">Agent · local LLM</option>
+                </select>
+                <button id="send" title="Send (Enter)">Send Request</button>
+            </div>
         </footer>
     </div>
 

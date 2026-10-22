@@ -198,8 +198,16 @@ AGENT_SHADOW_MAX_MB = int(os.getenv("AGENT_SHADOW_MAX_MB", "300"))
 AGENT_CONTEXT_TOKENS = int(os.getenv("AGENT_CONTEXT_TOKENS", "60000"))
 # Context window for a local agent; agent transcripts outgrow the chat default quickly.
 AGENT_LOCAL_NUM_CTX = int(os.getenv("AGENT_LOCAL_NUM_CTX", "16384"))
+# Max tokens one local agent step may generate — roughly its note plus the next tool call; a
+# small model with a large budget rambles for minutes before the step ends. Configurable like the
+# chat caps (LOCAL_BRIEF_MAX_TOKENS / LOCAL_DETAILED_MAX_TOKENS).
+AGENT_LOCAL_NUM_PREDICT = int(os.getenv("AGENT_LOCAL_NUM_PREDICT", "2048"))
 # Max wait for the next chunk from a local agent step. The first one waits for a model load plus
 # evaluating the whole transcript on CPU, far longer than a chat prompt.
 AGENT_LOCAL_TIMEOUT_S = float(os.getenv("AGENT_LOCAL_TIMEOUT_S", "600"))
+# Hard cap on the tokens a run generates in total, across all steps: keeps a generic question or a
+# rambling model from running on for step after step (each step otherwise ends only through
+# finish, the step limit or a nudge, all of which let it talk on).
+AGENT_MAX_OUTPUT_TOKENS = int(os.getenv("AGENT_MAX_OUTPUT_TOKENS", "20000"))
 # Run agent commands without asking. Off by default: every command needs approval in the sidebar.
 AGENT_AUTO_APPROVE_COMMANDS = os.getenv("AGENT_AUTO_APPROVE_COMMANDS", "false").lower() in ("1", "true", "yes")

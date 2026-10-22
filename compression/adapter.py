@@ -79,6 +79,40 @@ def _query_from(prompt: str, code: str) -> str:
     return f"{prompt} {' '.join(terms)}".strip()
 
 
+def _keyword_fallback(query: str, repo_files, budget: int) -> Tuple[str, List[str]]:
+    """Naive lexical selection over the walked repo files.
+
+    Last-resort context when both the indexed and the in-memory engines fail: without it the
+    router would answer with zero repo context and the LLM would guess ("random" answers).
+    """
+    if not repo_files or budget <= 0:
+        return "", []
+    terms = [t.lower() for t in _IDENT.findall(query) if t.lower() not in _CODE_NOISE][:_MAX_CODE_TERMS]
+
+    def score(f) -> int:
+        text = f.text.lower()
+        path = f.rel_path.lower()
+        return sum(text.count(t) + 5 * path.count(t) for t in terms)
+
+    ranked = sorted(repo_files, key=score, reverse=True)
+    best = score(ranked[0]) if ranked else 0
+    if best == 0:
+        ranked = sorted(repo_files, key=lambda f: f.rel_path)  # vague prompt: any context beats none
+
+    parts: List[str] = []
+    selected: List[str] = []
+    used = 0
+    for f in ranked:
+        block = f"# File: {f.rel_path}\n{f.text}"
+        cost = count_tokens(block)
+        if used + cost > budget:
+            continue
+        used += cost
+        parts.append(block)
+        selected.append(f.rel_path)
+    return "\n\n".join(parts), selected
+
+
 def _truncate_to_budget(text: str, budget: int) -> str:
     """Trim from the end until count_tokens(text) <= budget (binary search)."""
     if budget <= 0:
@@ -160,8 +194,8 @@ def optimize_context(
                     repo_context = result.context_text
                     files_selected = list(result.selected_files)
                 except Exception:
-                    repo_context = ""
-                    files_selected = []
+                    log.exception("context engine failed; using the keyword fallback")
+                    repo_context, files_selected = _keyword_fallback(query, repo_files, repo_budget)
 
     # Selected editor code is always included, first.
     combined = code

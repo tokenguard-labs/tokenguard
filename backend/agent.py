@@ -651,6 +651,9 @@ class AgentRun:
                 if finished:
                     stopped = "finished"
                     break
+                if output_tokens >= config.AGENT_MAX_OUTPUT_TOKENS:
+                    summary, stopped = self._budget_note(model, output_tokens), "token_budget"
+                    break
                 if repeated >= MAX_REPEATED_FAILURES:
                     summary, stopped = self._gave_up(model), "gave_up"
                     break
@@ -686,6 +689,14 @@ class AgentRun:
                 + (f"; {staged} staged change(s) are listed below for review." if staged else
                    ", so nothing was changed.")
                 + " Small local models often can't complete multi-step edits; try qwen2.5-coder:7b or the global LLM.")
+
+    def _budget_note(self, model: str, tokens: int) -> str:
+        staged = len(self.ws.change_list())
+        return (f"The model ({model}) hit the generation limit ({tokens} tokens in total, "
+                f"AGENT_MAX_OUTPUT_TOKENS={config.AGENT_MAX_OUTPUT_TOKENS})"
+                + (f"; {staged} staged change(s) are listed below for review." if staged else
+                   ", so nothing was changed.")
+                + " Ask the agent to continue if the task is not done.")
 
     def _change_stats(self) -> List[Dict[str, Any]]:
         return [{k: c[k] for k in ("path", "status", "additions", "deletions")} for c in self.ws.change_list()]

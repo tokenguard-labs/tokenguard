@@ -205,9 +205,17 @@ export class LocalPilotViewProvider implements vscode.WebviewViewProvider, vscod
             case 'run':
                 await this._run(data.id, data.req, data.route);
                 break;
-            case 'cancel':
-                this._inFlight.get(data.id)?.abort();
+            case 'cancel': {
+                const controller = this._inFlight.get(data.id);
+                if (controller) {
+                    controller.abort();
+                } else {
+                    // Nothing in flight (e.g. the turn was already untracked): the page is still
+                    // holding it busy. Answer 'cancelled' so Stop never hangs on a no-op.
+                    this._post({ type: 'cancelled', id: data.id });
+                }
                 break;
+            }
             case 'agentRun':
                 await this._runAgent(data.id, String(data.prompt ?? ''), data.route === 'local' ? 'local' : 'cloud',
                     Array.isArray(data.history) ? data.history : []);
@@ -833,7 +841,7 @@ function buildRequest(prompt: string, editor: vscode.TextEditor | undefined): { 
     const folder = (editor && vscode.workspace.getWorkspaceFolder(editor.document.uri))
         || vscode.workspace.workspaceFolders?.[0];
     const repoPath = folder && folder.uri.scheme === 'file' ? folder.uri.fsPath : null;
-    if (folder && repoPath) {
+    if (repoPath && info.length === 0 && folder) {
         info.push(`workspace "${folder.name}"`);
     }
     return {

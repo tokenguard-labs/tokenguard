@@ -222,7 +222,8 @@ async def _ollama_step(messages, tools, progress: Optional[Progress] = None) -> 
     payload = {
         "model": model, "messages": to_ollama(messages), "tools": _openai_tools(tools), "stream": True,
         "keep_alive": config.LOCAL_KEEP_ALIVE,
-        "options": {"temperature": 0.2, "num_ctx": config.AGENT_LOCAL_NUM_CTX, "num_predict": 4096},
+        "options": {"temperature": 0.2, "num_ctx": config.AGENT_LOCAL_NUM_CTX,
+                    "num_predict": config.AGENT_LOCAL_NUM_PREDICT},
     }
     parts: List[str] = []
     raw_calls: List[Dict[str, Any]] = []
