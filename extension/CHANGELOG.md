@@ -3,6 +3,18 @@
 All notable changes to this extension are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-10-24
+
+### Added
+- One Local model menu: default, installed and downloadable models with disk size, RAM needed, and Load / Download / Delete.
+- Model loads time out (`tokenguard.localModelLoadTimeoutSeconds`, default 120 s) and fall back to the previously loaded model.
+- The Cloud model panel opens over the chat.
+- The sidebar refreshes every 15 s, so models pulled outside it show up.
+
+### Fixed
+- Windows: RAM and swap showed 0, which hid every recommended model.
+- Windows: models not listed when "localhost" resolved to IPv6 or a system proxy caught local calls.
+
 ## [0.1.1] - 2026-10-17
 
 beta-release of LocalPilot agent
