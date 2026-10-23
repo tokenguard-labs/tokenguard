@@ -146,12 +146,13 @@
 
     // ---- Local model picker ---------------------------------------------------------------
 
-    // Populate the local-model picker: installed models plus recommendations that fit
-    // this machine (pulled on demand). The empty value means "use LOCAL_MODEL from .env".
-    let installedModels = [];
-    let recommendedModels = [];
+    // The local-model picker: a select-like button whose list is the whole model manager —
+    // downloaded models (load into RAM / delete) and recommendations that fit this machine
+    // (download). The empty selection means "use LOCAL_MODEL from .env".
     let fitInfo = {};          // model name -> {fits, comfortable, size_gb, min_ram_gb} (RAM-fit info)
     let loadingModel = null;   // model currently being loaded into memory
+    let savedModel = '';       // the tokenguard.localModel setting ('' = backend default)
+    let loadError = null;      // { model, error, revertedTo } from the last failed / timed-out load
 
     // "45%" for a downloading model, or "" when Ollama hasn't reported progress yet.
     function pullTag(name) {
@@ -172,44 +173,35 @@
         const installed = available || [];
         const recs = recommended || [];
         const inFlight = pulling || [];
-        installedModels = installed;
-        recommendedModels = recs;
+        savedModel = saved || '';
+        const label = document.getElementById('localModelLabel');
         const state = document.getElementById('modelState');
         if (!installed.length && !recs.length) {
-            modelSelect.innerHTML = '<option value="">(no Ollama models found)</option>';
+            if (label) label.textContent = '(no Ollama models found)';
             modelSelect.disabled = true;
             if (state) state.textContent = '';
             return;
         }
         modelSelect.disabled = false;
-        const opts = ['<option value="">Default (' + esc(current || 'backend') + ')</option>'];
-        if (installed.length) {
-            opts.push('<optgroup label="Installed">');
-            installed.forEach(m => opts.push('<option value="' + esc(m) + '">' + esc(m) + fitTag(m) + '</option>'));
-            opts.push('</optgroup>');
+        if (loadingModel && loaded === loadingModel) {
+            loadingModel = null; // finished loading
         }
-        if (recs.length) {
-            opts.push('<optgroup label="Recommended — needs download">');
-            recs.forEach(m => {
-                const size = m.size_gb ? ' — ' + m.size_gb + ' GB' : '';
-                const warn = m.comfortable === false ? ' (may use swap)' : '';
-                const downloading = inFlight.includes(m.name) ? ' — downloading' + pullTag(m.name) + '…' : '';
-                opts.push('<option value="' + esc(m.name) + '">' + esc(m.name) + size + warn + downloading + '</option>');
-            });
-            opts.push('</optgroup>');
+        const active = installed.includes(savedModel) ? savedModel : '';
+        if (label) {
+            const name = active || 'Default (' + (current || 'backend') + ')';
+            const where = loadingModel ? 'loading…' : (loaded && loaded === (active || current) ? 'in RAM' : 'not loaded');
+            label.textContent = name + ' · ' + where + fitTag(active || current);
         }
-        modelSelect.innerHTML = opts.join('');
-        const known = installed.concat(recs.map(m => m.name));
-        modelSelect.value = known.includes(saved) ? saved : '';
         if (state) {
-            if (loadingModel && loaded === loadingModel) {
-                loadingModel = null; // finished loading
-            }
             let text;
             if (loadingModel) {
-                text = '<span class="spinner">loading ' + esc(loadingModel) + '…</span>';
+                text = '<span class="spinner">loading ' + esc(loadingModel) + ' into RAM…</span>';
             } else {
                 text = loaded ? 'loaded in memory: ' + esc(loaded) : 'no model loaded';
+            }
+            if (!loadingModel && loadError) {
+                text = '<span class="ramwarn">⚠ ' + esc(loadError.error) + ' — ' +
+                    (loadError.revertedTo ? 'went back to ' + esc(loadError.revertedTo) : 'no model loaded') + '</span>';
             }
             const lf = loaded && fitInfo[loaded];
             if (loadingModel === null && lf) {
@@ -358,31 +350,84 @@
             return;
         }
         if (!h.ollama) {
-            el.innerHTML = '<div class="muted">Ollama is not reachable.</div>';
+            el.innerHTML = '<div class="muted">Ollama is not reachable, so no models can be listed.</div>' +
+                '<div class="choices"><button class="secondary" data-model-action="start-ollama">Start / check Ollama</button></div>';
             return;
         }
         const sizes = h.local_sizes || {};
         const installed = h.local_models || [];
         const pulling = activeDownloads();
         const total = installed.reduce((sum, m) => sum + (sizes[m] || 0), 0);
-        const rows = ['<div class="model-group">Installed' + (installed.length ? ' · ' + fmtBytes(total) + ' on disk' : '') + '</div>'];
+        const rows = [];
+        const g = h.system;
+        if (g && g.total_ram_gb) {
+            const free = g.available_ram_gb != null ? g.available_ram_gb + ' GB free of ' : '';
+            rows.push('<div class="muted">RAM: ' + esc(free + g.total_ram_gb) + ' GB' +
+                (g.swap_total_gb ? ' · swap ' + esc(g.swap_total_gb) + ' GB' : '') +
+                (g.has_gpu ? ' · VRAM ' + esc(g.gpu_vram_gb) + ' GB' : '') + '</div>');
+        }
+        // How much memory a model wants, plus the fit warning when it is more than this machine holds well.
+        const ramNote = f => !f || !f.min_ram_gb ? '' : ' · needs ~' + esc(f.min_ram_gb) + ' GB RAM' +
+            (f.fits === false ? ' <span class="ramwarn">⚠ too big</span>'
+                : f.comfortable === false ? ' <span class="ramwarn">may use swap</span>' : '');
+        const anyLoading = !!loadingModel;
+        const recs = (h.local_recommended || []);
+
+        // Default: follow the backend's LOCAL_MODEL instead of a model picked here.
+        const def = h.local_default || (!savedModel && h.local_model) || '';
+        if (def) {
+            const defInstalled = installed.includes(def);
+            const defRec = recs.find(m => m.name === def);
+            const active = !savedModel;
+            let action;
+            if (!defInstalled) {
+                action = defRec && !pulling.includes(def)
+                    ? '<button class="secondary" data-model-action="download" data-model="' + esc(def) + '">Download</button>'
+                    : (pulling.includes(def) ? '<button class="secondary" disabled>' + (pullTag(def).trim() || '…') + '</button>' : '');
+            } else if (active && def === h.local_loaded) {
+                action = '<button class="secondary" disabled>Active</button>';
+            } else {
+                action = '<button data-model-action="load" data-model=""' + (anyLoading ? ' disabled' : '') + '>' +
+                    (active ? (loadingModel === def ? 'Loading…' : 'Load') : 'Use') + '</button>';
+            }
+            const meta = defInstalled
+                ? esc(fmtBytes(sizes[def])) + ' on disk' + ramNote(fitInfo[def])
+                : 'not downloaded' + (defRec ? ' · ~' + esc(defRec.size_gb) + ' GB' + ramNote(defRec) : '');
+            rows.push('<div class="model-group">Default</div>');
+            rows.push('<div class="model-item' + (active ? ' selected' : '') + '"><span class="info">' +
+                '<span class="name" title="The backend\'s LOCAL_MODEL setting"><code>' + esc(def) + '</code>' +
+                (active && def === h.local_loaded ? '<span class="tag">in RAM</span>' : '') + '</span>' +
+                '<span class="meta">' + meta + '</span></span><span class="actions">' + action + '</span></div>');
+        }
+
+        rows.push('<div class="model-group">Installed' + (installed.length ? ' · ' + fmtBytes(total) + ' on disk' : '') + '</div>');
         if (!installed.length) rows.push('<div class="muted">No models downloaded yet.</div>');
         installed.forEach(m => {
-            const tag = m === h.local_loaded ? ' <span class="muted">(loaded)</span>' : '';
-            rows.push('<div class="model-item"><span class="name" title="' + esc(m) + '"><code>' + esc(m) + '</code>' + tag + '</span>' +
-                '<span class="size">' + esc(fmtBytes(sizes[m])) + '</span>' +
+            const inRam = m === h.local_loaded;
+            const selected = m === savedModel;
+            const tags = (inRam ? '<span class="tag">in RAM</span>' : '') + (m === loadingModel ? '<span class="tag">loading…</span>' : '');
+            const load = inRam
+                ? '<button class="secondary" disabled>Loaded</button>'
+                : '<button data-model-action="load" data-model="' + esc(m) + '"' + (anyLoading ? ' disabled' : '') + '>' +
+                  (m === loadingModel ? 'Loading…' : 'Load') + '</button>';
+            rows.push('<div class="model-item' + (selected ? ' selected' : '') + '"><span class="info">' +
+                '<span class="name" title="' + esc(m) + '"><code>' + esc(m) + '</code>' + tags + '</span>' +
+                '<span class="meta">' + esc(fmtBytes(sizes[m])) + ' on disk' + ramNote(fitInfo[m]) + '</span></span>' +
+                '<span class="actions">' + load +
                 '<button class="secondary danger" title="Delete from disk" data-model-action="delete" data-model="' + esc(m) +
-                '" data-size="' + (sizes[m] || 0) + '">Delete</button></div>');
+                '" data-size="' + (sizes[m] || 0) + '"' + (m === loadingModel ? ' disabled' : '') + '>🗑</button></span></div>');
         });
-        const recs = (h.local_recommended || []);
-        if (recs.length) {
+        const downloadable = recs.filter(m => m.name !== def);
+        if (downloadable.length) {
             rows.push('<div class="model-group">Available to download</div>');
-            recs.forEach(m => {
+            downloadable.forEach(m => {
                 const busy = pulling.includes(m.name);
-                rows.push('<div class="model-item"><span class="name" title="' + esc(m.description || m.name) + '"><code>' + esc(m.name) + '</code></span>' +
-                    '<span class="size">~' + esc(m.size_gb) + ' GB</span>' +
-                    '<button class="secondary" data-model-action="download" data-model="' + esc(m.name) + '"' +
-                    (busy ? ' disabled>Downloading…' : '>Download') + '</button></div>');
+                rows.push('<div class="model-item"><span class="info">' +
+                    '<span class="name" title="' + esc(m.description || m.name) + '"><code>' + esc(m.name) + '</code>' +
+                    (m.params && m.params !== '?' ? ' <span class="muted">' + esc(m.params) + '</span>' : '') + '</span>' +
+                    '<span class="meta">~' + esc(m.size_gb) + ' GB download' + ramNote(m) + '</span></span>' +
+                    '<span class="actions"><button class="secondary" data-model-action="download" data-model="' + esc(m.name) + '"' +
+                    (busy ? ' disabled>' + (pullTag(m.name).trim() || '…') : '>Download') + '</button></span></div>');
             });
         }
         el.innerHTML = rows.join('');
@@ -419,6 +464,20 @@
                 try { vscode.setState({ ...(vscode.getState() || {}), setupDismissed: true }); } catch { /* ignore */ }
                 renderSetup();
                 break;
+            case 'load': {
+                // Make it the active local model and load it into RAM; the extension puts the previous
+                // one back if this load fails or times out.
+                // model '' = follow the backend default; it still gets loaded (as defaultModel).
+                const defaultModel = model ? '' : ((lastHealth && lastHealth.local_default) || '');
+                loadError = null;
+                loadingModel = model || defaultModel || null;
+                const state = document.getElementById('modelState');
+                if (state) state.innerHTML = '<span class="spinner">switching…</span>';
+                modelSelect.disabled = true;
+                renderModelsList();
+                vscode.postMessage({ type: 'selectLocalModel', model, installed: true, defaultModel });
+                break;
+            }
             case 'download':
                 pullProgress[model] = optimisticPull();
                 renderDownloads();
@@ -1164,21 +1223,6 @@
         .map(p => '<button class="example" data-example="' + esc(p) + '">' + esc(p) + '</button>').join('');
 
     sendBtn.addEventListener('click', () => (busy ? stop() : send()));
-    modelSelect.addEventListener('change', () => {
-        const value = modelSelect.value;
-        const rec = recommendedModels.find(m => m.name === value);
-        const installed = installedModels.includes(value);
-        const state = document.getElementById('modelState');
-        loadingModel = installed && value ? value : null;
-        if (state) state.textContent = installed || !value ? 'switching…' : 'checking download…';
-        modelSelect.disabled = true;
-        vscode.postMessage({
-            type: 'selectLocalModel',
-            model: value,
-            installed,
-            size_gb: rec ? rec.size_gb : null
-        });
-    });
     document.addEventListener('change', e => {
         if (e.target.id !== 'setupModel') return;
         const rec = (lastHealth && lastHealth.local_recommended || []).find(m => m.name === e.target.value);
@@ -1205,27 +1249,37 @@
     cloudKeyInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); document.getElementById('saveCloudKey').click(); }
     });
-    // Model manager popover: position it under its summary, and close it on Escape / outside click.
-    const modelsSection = document.getElementById('modelsSection');
+    // Local-model picker: the button opens its list as a popover under it; Escape / outside click closes it.
+    const localPicker = document.getElementById('localPicker');
     const modelsList = document.getElementById('modelsList');
+    function setPickerOpen(open) {
+        modelsList.hidden = !open;
+        modelSelect.setAttribute('aria-expanded', String(open));
+        if (open) {
+            renderModelsList();
+            placeModelsList();
+            vscode.postMessage({ type: 'refreshStatus' }); // pick up models pulled elsewhere
+        }
+    }
     function placeModelsList() {
-        if (!modelsSection.open) return;
-        const box = modelsSection.getBoundingClientRect();
-        const top = modelsSection.querySelector('summary').getBoundingClientRect().bottom + 4;
+        if (modelsList.hidden) return;
+        const box = modelSelect.getBoundingClientRect();
+        const top = box.bottom + 4;
+        const left = Math.max(8, Math.min(box.left, window.innerWidth - 268));
         modelsList.style.top = top + 'px';
-        modelsList.style.left = box.left + 'px';
-        modelsList.style.width = box.width + 'px';
+        modelsList.style.left = left + 'px';
+        modelsList.style.width = Math.min(window.innerWidth - left - 8, Math.max(box.width, 260)) + 'px';
         modelsList.style.maxHeight = Math.max(120, window.innerHeight - top - 8) + 'px';
     }
-    modelsSection.addEventListener('toggle', placeModelsList);
+    modelSelect.addEventListener('click', () => setPickerOpen(modelsList.hidden));
     window.addEventListener('resize', placeModelsList);
     document.querySelector('.top').addEventListener('scroll', placeModelsList);
     new ResizeObserver(placeModelsList).observe(document.querySelector('.top'));
     document.addEventListener('mousedown', e => {
-        if (modelsSection.open && !modelsSection.contains(e.target)) modelsSection.open = false;
+        if (!modelsList.hidden && !localPicker.contains(e.target)) setPickerOpen(false);
     });
     document.addEventListener('keydown', e => {
-        if (e.key === 'Escape' && modelsSection.open) { modelsSection.open = false; e.stopPropagation(); }
+        if (e.key === 'Escape' && !modelsList.hidden) { setPickerOpen(false); e.stopPropagation(); }
     }, true);
 
     document.addEventListener('keydown', e => {
@@ -1308,10 +1362,17 @@
                 loadingModel = m.model || null;
                 const state = document.getElementById('modelState');
                 if (state && m.model) {
-                    state.innerHTML = '<span class="spinner">loading ' + esc(m.model) + '…</span>';
+                    state.innerHTML = '<span class="spinner">loading ' + esc(m.model) + ' into RAM…</span>';
                 }
+                renderModelsList();
                 break;
             }
+            case 'modelLoadFailed':
+                // The load failed or timed out; the extension already put the previous model back.
+                loadingModel = null;
+                loadError = { model: m.model, error: m.error || 'load failed', revertedTo: m.revertedTo || null };
+                renderModelsList();
+                break;
             case 'ollama':
                 ollamaState = { state: m.state, error: m.error };
                 renderOllama();

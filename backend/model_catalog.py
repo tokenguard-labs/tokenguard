@@ -45,6 +45,11 @@ def _annotate(item: Dict, resources: Dict) -> None:
     budget = max(vram, total_ram + swap)
     fast_budget = max(vram, total_ram)
     need = float(item["min_ram_gb"])
+    if total_ram <= 0 and vram <= 0:
+        # Memory detection failed: offer the model rather than hiding the whole catalog.
+        item["fits"], item["comfortable"] = True, True
+        item["note"] = "couldn't detect this machine's RAM — check it has ~" + str(item["min_ram_gb"]) + "GB"
+        return
     item["fits"] = need <= budget
     item["comfortable"] = need <= fast_budget
     if not item["fits"]:

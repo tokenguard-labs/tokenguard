@@ -299,7 +299,8 @@ function apiUrl() {
 }
 function ollamaUrl() {
     const url = vscode.workspace.getConfiguration('tokenguard').get('ollamaUrl') || 'http://localhost:11434';
-    return url.replace(/\/+$/, '');
+    // Ollama listens on 127.0.0.1; "localhost" may resolve to ::1 first (notably on Windows).
+    return url.replace(/\/+$/, '').replace(/^(https?:\/\/)localhost(?=[:/]|$)/, '$1127.0.0.1');
 }
 function cloudProvider() {
     return vscode.workspace.getConfiguration('tokenguard').get('cloudProvider') || 'deepseek';
@@ -348,18 +349,28 @@ async function llmHeaders() {
     }
     return headers;
 }
-/** Ask the backend to unload the previous local model and load the selected one (one at a time). */
-async function switchLocalModel(model) {
+/** Ask the backend to unload the previous local model and load the selected one (one at a time).
+ *  A load past `tokenguard.localModelLoadTimeoutSeconds` is abandoned and the previous model (or
+ *  `fallback`) is reloaded; the result then carries `error`. undefined = backend unreachable. */
+async function switchLocalModel(model, fallback) {
+    const timeoutS = Math.max(10, vscode.workspace.getConfiguration('tokenguard')
+        .get('localModelLoadTimeoutSeconds', 120));
     try {
-        await fetch(`${apiUrl()}/local-model`, {
+        const resp = await fetch(`${apiUrl()}/local-model`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json', 'X-Token-Guard-Session': backend?.sessionToken ?? '' },
-            body: JSON.stringify({ model: model || null, preload: true }),
-            signal: AbortSignal.timeout(60_000)
+            body: JSON.stringify({ model: model || null, preload: true, timeout_s: timeoutS, fallback: fallback || null }),
+            // Room for the timed-out load plus reloading the previous model.
+            signal: AbortSignal.timeout((2 * timeoutS + 30) * 1000)
         });
+        if (!resp.ok) {
+            return { loaded: null, error: `backend answered ${resp.status}: ${(await resp.text()).slice(0, 200)}` };
+        }
+        return await resp.json();
     }
     catch {
         // Best effort: the backend re-enforces one-model-at-a-time on the next local prompt.
+        return undefined;
     }
 }
 async function fetchModels() {

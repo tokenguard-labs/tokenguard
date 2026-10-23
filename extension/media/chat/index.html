@@ -44,15 +44,18 @@
             </details>
             <div class="model-row">
                 <label for="localModel">Local model</label>
-                <select id="localModel" title="Ollama model used for local inference"></select>
+                <!-- One picker for choosing, downloading, loading and deleting local models. -->
+                <div id="localPicker" class="picker">
+                    <button id="localModel" class="picker-btn" aria-haspopup="listbox" aria-expanded="false"
+                            title="Ollama model used for local inference">
+                        <span id="localModelLabel" class="picker-label">…</span><span class="caret">▾</span>
+                    </button>
+                    <div id="modelsList" class="picker-list" role="listbox" hidden></div>
+                </div>
             </div>
             <div id="modelState" class="muted"></div>
             <div id="setupCard" class="setup-card" hidden></div>
             <div id="downloads" class="downloads"></div>
-            <details id="modelsSection" class="section">
-                <summary>Manage local models</summary>
-                <div id="modelsList" class="section-body"></div>
-            </details>
             <div id="systemInfo" class="muted"></div>
         </header>
         <div id="topResizer" class="resizer" role="separator" aria-orientation="horizontal"

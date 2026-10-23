@@ -206,6 +206,7 @@ async def _local_model_info() -> Dict[str, Any]:
     return {
         "ollama": reachable,
         "local_model": llm.effective_local_model(),
+        "local_default": config.LOCAL_MODEL,  # what an empty editor selection falls back to
         "local_loaded": llm.loaded_local_model(),
         "installed": installed,
         "installed_sizes": {m["name"]: m["size"] for m in installed_list},
@@ -307,20 +308,24 @@ async def delete_model(name: str):
 class LocalModelRequest(BaseModel):
     model: Optional[str] = None  # None / "" unloads everything
     preload: bool = True
+    timeout_s: Optional[float] = None  # load timeout; None = LOCAL_LOAD_TIMEOUT_S
+    fallback: Optional[str] = None     # model to reload if the load fails and none was loaded
 
 
 @app.put("/local-model")
 async def select_local_model(req: LocalModelRequest):
     """Switch the active local Ollama model, keeping only one loaded in memory.
 
-    Unloads the previously loaded model first, then optionally preloads the new one.
+    Unloads the previously loaded model first, then optionally preloads the new one. A load that
+    fails or times out puts the previous model back and reports `error` (still a 200).
     """
     model = (req.model or "").strip() or None
     if model:
         available = await llm.list_local_models()
         if available and model not in available:
             raise HTTPException(400, f"model {model!r} is not available in Ollama")
-    return await llm.switch_local_model(model, preload=req.preload)
+    return await llm.switch_local_model(model, preload=req.preload, timeout_s=req.timeout_s,
+                                        fallback=req.fallback)
 
 
 # In-memory history for the dashboard (resets on restart; fine for a demo)
@@ -546,6 +551,7 @@ async def health(force: bool = False):
         "status": "ok",
         "ollama": local["ollama"],
         "local_model": local["local_model"],
+        "local_default": local["local_default"],
         "local_loaded": local["local_loaded"],
         "local_models": local["installed"],
         "fit": local["fit"],

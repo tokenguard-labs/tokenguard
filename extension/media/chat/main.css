@@ -374,14 +374,35 @@ button.icon-btn.reject { color: var(--vscode-gitDecoration-deletedResourceForegr
 @keyframes progress-slide { from { margin-left: -30%; } to { margin-left: 100%; } }
 .download.failed .download-head { color: var(--vscode-errorForeground); }
 .model-group { font-size: 11px; opacity: 0.75; text-transform: uppercase; letter-spacing: 0.04em; }
-.model-item { display: flex; align-items: center; gap: 6px; font-size: 12px; }
-.model-item .name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.model-item .size { opacity: 0.75; font-size: 11px; white-space: nowrap; }
+.model-group:not(:first-child) { margin-top: 4px; }
+.model-item { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 3px 4px; border-radius: 3px; }
+.model-item.selected { background: var(--vscode-list-inactiveSelectionBackground); }
+.model-item .info { flex: 1 1 auto; min-width: 0; }
+.model-item .name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-item .meta { display: block; opacity: 0.75; font-size: 11px; }
+.model-item .actions { flex: none; display: flex; gap: 4px; }
 .model-item button.danger:hover { background: var(--vscode-inputValidation-errorBackground, #5a1d1d); }
-/* "Manage local models" opens as a popover over the chat instead of inside the (scrolling,
-   clipped) header; main.js sets its top/left/width/max-height from the summary's position. */
-#modelsSection[open] > #modelsList {
-    position: fixed; z-index: 100; margin-top: 0; gap: 8px;
+.model-item .tag { font-size: 10px; padding: 0 4px; border-radius: 3px; margin-left: 4px;
+    background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+/* The local-model picker: a select-like button whose list holds the whole model manager. */
+.picker { flex: 1; min-width: 0; }
+.picker-btn {
+    display: flex; align-items: center; gap: 6px; width: 100%; text-align: left;
+    padding: 4px 6px; font-weight: normal; font-size: 11px;
+    background: var(--vscode-dropdown-background);
+    color: var(--vscode-dropdown-foreground);
+    border: 1px solid var(--vscode-dropdown-border);
+}
+.picker-btn:hover { background: var(--vscode-dropdown-background); }
+.picker-btn:disabled { opacity: 0.6; }
+.picker-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.caret { flex: none; opacity: 0.7; }
+.picker-list[hidden] { display: none; }
+/* The list opens as a popover over the chat instead of inside the (scrolling, clipped) header;
+   main.js sets its top/left/width/max-height from the picker button's position. */
+.picker-list {
+    display: flex; flex-direction: column;
+    position: fixed; z-index: 100; margin-top: 0; gap: 6px;
     padding: 8px 10px; overflow-y: auto; box-sizing: border-box;
     border: 1px solid var(--vscode-editorWidget-border, var(--vscode-widget-border));
     border-radius: 4px;

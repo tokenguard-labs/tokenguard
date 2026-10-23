@@ -30,6 +30,42 @@ def _linux_meminfo() -> dict:
     return info
 
 
+def _windows_meminfo() -> dict:
+    """RAM and page-file sizes in KiB via GlobalMemoryStatusEx (Windows has no /proc or sysconf)."""
+    import ctypes
+
+    class MEMORYSTATUSEX(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    try:
+        stat = MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return {}
+    except (AttributeError, OSError) as e:
+        log.debug("GlobalMemoryStatusEx failed: %s", e)
+        return {}
+    # The "page file" figures are the commit limit (RAM + page file), so swap is the difference.
+    swap_total = max(0, stat.ullTotalPageFile - stat.ullTotalPhys)
+    swap_free = max(0, min(swap_total, stat.ullAvailPageFile - stat.ullAvailPhys))
+    return {
+        "MemTotal": stat.ullTotalPhys // 1024,
+        "MemAvailable": stat.ullAvailPhys // 1024,
+        "SwapTotal": swap_total // 1024,
+        "SwapFree": swap_free // 1024,
+    }
+
+
 def _gpu_vram_gb() -> float:
     """Total VRAM in GB for an NVIDIA GPU, if nvidia-smi is available. 0.0 otherwise."""
     if not shutil.which("nvidia-smi"):
@@ -55,8 +91,12 @@ def system_resources(force: bool = False) -> dict:
         return _cache[1]
 
     total_kib = available_kib = swap_kib = swap_free_kib = None
+    mi = {}
     if os.path.exists("/proc/meminfo"):
         mi = _linux_meminfo()
+    elif os.name == "nt":
+        mi = _windows_meminfo()
+    if mi:
         total_kib = mi.get("MemTotal")
         available_kib = mi.get("MemAvailable") or mi.get("MemFree")
         swap_kib = mi.get("SwapTotal")

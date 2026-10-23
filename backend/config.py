@@ -1,6 +1,7 @@
 """Central settings. Override any of these with environment variables (or a .env file)."""
 import json
 import os
+import re
 from pathlib import Path
 
 
@@ -8,7 +9,7 @@ def _load_dotenv() -> None:
     env_path = Path(__file__).resolve().parent / ".env"
     if not env_path.exists():
         return
-    for line in env_path.read_text().splitlines():
+    for line in env_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -19,13 +20,26 @@ def _load_dotenv() -> None:
 _load_dotenv()
 
 # Local LLM (Ollama)
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+# Ollama listens on 127.0.0.1 only. On Windows "localhost" can resolve to ::1 first and each refused
+# attempt costs seconds, so the 3s model listing timed out and the sidebar showed no models.
+OLLAMA_URL = re.sub(r"^(https?://)localhost(?=[:/]|$)", r"\g<1>127.0.0.1", OLLAMA_URL)
+# httpx honours the system proxy (on Windows: the registry settings, without their "bypass local
+# addresses" list), which would send Ollama and loopback calls to the proxy. Always go direct.
+_no_proxy = [h for h in (os.getenv("NO_PROXY") or os.getenv("no_proxy") or "").split(",") if h.strip()]
+for _host in ("localhost", "127.0.0.1", "::1"):
+    if _host not in _no_proxy:
+        _no_proxy.append(_host)
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = ",".join(_no_proxy)
 LOCAL_MODEL = os.getenv("LOCAL_MODEL", "qwen2.5-coder:0.5b")
 LOCAL_TIMEOUT_S = float(os.getenv("LOCAL_TIMEOUT_S", "120"))
 LOCAL_NUM_CTX = int(os.getenv("LOCAL_NUM_CTX", "8192"))  # Ollama's default window silently truncates
 # How long to keep the active local model resident between prompts. Only one is kept loaded at a
 # time regardless: switching models unloads the previous one first.
 LOCAL_KEEP_ALIVE = os.getenv("LOCAL_KEEP_ALIVE", "30m")
+# Max wait for a model switch to load the new model into memory. Past it the load is abandoned
+# and the previously loaded model is put back (the sidebar can override this per request).
+LOCAL_LOAD_TIMEOUT_S = float(os.getenv("LOCAL_LOAD_TIMEOUT_S", "120"))
 # Answer length for the local model. The word budget is told to the model (so it plans an answer
 # that fits); the token cap is a hard stop (num_predict) with headroom, only hit when it ignores
 # the budget. "brief" is the default; "detailed" is what the "More detail" button asks for.

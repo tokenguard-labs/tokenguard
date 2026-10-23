@@ -239,6 +239,12 @@
           "default": true,
           "description": "Load the selected local model when the chat opens so the first local prompt is warm (it stays loaded until exit)."
         },
+        "tokenguard.localModelLoadTimeoutSeconds": {
+          "type": "number",
+          "default": 120,
+          "minimum": 10,
+          "description": "Max seconds to wait for a local model to load into memory. A slower load is abandoned and the previously loaded model is put back."
+        },
         "tokenguard.autoStartOllama": {
           "type": "boolean",
           "default": true,

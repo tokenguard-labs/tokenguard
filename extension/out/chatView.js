@@ -45,6 +45,9 @@ const AGENT_DIFF_SCHEME = 'tokenguard-agent';
 const ANALYZE_TIMEOUT_MS = 60_000;
 // Idle, not total: the backend streams tokens and sends a heartbeat every 15s while a model loads.
 const STREAM_IDLE_TIMEOUT_MS = 60_000;
+// Refresh the status / model list this often while the sidebar is visible, so models pulled
+// outside the sidebar (ollama pull in a terminal) or a late Ollama start show up without a reopen.
+const STATUS_POLL_MS = 15_000;
 // Code-fence names (as highlight.js reports them) that differ from VS Code language ids.
 const LANGUAGE_ALIASES = {
     js: 'javascript', jsx: 'javascriptreact', ts: 'typescript', tsx: 'typescriptreact',
@@ -61,6 +64,7 @@ class LocalPilotViewProvider {
     _retryDelayMs = 1_000;
     _preloadedFor; // model we've already asked the backend to load
     _preloadSuppressed = false; // user explicitly unloaded: don't auto-reload until they pick again
+    _switching = false; // a user-picked model is loading: no auto-preload meanwhile
     _cloudSig = ''; // provider|baseUrl signature last fetched for /cloud/models
     _inFlight = new Map(); // turn id -> request (for Stop)
     // turn id -> the agent's proposed changes, kept here (not in the page) until accepted/rejected
@@ -94,7 +98,21 @@ class LocalPilotViewProvider {
                 void this._onMessage(data);
             }
         });
-        webviewView.onDidDispose(() => this._detach(webviewView.webview));
+        const poll = setInterval(() => {
+            // Skip while hidden, after a move to another view, or while the retry loop is polling.
+            if (webviewView.visible && this._webview === webviewView.webview && !this._retryTimer) {
+                void this._postStatus();
+            }
+        }, STATUS_POLL_MS);
+        webviewView.onDidChangeVisibility(() => {
+            if (webviewView.visible && this._webview === webviewView.webview) {
+                void this._postStatus();
+            }
+        });
+        webviewView.onDidDispose(() => {
+            clearInterval(poll);
+            this._detach(webviewView.webview);
+        });
         this._attach(webviewView.webview);
     }
     /** Load the chat into `webview`; a previous view (e.g. before a move) stops being served. */
@@ -223,12 +241,30 @@ class LocalPilotViewProvider {
                     await this._postStatus(); // declined: reset the dropdown to the saved value
                     break;
                 }
-                await vscode.workspace.getConfiguration('tokenguard')
-                    .update('localModel', model, vscode.ConfigurationTarget.Global);
+                const previous = this._host.localModel();
+                // Choosing "Default" (model '') still loads the backend's default model.
+                const toLoad = model || String(data.defaultModel || '');
                 this._preloadSuppressed = false;
-                this._preloadedFor = model || undefined;
-                // Unload the old local model and warm up the new one so only one is resident.
-                await this._host.switchLocalModel(model);
+                this._preloadedFor = toLoad || undefined;
+                this._post({ type: 'modelLoading', model: toLoad || null });
+                // Unload the old local model and warm up the new one so only one is resident. The
+                // setting only changes once the load worked: a timed-out load keeps the old one.
+                this._switching = true;
+                let result;
+                try {
+                    result = await this._host.switchLocalModel(toLoad, previous);
+                }
+                finally {
+                    this._switching = false;
+                }
+                if (result?.error) {
+                    this._preloadedFor = result.reverted_to ?? (previous || undefined);
+                    this._reportLoadFailure(toLoad, result);
+                }
+                else {
+                    await vscode.workspace.getConfiguration('tokenguard')
+                        .update('localModel', model, vscode.ConfigurationTarget.Global);
+                }
                 this._post({ type: 'modelLoading', model: null });
                 await this._postStatus();
                 break;
@@ -390,7 +426,8 @@ class LocalPilotViewProvider {
     }
     /** Load the selected local model once the backend + Ollama are up, so it isn't shown idle. */
     async _maybePreload(health) {
-        if (this._preloadSuppressed || !vscode.workspace.getConfiguration('tokenguard').get('preloadLocalModel', true)) {
+        if (this._switching || this._preloadSuppressed
+            || !vscode.workspace.getConfiguration('tokenguard').get('preloadLocalModel', true)) {
             return;
         }
         if (!health?.ollama) {
@@ -406,9 +443,18 @@ class LocalPilotViewProvider {
         }
         this._preloadedFor = selected;
         this._post({ type: 'modelLoading', model: selected }); // "loading…" while Ollama loads it
-        await this._host.switchLocalModel(selected);
+        const result = await this._host.switchLocalModel(selected);
+        if (result?.error) {
+            this._reportLoadFailure(selected, result); // _preloadedFor stays: no retry loop
+        }
         this._post({ type: 'modelLoading', model: null }); // clear the spinner either way
         void this._postStatus(); // reflect "loaded in memory" in the sidebar
+    }
+    /** A model load failed or timed out: tell the sidebar and the user which model is in RAM now. */
+    _reportLoadFailure(model, result) {
+        const now = result.reverted_to ? `went back to "${result.reverted_to}"` : 'no local model is loaded now';
+        this._post({ type: 'modelLoadFailed', model, error: result.error, revertedTo: result.reverted_to ?? null });
+        void vscode.window.showWarningMessage(`TokenGuard: ${result.error} — ${now}.`);
     }
     /** RAM check for a local model: resolve true when loading may proceed (after any warning). */
     async _warnOnFit(model) {

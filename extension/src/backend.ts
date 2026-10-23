@@ -230,12 +230,20 @@ export class BackendManager implements vscode.Disposable {
         this._setProgress(40, 'Launching the server');
         this._stderrTail = [];
 
+        // The backend must talk to the same Ollama as the sidebar: pass an explicitly set
+        // tokenguard.ollamaUrl along (otherwise OLLAMA_URL from backend/.env or its default applies).
+        const ollamaSetting = vscode.workspace.getConfiguration('tokenguard').inspect<string>('ollamaUrl');
+        const ollamaUrl = (ollamaSetting?.workspaceFolderValue ?? ollamaSetting?.workspaceValue
+            ?? ollamaSetting?.globalValue ?? '').trim();
         const proc = spawn(python, args, {
             cwd: root,
             env: {
                 ...process.env,
                 PYTHONUNBUFFERED: '1',
-                TOKENGUARD_SESSION_TOKEN: this._sessionToken
+                // Windows otherwise decodes the backend's output with the ANSI code page.
+                PYTHONIOENCODING: 'utf-8',
+                TOKENGUARD_SESSION_TOKEN: this._sessionToken,
+                ...(ollamaUrl ? { OLLAMA_URL: ollamaUrl } : {})
             }
         });
         this._proc = proc;

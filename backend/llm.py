@@ -296,14 +296,24 @@ def _same_model(a: Optional[str], b: Optional[str]) -> bool:
     return bool(a) and a == b
 
 
-async def switch_local_model(model: Optional[str], preload: bool = True) -> dict:
+async def _preload_within(model: str, timeout_s: float) -> None:
+    """_ollama_preload, abandoned after `timeout_s` (raises asyncio.TimeoutError)."""
+    await asyncio.wait_for(_ollama_preload(model), timeout=timeout_s)
+
+
+async def switch_local_model(model: Optional[str], preload: bool = True, timeout_s: Optional[float] = None,
+                             fallback: Optional[str] = None) -> dict:
     """Make `model` the only local model loaded in Ollama; None/empty unloads everything.
 
     Unloads the previously loaded model first, then (optionally) preloads the new one so the
-    next prompt is warm. Returns the resulting loaded model and the one it replaced.
+    next prompt is warm. If that load fails or takes longer than `timeout_s`, the half-loaded
+    model is evicted and the previous one (or `fallback`, when nothing was loaded) is loaded
+    again. Returns the resulting loaded model, the one it replaced and, on failure, `error`,
+    `timed_out` and `reverted_to`.
     """
     global _loaded_local_model
     model = (model or "").strip() or None
+    timeout_s = timeout_s if timeout_s and timeout_s > 0 else config.LOCAL_LOAD_TIMEOUT_S
     async with _local_lock:
         previous = _loaded_local_model
         if previous and not _same_model(previous, model):
@@ -312,10 +322,23 @@ async def switch_local_model(model: Optional[str], preload: bool = True) -> dict
         if model and preload:
             if not _same_model(previous, model):
                 try:
-                    await _ollama_preload(model)
+                    await _preload_within(model, timeout_s)
                 except Exception as e:
-                    log.warning("could not preload local model %s: %s", model, e)
-                    return {"loaded": None, "previous": previous}
+                    timed_out = isinstance(e, asyncio.TimeoutError)
+                    error = (f"loading {model} took longer than {timeout_s:g}s" if timed_out
+                             else f"could not load {model}: {e}")
+                    log.warning("local model switch failed: %s", error)
+                    await _ollama_unload(model)  # drop whatever part of it made it into memory
+                    restore = previous or ((fallback or "").strip() or None)
+                    reverted_to = None
+                    if restore and not _same_model(restore, model):
+                        try:
+                            await _preload_within(restore, timeout_s)
+                            _loaded_local_model = reverted_to = restore
+                        except Exception as e2:
+                            log.warning("could not reload previous local model %s: %s", restore, e2)
+                    return {"loaded": _loaded_local_model, "previous": previous, "error": error,
+                            "timed_out": timed_out, "reverted_to": reverted_to}
             _loaded_local_model = model
         # preload=False: nothing loaded now; call_local loads it (unloading others) on demand.
         return {"loaded": _loaded_local_model, "previous": previous}

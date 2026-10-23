@@ -6,6 +6,11 @@ PY        := $(VENV)/bin/python
 PORT      ?= 8000
 # Folder opened in the Extension Development Host (the project you want to ask questions about)
 WORKSPACE ?= $(CURDIR)
+# Published IDs of this extension. An installed copy whose ID differs from the one under development
+# would run beside it in the dev window (a second sidebar on the same command IDs), so it is disabled there.
+PUBLISHED_IDS := tokenguard-labs.tokenguard tokenguard-labs.tokenguard-localpilot
+DEV_ID        := $(shell sed -n 's/^  "publisher": "\(.*\)",$$/\1/p' extension/package.json).$(shell sed -n 's/^  "name": "\(.*\)",$$/\1/p' extension/package.json)
+DISABLE_FLAGS := $(foreach id,$(filter-out $(DEV_ID),$(PUBLISHED_IDS)),--disable-extension $(id))
 
 .PHONY: dev setup backend stop test clean help
 
@@ -22,7 +27,7 @@ setup:
 
 dev: setup
 	@command -v code >/dev/null || { echo "VS Code 'code' CLI not found on PATH"; exit 1; }
-	code --new-window --extensionDevelopmentPath="$(CURDIR)/extension" "$(WORKSPACE)"
+	code --new-window $(DISABLE_FLAGS) --extensionDevelopmentPath="$(CURDIR)/extension" "$(WORKSPACE)"
 	@echo "VS Code is opening. The LocalPilot backend starts with the extension (Output > LocalPilot Backend)."
 
 backend: setup
