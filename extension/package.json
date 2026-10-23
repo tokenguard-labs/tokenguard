@@ -6,7 +6,6 @@
   "publisher": "tokenguard-labs",
   "license": "MIT",
   "icon": "media/icon.png",
-  "preview": true,
   "repository": {
     "type": "git",
     "url": "https://github.com/tokenguard-labs/tokenguard.git"
