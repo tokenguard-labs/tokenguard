@@ -1249,37 +1249,59 @@
     cloudKeyInput.addEventListener('keydown', e => {
         if (e.key === 'Enter') { e.preventDefault(); document.getElementById('saveCloudKey').click(); }
     });
-    // Local-model picker: the button opens its list as a popover under it; Escape / outside click closes it.
+    // Popovers: the local-model list and the cloud settings float over the chat under their
+    // anchor instead of growing the (scrolling, clipped) header. Escape / outside click closes them.
+    function placePopover(anchor, panel) {
+        const box = anchor.getBoundingClientRect();
+        const top = box.bottom + 4;
+        const left = Math.max(8, Math.min(box.left, window.innerWidth - 268));
+        panel.style.top = top + 'px';
+        panel.style.left = left + 'px';
+        panel.style.width = Math.min(window.innerWidth - left - 8, Math.max(box.width, 260)) + 'px';
+        panel.style.maxHeight = Math.max(120, window.innerHeight - top - 8) + 'px';
+    }
+
     const localPicker = document.getElementById('localPicker');
     const modelsList = document.getElementById('modelsList');
+    const cloudSection = document.getElementById('cloudSection');
+    const cloudSummary = cloudSection.querySelector('summary');
+    const cloudBody = cloudSection.querySelector('.section-body');
     function setPickerOpen(open) {
         modelsList.hidden = !open;
         modelSelect.setAttribute('aria-expanded', String(open));
         if (open) {
+            cloudSection.open = false;
             renderModelsList();
             placeModelsList();
             vscode.postMessage({ type: 'refreshStatus' }); // pick up models pulled elsewhere
         }
     }
     function placeModelsList() {
-        if (modelsList.hidden) return;
-        const box = modelSelect.getBoundingClientRect();
-        const top = box.bottom + 4;
-        const left = Math.max(8, Math.min(box.left, window.innerWidth - 268));
-        modelsList.style.top = top + 'px';
-        modelsList.style.left = left + 'px';
-        modelsList.style.width = Math.min(window.innerWidth - left - 8, Math.max(box.width, 260)) + 'px';
-        modelsList.style.maxHeight = Math.max(120, window.innerHeight - top - 8) + 'px';
+        if (!modelsList.hidden) placePopover(modelSelect, modelsList);
+    }
+    function placeCloudBody() {
+        if (cloudSection.open) placePopover(cloudSummary, cloudBody);
+    }
+    function placePopovers() {
+        placeModelsList();
+        placeCloudBody();
     }
     modelSelect.addEventListener('click', () => setPickerOpen(modelsList.hidden));
-    window.addEventListener('resize', placeModelsList);
-    document.querySelector('.top').addEventListener('scroll', placeModelsList);
-    new ResizeObserver(placeModelsList).observe(document.querySelector('.top'));
+    cloudSection.addEventListener('toggle', () => {
+        if (cloudSection.open) setPickerOpen(false);
+        placeCloudBody();
+    });
+    window.addEventListener('resize', placePopovers);
+    document.querySelector('.top').addEventListener('scroll', placePopovers);
+    new ResizeObserver(placePopovers).observe(document.querySelector('.top'));
     document.addEventListener('mousedown', e => {
         if (!modelsList.hidden && !localPicker.contains(e.target)) setPickerOpen(false);
+        if (cloudSection.open && !cloudSection.contains(e.target)) cloudSection.open = false;
     });
     document.addEventListener('keydown', e => {
-        if (e.key === 'Escape' && !modelsList.hidden) { setPickerOpen(false); e.stopPropagation(); }
+        if (e.key !== 'Escape') return;
+        if (!modelsList.hidden) { setPickerOpen(false); e.stopPropagation(); }
+        if (cloudSection.open) { cloudSection.open = false; e.stopPropagation(); }
     }, true);
 
     document.addEventListener('keydown', e => {

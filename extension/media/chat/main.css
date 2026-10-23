@@ -398,9 +398,10 @@ button.icon-btn.reject { color: var(--vscode-gitDecoration-deletedResourceForegr
 .picker-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .caret { flex: none; opacity: 0.7; }
 .picker-list[hidden] { display: none; }
-/* The list opens as a popover over the chat instead of inside the (scrolling, clipped) header;
-   main.js sets its top/left/width/max-height from the picker button's position. */
-.picker-list {
+#cloudSection[open] > .section-body { gap: 10px; }
+/* The local-model list and the open cloud settings are popovers over the chat instead of growing
+   the (scrolling, clipped) header; main.js sets their top/left/width/max-height from the anchor. */
+.picker-list, #cloudSection[open] > .section-body {
     display: flex; flex-direction: column;
     position: fixed; z-index: 100; margin-top: 0; gap: 6px;
     padding: 8px 10px; overflow-y: auto; box-sizing: border-box;

@@ -4,7 +4,7 @@
 
 TokenGuard is not another coding model. It sits in front of the models and decides **where** each question is answered and **how much** of your code goes with it.
 
-![LocalPilot sidebar](images/sidebar.png)
+![LocalPilot sidebar](images/sidebar_release_0.2.0.png)
 
 ## Features
 
